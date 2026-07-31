@@ -1,0 +1,5 @@
+/target
+.env
+*.log
+/data
+.symphony-mcp.json
