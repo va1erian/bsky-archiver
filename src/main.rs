@@ -2,6 +2,7 @@ mod bluesky;
 mod config;
 mod firehose;
 mod media;
+mod pipeline;
 mod poller;
 mod storage;
 mod web;
