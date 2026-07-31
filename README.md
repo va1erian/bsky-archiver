@@ -10,3 +10,13 @@ This repository is being built incrementally by an automated coding-agent pipeli
 
 Project status and usage docs will be filled in as the pipeline progresses (see the
 final "docs and e2e" ticket).
+
+## Development
+
+Before committing, run the same checks CI runs:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
