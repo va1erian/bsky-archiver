@@ -1,0 +1,8 @@
+/target
+/data
+.env
+*.log
+.git
+.github
+.symphony-mcp.json
+docker-compose.yml

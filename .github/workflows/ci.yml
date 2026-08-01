@@ -29,3 +29,56 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: bsky-archiver:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test - fails fast on bad Bluesky credentials
+        run: |
+          set +e
+          output=$(timeout 60 docker run --rm \
+            --name bsky-archiver-smoketest \
+            -e BSKY_IDENTIFIER=invalid.example.social \
+            -e BSKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx \
+            -e UI_PASSWORD=ci-smoketest-password \
+            -e UI_SESSION_SECRET=ci-smoketest-session-secret-0123456789 \
+            bsky-archiver:ci 2>&1)
+          status=$?
+
+          if [ "$status" -eq 124 ]; then
+            echo "::error::container did not exit within 60s on invalid credentials; expected a fast fail-fast exit"
+            exit 1
+          fi
+          echo "$output"
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::container exited 0 on invalid credentials; expected a non-zero fail-fast exit"
+            exit 1
+          fi
+
+          if ! echo "$output" | grep -qi "fatal startup error"; then
+            echo "::error::expected a clear 'fatal startup error' log line; none found"
+            exit 1
+          fi
+
+          if echo "$output" | grep -q "xxxx-xxxx-xxxx-xxxx"; then
+            echo "::error::the app password leaked into container logs"
+            exit 1
+          fi
+
+          echo "container failed fast with a clear error, as expected (exit $status)"

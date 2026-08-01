@@ -1,0 +1,46 @@
+# Example deployment for bsky-archiver, suitable for Cosmos Cloud or plain
+# `docker compose up -d`. Copy this file, fill in the placeholder secrets
+# below, and adjust the volume/port mapping as needed.
+#
+# See README.md's "Deploying" section for the full environment variable
+# reference (required vs optional-with-defaults).
+
+services:
+  bsky-archiver:
+    image: ghcr.io/example-org/bsky-archiver:latest
+    # Or build locally instead of pulling a published image:
+    # build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080" # host:container, must match UI_PORT below
+    environment:
+      # --- required ---
+      BSKY_IDENTIFIER: "your-handle.bsky.social"
+      BSKY_APP_PASSWORD: "xxxx-xxxx-xxxx-xxxx" # Bluesky app password, not your main password
+      UI_PASSWORD: "change-me-to-a-long-random-password"
+      UI_SESSION_SECRET: "change-me-to-a-long-random-string-at-least-32-chars"
+
+      # --- optional (defaults shown) ---
+      # BSKY_WATCH_HANDLES: "your-handle.bsky.social"
+      ARCHIVE_DIR: "/data/archive"
+      DATABASE_PATH: "/data/archive/index.sqlite3"
+      UI_PORT: "8080"
+      POLL_INTERVAL_SECONDS: "120"
+      # JETSTREAM_URL: "wss://jetstream1.us-east.bsky.network/subscribe"
+      MEDIA_MAX_CONCURRENT_DOWNLOADS: "4"
+      MEDIA_MAX_BYTES: "104857600"
+      RUST_LOG: "info"
+    volumes:
+      # Persists the archived JSON + media + SQLite index across restarts
+      # and image upgrades. This is the only state that must survive - the
+      # container itself is fully disposable.
+      - bsky-archiver-data:/data/archive
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  bsky-archiver-data:
