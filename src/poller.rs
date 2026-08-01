@@ -9,11 +9,6 @@
 //! [`crate::storage::ArchiveStore`] so a post already captured by another
 //! producer is never reprocessed here, and vice versa.
 
-// Not yet wired into `main`: AR-9 (service orchestration) spawns these
-// pollers. Silence dead-code lints on this module's public surface until
-// then.
-#![allow(dead_code)]
-
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -150,7 +145,7 @@ enum CycleOutcome {
 /// Runs the REST-polling fallback until `sender` is dropped/closed. Meant
 /// to be spawned as a long-lived background task (`tokio::spawn`).
 pub struct RestFallbackPoller {
-    client: BlueskyClient,
+    client: std::sync::Arc<BlueskyClient>,
     archive: ArchiveStore,
     sender: CandidatePostSender,
     health_rx: ConnectionHealthReceiver,
@@ -160,7 +155,7 @@ pub struct RestFallbackPoller {
 
 impl RestFallbackPoller {
     pub fn new(
-        client: BlueskyClient,
+        client: std::sync::Arc<BlueskyClient>,
         archive: ArchiveStore,
         sender: CandidatePostSender,
         health_rx: ConnectionHealthReceiver,
@@ -932,7 +927,7 @@ mod tests {
         config.health_recheck_interval = Duration::from_millis(10);
 
         let poller = RestFallbackPoller::new(
-            client,
+            std::sync::Arc::new(client),
             store,
             tx,
             health_rx,

@@ -95,8 +95,14 @@ pub struct AppConfig {
     pub bsky_watch_handles: Vec<String>,
     pub archive_dir: PathBuf,
     pub database_path: PathBuf,
+    // Not yet read outside tests: AR-10 (the web UI) is the consumer of the
+    // session-auth / listen-port config. Silence dead-code lints on these
+    // fields until then.
+    #[allow(dead_code)]
     pub ui_password: Secret,
+    #[allow(dead_code)]
     pub ui_session_secret: Secret,
+    #[allow(dead_code)]
     pub ui_port: u16,
     pub poll_interval_seconds: u64,
     pub jetstream_url: url::Url,

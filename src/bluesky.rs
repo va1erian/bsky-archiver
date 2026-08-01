@@ -6,11 +6,6 @@
 //! likes/bookmarks poller (AR-7) need: session auth (with automatic
 //! re-login on a 401), `getAuthorFeed`, `getActorLikes`, and `getBookmarks`.
 
-// Not yet wired into `main`: AR-9 (service orchestration) constructs and
-// uses a Bluesky client. Silence dead-code lints on this module's public
-// surface until then.
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 use crate::config::Secret;
@@ -91,6 +86,11 @@ pub struct AuthorFeedPage {
 struct CreateSessionResponse {
     #[serde(rename = "accessJwt")]
     access_jwt: String,
+    did: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ResolveHandleResponse {
     did: String,
 }
 
@@ -258,6 +258,31 @@ impl BlueskyClient {
         }
         self.get_authenticated("app.bsky.bookmark.getBookmarks", &query)
             .await
+    }
+
+    /// Authenticates immediately, returning the authenticated account's own
+    /// DID. Used at startup to fail fast on bad credentials rather than
+    /// discovering the problem on the first real API call.
+    pub async fn authenticate(&self) -> Result<String, BlueskyError> {
+        self.login().await?;
+        let session = self.session.read().await;
+        Ok(session
+            .as_ref()
+            .expect("login() just populated the session")
+            .did
+            .clone())
+    }
+
+    /// Resolves `handle` (a Bluesky handle, e.g. `alice.bsky.social`) to its
+    /// DID via `com.atproto.identity.resolveHandle`.
+    pub async fn resolve_handle(&self, handle: &str) -> Result<String, BlueskyError> {
+        let response: ResolveHandleResponse = self
+            .get_authenticated(
+                "com.atproto.identity.resolveHandle",
+                &[("handle", handle.to_string())],
+            )
+            .await?;
+        Ok(response.did)
     }
 }
 
@@ -539,5 +564,54 @@ mod tests {
             .await
             .expect_err("missing accessJwt should fail cleanly");
         assert!(matches!(err, BlueskyError::Http(_)));
+    }
+
+    #[tokio::test]
+    async fn authenticate_returns_own_did() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        let client = client(&server);
+        let did = client.authenticate().await.expect("authenticate");
+        assert_eq!(did, "did:plc:alice");
+    }
+
+    #[tokio::test]
+    async fn authenticate_fails_fast_on_bad_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": "AuthenticationRequired",
+                "message": "invalid credentials",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let err = client
+            .authenticate()
+            .await
+            .expect_err("bad credentials should fail authenticate");
+        assert!(matches!(err, BlueskyError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_returns_did() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+            .and(query_param("handle", "bob.bsky.social"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"did": "did:plc:bob"})))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let did = client
+            .resolve_handle("bob.bsky.social")
+            .await
+            .expect("resolve_handle");
+        assert_eq!(did, "did:plc:bob");
     }
 }

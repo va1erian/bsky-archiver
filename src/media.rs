@@ -7,11 +7,6 @@
 //! each post's JSON record, then downloads and stores every attached media
 //! file.
 
-// Not yet constructed from `main`: AR-9 (service orchestration) wires a
-// `MediaDownloader` up to the producers' channel. Silence dead-code lints on
-// this module's public surface until then.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,7 +87,13 @@ impl MediaDownloader {
     /// attached media file. Returns once every candidate has been received
     /// and every spawned download task has finished. A single post or media
     /// failure is logged and does not stop the pipeline.
-    pub async fn run(self, mut candidates: CandidatePostReceiver) {
+    ///
+    /// Takes the receiver by reference (rather than owning it) so a
+    /// supervisor ([`crate::app`]) can hold onto the same receiver across
+    /// restarts if a run panics — the channel and everything already queued
+    /// on it survives even though this particular downloader instance
+    /// doesn't.
+    pub async fn run(self, candidates: &mut CandidatePostReceiver) {
         let downloader = Arc::new(self);
         let mut media_tasks = JoinSet::new();
 
@@ -362,7 +363,7 @@ mod tests {
 
         let (_dir, store) = open_store().await;
         let downloader = MediaDownloader::new(store.clone(), 4, 1_000_000);
-        let (tx, rx) = candidate_post_channel(4);
+        let (tx, mut rx) = candidate_post_channel(4);
 
         let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
         tx.send(candidate(
@@ -377,7 +378,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        downloader.run(rx).await;
+        downloader.run(&mut rx).await;
 
         let record = store
             .get_post(Category::Post, at_uri)
@@ -405,7 +406,7 @@ mod tests {
 
         let (_dir, store) = open_store().await;
         let downloader = MediaDownloader::new(store.clone(), 4, 1_000_000);
-        let (tx, rx) = candidate_post_channel(4);
+        let (tx, mut rx) = candidate_post_channel(4);
 
         let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
         tx.send(candidate(
@@ -420,7 +421,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        downloader.run(rx).await;
+        downloader.run(&mut rx).await;
 
         let record = store
             .get_post(Category::Post, at_uri)
@@ -446,7 +447,7 @@ mod tests {
 
         let (dir, store) = open_store().await;
         let downloader = MediaDownloader::new(store.clone(), 4, 100);
-        let (tx, rx) = candidate_post_channel(4);
+        let (tx, mut rx) = candidate_post_channel(4);
 
         let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
         tx.send(candidate(
@@ -461,7 +462,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        downloader.run(rx).await;
+        downloader.run(&mut rx).await;
 
         let record = store
             .get_post(Category::Post, at_uri)
@@ -530,7 +531,7 @@ mod tests {
 
         let (_dir, store) = open_store().await;
         let downloader = MediaDownloader::new(store.clone(), 4, 1_000_000);
-        let (tx, rx) = candidate_post_channel(4);
+        let (tx, mut rx) = candidate_post_channel(4);
 
         let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
         tx.send(candidate(
@@ -545,7 +546,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        downloader.run(rx).await;
+        downloader.run(&mut rx).await;
 
         let record = store
             .get_post(Category::Post, at_uri)
@@ -566,7 +567,7 @@ mod tests {
 
         let (_dir, store) = open_store().await;
         let downloader = MediaDownloader::new(store.clone(), 4, 1_000_000);
-        let (tx, rx) = candidate_post_channel(4);
+        let (tx, mut rx) = candidate_post_channel(4);
 
         let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
         tx.send(candidate(
@@ -583,7 +584,7 @@ mod tests {
 
         // Must return normally (no panic) even though the download never
         // succeeds.
-        downloader.run(rx).await;
+        downloader.run(&mut rx).await;
 
         let record = store
             .get_post(Category::Post, at_uri)
@@ -649,7 +650,7 @@ mod tests {
         let (_dir, store) = open_store().await;
         const LIMIT: usize = 2;
         let downloader = MediaDownloader::new(store.clone(), LIMIT, 1_000_000);
-        let (tx, rx) = candidate_post_channel(16);
+        let (tx, mut rx) = candidate_post_channel(16);
 
         for i in 0..6 {
             let at_uri = format!("at://did:plc:alice/app.bsky.feed.post/{i}");
@@ -666,7 +667,7 @@ mod tests {
         }
         drop(tx);
 
-        downloader.run(rx).await;
+        downloader.run(&mut rx).await;
 
         let arrivals = responder.arrivals.lock().unwrap().clone();
         assert_eq!(arrivals.len(), 6);

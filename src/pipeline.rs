@@ -13,11 +13,6 @@
 //! - AR-8 (media downloader) consumes [`CandidatePost`]s from a
 //!   [`CandidatePostReceiver`] and downloads each listed [`MediaRef`].
 
-// Nothing in `main` constructs a producer or consumer yet: AR-5/6/7/8 wire
-// this module up. Silence dead-code lints on this module's public surface
-// until then.
-#![allow(dead_code)]
-
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};

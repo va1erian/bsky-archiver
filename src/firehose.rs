@@ -13,10 +13,6 @@
 //! caller's responsibility: this module takes already-resolved DIDs so it
 //! can be built and tested independently of that client.
 
-// Not wired into `main` yet: that happens once AR-3's client is available on
-// this branch to resolve handles to DIDs at startup.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -201,6 +197,7 @@ impl FirehoseConsumer {
     /// Overrides the reconnect backoff parameters. Exposed for tests, which
     /// need reconnects to happen fast rather than waiting out production
     /// delays.
+    #[allow(dead_code)]
     pub fn with_backoff(mut self, backoff: BackoffConfig) -> Self {
         self.backoff = backoff;
         self
