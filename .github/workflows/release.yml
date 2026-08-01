@@ -1,0 +1,131 @@
+name: Release
+
+# Packaging and publishing. Unlike ci.yml (which runs on every push and
+# pull request), this workflow only fires when a semver release tag is
+# pushed, so ordinary commits to main never build/push images or cut a
+# GitHub Release.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Binary/crate name produced by `cargo build --release` (see Cargo.toml
+  # `[package] name`). Used for the packaged tarball's contents.
+  BIN_NAME: bsky-archiver
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Build and push the Docker image ("Symphony base image") to GHCR, tagged
+  # with both the git tag (e.g. v1.2.3) and `latest`.
+  # -------------------------------------------------------------------------
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        id: image
+        # GHCR requires a fully lowercase repository path; owner names can
+        # contain uppercase, so normalise ${{ github.repository }} here.
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # -------------------------------------------------------------------------
+  # Build the release binary, package it as a .tar.gz, and attach it (plus a
+  # checksum and the pushed Docker image reference) to a GitHub Release for
+  # the tag. Depends on `docker` so the release notes can point at an image
+  # that has actually been published.
+  # -------------------------------------------------------------------------
+  release:
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Package binary
+        id: package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          target="x86_64-unknown-linux-gnu"
+          pkg="${BIN_NAME}-${version}-${target}"
+
+          mkdir -p "dist/${pkg}"
+          install -m755 "target/release/${BIN_NAME}" "dist/${pkg}/${BIN_NAME}"
+          cp README.md "dist/${pkg}/"
+          tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
+          sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+
+          echo "tarball=${pkg}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${pkg}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # GITHUB_REF_NAME (e.g. v1.2.3) is used implicitly as the tag.
+          files: |
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.checksum }}
+          generate_release_notes: true
+          body: |
+            ### Docker image
+
+            Published to GHCR and tagged with this release and `latest`:
+
+            ```
+            docker pull ${{ needs.docker.outputs.image }}:${{ github.ref_name }}
+            docker pull ${{ needs.docker.outputs.image }}:latest
+            ```
+
+            ### Binary
+
+            `${{ steps.package.outputs.tarball }}` contains the Linux
+            x86_64 release build of `${{ env.BIN_NAME }}`. Verify its
+            integrity against the accompanying `.sha256` checksum.
