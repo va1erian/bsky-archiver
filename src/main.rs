@@ -8,6 +8,7 @@ mod pipeline;
 mod poller;
 mod state;
 mod storage;
+mod templates;
 mod web;
 
 #[tokio::main]

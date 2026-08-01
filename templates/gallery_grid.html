@@ -1,0 +1,40 @@
+<div id="gallery-grid">
+<div class="gallery-grid">
+{% for item in items %}
+<figure class="item-card">
+<a class="gallery-item" href="{{ item.full_url }}" data-lightbox data-media-type="{% if item.is_video %}video{% else %}image{% endif %}" data-alt="{{ item.alt }}">
+{% if item.is_video %}
+<video src="{{ item.thumb_url }}" muted preload="metadata"></video>
+{% else %}
+<img src="{{ item.thumb_url }}" alt="{{ item.alt }}" loading="lazy">
+{% endif %}
+</a>
+<figcaption><a href="{{ item.post_href }}">View post</a></figcaption>
+</figure>
+{% endfor %}
+</div>
+{% if items.is_empty() %}
+<p>No media archived yet.</p>
+{% endif %}
+
+<nav class="pagination" aria-label="Pagination">
+{% if let Some(href) = pagination.prev_href %}
+<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true">Previous</a>
+{% else %}
+<span class="disabled">Previous</span>
+{% endif %}
+{% for link in pagination.page_links %}
+{% if link.current %}
+<span class="current">{{ link.number }}</span>
+{% else %}
+<a href="{{ link.href }}" hx-get="{{ link.href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true">{{ link.number }}</a>
+{% endif %}
+{% endfor %}
+{% if let Some(href) = pagination.next_href %}
+<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true">Next</a>
+{% else %}
+<span class="disabled">Next</span>
+{% endif %}
+<span class="item-meta">Page {{ pagination.page }} of {{ pagination.total_pages }} ({{ pagination.total_items }} total)</span>
+</nav>
+</div>

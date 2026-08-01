@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Configuration – bsky-archiver{% endblock %}
+{% block content %}
+<h1>Active configuration</h1>
+<p>Secrets are never shown, only marked as present.</p>
+<table class="config-table">
+<thead><tr><th>Variable</th><th>Value</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr>
+<td>{{ row.key }}</td>
+<td>{% if row.redacted %}<span class="redacted">{{ row.value }}</span>{% else %}{{ row.value }}{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endblock %}

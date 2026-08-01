@@ -135,6 +135,8 @@ pub struct PostSummary {
     pub cid: String,
     pub indexed_at: String,
     pub media_count: u32,
+    pub thumbnail_filename: Option<String>,
+    pub thumbnail_content_type: Option<String>,
 }
 
 /// A row for the gallery view: one media file plus a pointer back to its
@@ -523,7 +525,11 @@ impl ArchiveStore {
                 let offset = (page - 1) as i64 * page_size as i64;
                 let mut stmt = conn.prepare(
                     "SELECT p.at_uri, p.category, p.cid, p.indexed_at,
-                        (SELECT COUNT(*) FROM media m WHERE m.post_at_uri = p.at_uri)
+                        (SELECT COUNT(*) FROM media m WHERE m.post_at_uri = p.at_uri),
+                        (SELECT m.filename FROM media m WHERE m.post_at_uri = p.at_uri
+                            ORDER BY m.id ASC LIMIT 1),
+                        (SELECT m.content_type FROM media m WHERE m.post_at_uri = p.at_uri
+                            ORDER BY m.id ASC LIMIT 1)
                  FROM posts p
                  WHERE ?1 IS NULL OR p.category = ?1
                  ORDER BY p.indexed_at DESC, p.at_uri DESC
@@ -538,6 +544,8 @@ impl ArchiveStore {
                             cid: row.get(2)?,
                             indexed_at: row.get(3)?,
                             media_count: row.get::<_, i64>(4)? as u32,
+                            thumbnail_filename: row.get(5)?,
+                            thumbnail_content_type: row.get(6)?,
                         })
                     })?;
                 let items = rows.collect::<Result<Vec<_>, _>>()?;
@@ -591,6 +599,40 @@ impl ArchiveStore {
             })
             .await;
 
+        join_result(result)
+    }
+
+    /// Reads a previously-archived media file's raw bytes straight from
+    /// disk. `filename` must be a bare filename (no path separators or
+    /// `..` components) — callers pass this through from a URL path
+    /// segment, and this guards against escaping the item's media
+    /// directory.
+    pub async fn read_media(
+        &self,
+        category: Category,
+        at_uri: &str,
+        filename: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        if filename.is_empty()
+            || filename.contains('/')
+            || filename.contains('\\')
+            || filename == ".."
+        {
+            return Ok(None);
+        }
+
+        let archive_dir = self.archive_dir.clone();
+        let at_uri = at_uri.to_string();
+        let filename = filename.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, StorageError> {
+                let path = media_dir(&archive_dir, category, &at_uri).join(&filename);
+                if !path.is_file() {
+                    return Ok(None);
+                }
+                Ok(Some(std::fs::read(&path)?))
+            })
+            .await;
         join_result(result)
     }
 
@@ -852,6 +894,39 @@ mod tests {
         assert_eq!(gallery.total_items, 1);
         assert_eq!(gallery.items[0].filename, "image1.jpg");
         assert_eq!(gallery.items[0].post_at_uri, at_uri);
+
+        let post_list = store.list_posts(None, 1, 10).await.unwrap();
+        assert_eq!(
+            post_list.items[0].thumbnail_filename.as_deref(),
+            Some("image1.jpg")
+        );
+        assert_eq!(
+            post_list.items[0].thumbnail_content_type.as_deref(),
+            Some("image/jpeg")
+        );
+
+        let bytes = store
+            .read_media(Category::Post, at_uri, "image1.jpg")
+            .await
+            .unwrap()
+            .expect("media file should be readable");
+        assert_eq!(bytes, b"fake-image-bytes");
+
+        assert!(
+            store
+                .read_media(Category::Post, at_uri, "missing.jpg")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_media(Category::Post, at_uri, "../record.json")
+                .await
+                .unwrap()
+                .is_none(),
+            "path traversal attempts must be rejected"
+        );
 
         // Re-saving the same filename is a no-op: no duplicate media rows,
         // no duplicate entries in the record's media list.

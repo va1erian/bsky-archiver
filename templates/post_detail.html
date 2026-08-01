@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}{{ category_label }} – bsky-archiver{% endblock %}
+{% block content %}
+<p><a href="/posts">&larr; Back to posts</a></p>
+<article>
+<header>
+<span class="badge {{ category_badge_class }}">{{ category_label }}</span>
+<p class="item-meta">{{ author }} · {{ indexed_at }}</p>
+</header>
+
+{% if let Some(text) = text %}
+<p class="excerpt">{{ text }}</p>
+{% endif %}
+
+{% if let Some(url) = bluesky_url %}
+<p><a href="{{ url }}" target="_blank" rel="noopener noreferrer">View on Bluesky &rarr;</a></p>
+{% endif %}
+
+{% if !media.is_empty() %}
+<h2>Media</h2>
+<div class="card-grid">
+{% for m in media %}
+<figure>
+{% if m.is_video %}
+<video class="media-full" src="{{ m.url }}" controls preload="metadata"></video>
+{% else %}
+<img class="media-full" src="{{ m.url }}" alt="{{ m.alt }}" loading="lazy">
+{% endif %}
+<figcaption class="item-meta">{{ m.content_type }}</figcaption>
+</figure>
+{% endfor %}
+</div>
+{% endif %}
+
+<details>
+<summary>Raw JSON</summary>
+<pre>{{ raw_json }}</pre>
+</details>
+</article>
+{% endblock %}

@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Gallery – bsky-archiver{% endblock %}
+{% block content %}
+<h1>Gallery</h1>
+{% include "gallery_grid.html" %}
+
+<dialog id="lightbox">
+<article>
+<button aria-label="Close" id="lightbox-close" class="close-lightbox">&times;</button>
+<div id="lightbox-content"></div>
+</article>
+</dialog>
+
+<script>
+(function () {
+  var dialog = document.getElementById("lightbox");
+  var content = document.getElementById("lightbox-content");
+  if (!dialog || !content || typeof dialog.showModal !== "function") return;
+
+  document.addEventListener("click", function (event) {
+    var link = event.target.closest("[data-lightbox]");
+    if (!link) return;
+    event.preventDefault();
+    var isVideo = link.getAttribute("data-media-type") === "video";
+    var alt = link.getAttribute("data-alt") || "";
+    content.innerHTML = isVideo
+      ? "<video src=\"" + link.href + "\" controls autoplay></video>"
+      : "<img src=\"" + link.href + "\" alt=\"" + alt + "\">";
+    dialog.showModal();
+  });
+
+  document.getElementById("lightbox-close").addEventListener("click", function () {
+    dialog.close();
+  });
+  dialog.addEventListener("click", function (event) {
+    if (event.target === dialog) dialog.close();
+  });
+})();
+</script>
+{% endblock %}
