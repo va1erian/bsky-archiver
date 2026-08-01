@@ -1,7 +1,12 @@
 name: CI
 
+# Runs on every push to main and on every pull request. Restricting the
+# push trigger to main (rather than all branches) avoids a duplicate run
+# on branches that also have an open PR, where the pull_request event
+# already covers them.
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:
@@ -26,6 +31,9 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --release
 
       - name: cargo test
         run: cargo test
