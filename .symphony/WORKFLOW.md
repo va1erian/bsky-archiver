@@ -8,6 +8,7 @@ tracker:
     active_state_labels:
       todo: "state:todo"
       in progress: "state:in-progress"
+      in review: "state:in-review"
   active_states: [todo, "in progress"]
   terminal_states: [done]
 
@@ -75,11 +76,17 @@ in your final message instead.
 Once your branch is pushed and you're satisfied with the change, call the
 `open_pull_request` tool with a `title` and a `body` describing what changed and why.
 Include a line `Closes #{{ issue.identifier }}` in the body -- the tracker issue
-closes automatically when a human reviews and merges the PR. **Do not call
-`update_issue_state` to close this issue yourself** -- in this workflow, "done" means
-merged, not "I'm finished writing code," and that decision belongs to whoever reviews
-the PR. If you call `open_pull_request` again later (e.g. after pushing more work in
-a retry), it updates the existing PR in place rather than opening a duplicate.
+closes automatically when a human reviews and merges the PR.
+
+Immediately after `open_pull_request` succeeds, call `update_issue_state` with
+`state: "in review"`. This does **not** close the issue -- it just tells the harness
+your active work here is done for now, so it stops redispatching you to re-report the
+same status every few seconds. **Never call `update_issue_state` with `"done"`** --
+in this workflow "done" means merged, and that decision belongs to whoever reviews
+the PR, not you. If you call `open_pull_request` again later (e.g. after pushing more
+work in a retry), it updates the existing PR in place rather than opening a
+duplicate -- call `update_issue_state("in review")` again too if the issue had moved
+out of it for any reason.
 
 If you get meaningfully stuck on something outside this ticket's scope, say so
 clearly in your final message instead of opening a PR for incomplete work.
