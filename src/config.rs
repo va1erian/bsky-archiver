@@ -45,9 +45,6 @@ impl Secret {
     /// Exposes the plaintext secret. Callers that use this must never log,
     /// `Display`, or persist the returned value — only pass it to the API
     /// that actually needs it (e.g. an HTTP auth header, cookie signing key).
-    // Not yet called from `main`: consumed by later tickets (bluesky auth,
-    // session cookie signing) that need the plaintext value.
-    #[allow(dead_code)]
     pub fn expose_secret(&self) -> &str {
         &self.0
     }
@@ -95,14 +92,8 @@ pub struct AppConfig {
     pub bsky_watch_handles: Vec<String>,
     pub archive_dir: PathBuf,
     pub database_path: PathBuf,
-    // Not yet read outside tests: AR-10 (the web UI) is the consumer of the
-    // session-auth / listen-port config. Silence dead-code lints on these
-    // fields until then.
-    #[allow(dead_code)]
     pub ui_password: Secret,
-    #[allow(dead_code)]
     pub ui_session_secret: Secret,
-    #[allow(dead_code)]
     pub ui_port: u16,
     pub poll_interval_seconds: u64,
     pub jetstream_url: url::Url,

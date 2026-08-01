@@ -14,9 +14,6 @@ use crate::storage::ArchiveStore;
 pub struct AppState {
     pub config: AppConfig,
     pub store: ArchiveStore,
-    // Not yet read outside tests: AR-10 (the web UI) serves this via
-    // `/healthz` and the config page.
-    #[allow(dead_code)]
     pub health: HealthReceiver,
 }
 

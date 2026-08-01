@@ -231,8 +231,10 @@ pub async fn serve(started: Started) {
         config.media_max_concurrent_downloads,
         config.media_max_bytes,
         health_tx,
-        shutdown_rx,
+        shutdown_rx.clone(),
     ));
+
+    let web_handle = spawn_web_server(Arc::clone(&state), config.ui_port, shutdown_rx.clone());
 
     shutdown_signal().await;
     tracing::info!("shutdown signal received; stopping background tasks");
@@ -241,7 +243,8 @@ pub async fn serve(started: Started) {
     let _ = tokio::join!(
         firehose_handle,
         rest_fallback_handle,
-        likes_bookmarks_handle
+        likes_bookmarks_handle,
+        web_handle
     );
 
     match tokio::time::timeout(Duration::from_secs(30), media_handle).await {
@@ -462,6 +465,38 @@ async fn run_media_downloader_supervised(
             }
         }
     }
+}
+
+/// Spawns the web UI's HTTP server on `port`, serving until `shutdown_rx`
+/// fires. A bind failure (e.g. the port is already in use) is logged and
+/// ends this task alone rather than the whole process, matching how the
+/// other supervised subsystems degrade independently.
+fn spawn_web_server(
+    state: SharedAppState,
+    port: u16,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                tracing::error!(error = %err, %port, "failed to bind web UI listener");
+                return;
+            }
+        };
+        tracing::info!(%addr, "web UI listening");
+
+        let router = crate::web::router(state);
+        let result = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.wait_for(|shutdown| *shutdown).await;
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::error!(error = %err, "web UI server exited with error");
+        }
+    })
 }
 
 /// Resolves once SIGINT (Ctrl+C, all platforms) or SIGTERM (Unix only —

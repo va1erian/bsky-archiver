@@ -128,9 +128,6 @@ pub struct MediaMeta {
 
 /// A lightweight row for post-list views (no full JSON body, no media
 /// bytes).
-// Not yet constructed outside tests: AR-10 (the web UI) is the consumer of
-// `ArchiveStore::list_posts`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostSummary {
     pub category: Category,
@@ -142,9 +139,6 @@ pub struct PostSummary {
 
 /// A row for the gallery view: one media file plus a pointer back to its
 /// post.
-// Not yet constructed outside tests: AR-10 (the web UI) is the consumer of
-// `ArchiveStore::list_media`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaSummary {
     pub category: Category,
@@ -163,9 +157,6 @@ pub enum SaveOutcome {
 }
 
 /// One page of a paginated listing.
-// Not yet constructed outside tests: AR-10 (the web UI) is the consumer of
-// `ArchiveStore::list_posts` / `ArchiveStore::list_media`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -175,7 +166,6 @@ pub struct Page<T> {
     pub total_pages: u32,
 }
 
-#[allow(dead_code)]
 fn paginate<T>(items: Vec<T>, page: u32, page_size: u32, total_items: u64) -> Page<T> {
     let total_pages = if total_items == 0 {
         0
@@ -487,9 +477,6 @@ impl ArchiveStore {
 
     /// Fetches a single archived record by category + `at_uri`, reading
     /// straight from disk.
-    // Not yet called outside tests: AR-10 (the web UI) is the consumer,
-    // for the post-detail view.
-    #[allow(dead_code)]
     pub async fn get_post(
         &self,
         category: Category,
@@ -512,9 +499,6 @@ impl ArchiveStore {
 
     /// Lists posts (optionally filtered by category) newest-first, via
     /// the SQLite index.
-    // Not yet called outside tests: AR-10 (the web UI) is the consumer,
-    // for the post-list view.
-    #[allow(dead_code)]
     pub async fn list_posts(
         &self,
         category: Option<Category>,
@@ -566,9 +550,6 @@ impl ArchiveStore {
     }
 
     /// Lists archived media newest-first, for the gallery view.
-    // Not yet called outside tests: AR-10 (the web UI) is the consumer,
-    // for the media gallery view.
-    #[allow(dead_code)]
     pub async fn list_media(
         &self,
         page: u32,
