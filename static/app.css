@@ -100,6 +100,37 @@
   display: block;
 }
 
+.export-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.75rem 0 1rem;
+}
+
+.export-summary {
+  margin: 0;
+  color: var(--pico-muted-color, #6b7280);
+}
+
+.export-warning {
+  flex-basis: 100%;
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  border-radius: var(--pico-border-radius, 0.25rem);
+  background: var(--pico-mark-background-color, #fff3cd);
+  color: var(--pico-color, inherit);
+}
+
+.export-button {
+  margin: 0;
+}
+
+.export-empty {
+  margin: 0;
+  color: var(--pico-muted-color, #6b7280);
+}
+
 .pagination {
   display: flex;
   flex-wrap: wrap;

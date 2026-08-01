@@ -4,6 +4,9 @@
 //! in [`crate::templates`] (askama templates + their view models) so this
 //! file stays about *what data* each route needs, not how it's marked up.
 
+use async_zip::tokio::write::ZipFileWriter;
+use async_zip::{Compression, ZipEntryBuilder};
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -12,11 +15,20 @@ use axum::routing::get;
 use axum::{Form, Router};
 use axum_extra::extract::cookie::{Cookie, Key, PrivateCookieJar, SameSite};
 use serde::Deserialize;
+use time::OffsetDateTime;
+use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::io::ReaderStream;
 
 use crate::health::{HealthSnapshot, Status};
 use crate::state::SharedAppState;
-use crate::storage::{ArchiveStore, Category, PostSummary, StorageError};
+use crate::storage::{ArchiveStore, Category, MediaSummary, PostSummary, StorageError};
 use crate::templates;
+
+/// Total export size (in bytes) over which the gallery shows a soft
+/// "this may take a while" warning. 1 GiB. Deliberately a warning only —
+/// the download stays enabled, since category is the only filter and a hard
+/// cap would lock out anyone whose single category exceeds it.
+const EXPORT_WARN_THRESHOLD_BYTES: u64 = 1_073_741_824;
 
 const SESSION_COOKIE: &str = "bsky_archiver_session";
 const SESSION_VALUE: &str = "authenticated";
@@ -51,6 +63,7 @@ pub fn router(app: SharedAppState) -> Router {
         .route("/posts", get(list_posts))
         .route("/posts/:id", get(post_detail))
         .route("/gallery", get(gallery))
+        .route("/gallery/export", get(gallery_export))
         .route("/config", get(config_view))
         .route("/media/:category/:id/:filename", get(media_file))
         .route("/logout", axum::routing::post(logout))
@@ -405,8 +418,61 @@ async fn post_detail(
 
 #[derive(Debug, Deserialize)]
 struct GalleryQuery {
+    category: Option<String>,
     page: Option<u32>,
     page_size: Option<u32>,
+}
+
+/// Parses a gallery/export `category` query value into a [`Category`].
+/// Accepts both the singular tokens the gallery links itself use
+/// (`post`/`like`/`bookmark`) and the plural forms `/posts` uses
+/// (`posts`/`likes`/`bookmarks`); anything else is a `400`, matching the
+/// shape `/posts` returns for an unknown category.
+fn parse_gallery_category(raw: Option<&str>) -> Result<Option<Category>, WebError> {
+    let category = match raw {
+        None => None,
+        Some(raw) => Some(match raw {
+            "post" | "posts" => Category::Post,
+            "like" | "likes" => Category::Like,
+            "bookmark" | "bookmarks" => Category::Bookmark,
+            other => {
+                return Err(WebError::BadRequest {
+                    message: format!("unknown category {other:?}"),
+                });
+            }
+        }),
+    };
+    Ok(category)
+}
+
+/// The singular query token the gallery uses for a category in its own
+/// links (`/gallery?category=like`, `/gallery/export?category=like`).
+fn category_token(category: Category) -> &'static str {
+    match category {
+        Category::Post => "post",
+        Category::Like => "like",
+        Category::Bookmark => "bookmark",
+    }
+}
+
+fn build_gallery_category_options(selected: Option<Category>) -> Vec<templates::CategoryOption> {
+    let mut options = vec![templates::CategoryOption {
+        label: "All",
+        href: "/gallery".to_string(),
+        selected: selected.is_none(),
+    }];
+    for (category, label) in [
+        (Category::Post, "Posts"),
+        (Category::Like, "Likes"),
+        (Category::Bookmark, "Bookmarks"),
+    ] {
+        options.push(templates::CategoryOption {
+            label,
+            href: format!("/gallery?category={}", category_token(category)),
+            selected: selected == Some(category),
+        });
+    }
+    options
 }
 
 async fn gallery(
@@ -414,23 +480,192 @@ async fn gallery(
     Query(query): Query<GalleryQuery>,
     headers: HeaderMap,
 ) -> Result<Response, WebError> {
+    let category = parse_gallery_category(query.category.as_deref())?;
     let page = query.page.unwrap_or(1).max(1);
     let page_size = clamp_page_size(query.page_size);
 
-    let result = state.app.store.list_media(page, page_size).await?;
+    let result = state
+        .app
+        .store
+        .list_media(category, page, page_size)
+        .await?;
     let items: Vec<_> = result.items.iter().map(templates::gallery_item).collect();
+
+    let cat_token = category.map(category_token);
     let pagination =
         templates::build_pagination(result.page, result.total_pages, result.total_items, |n| {
-            format!("/gallery?page={n}&page_size={page_size}")
+            match cat_token {
+                Some(token) => {
+                    format!("/gallery?category={token}&page={n}&page_size={page_size}")
+                }
+                None => format!("/gallery?page={n}&page_size={page_size}"),
+            }
         });
 
     if is_htmx_request(&headers) {
         let fragment = templates::GalleryGridTemplate { items, pagination };
         Ok(askama_axum::into_response(&fragment))
     } else {
-        let template = templates::GalleryTemplate { items, pagination };
+        let estimate = state.app.store.export_estimate(category).await?;
+        let export = build_gallery_export(category, estimate);
+        let category_options = build_gallery_category_options(category);
+        let template = templates::GalleryTemplate {
+            items,
+            pagination,
+            category_options,
+            export,
+        };
         Ok(askama_axum::into_response(&template))
     }
+}
+
+fn build_gallery_export(
+    category: Option<Category>,
+    estimate: crate::storage::ExportEstimate,
+) -> templates::GalleryExport {
+    let href = match category {
+        Some(category) => format!("/gallery/export?category={}", category_token(category)),
+        None => "/gallery/export".to_string(),
+    };
+    let size_label = templates::format_bytes(estimate.total_bytes);
+    let warning = (estimate.total_bytes > EXPORT_WARN_THRESHOLD_BYTES).then(|| {
+        format!(
+            "This export is about {size_label}. It may take a while — keep this tab open \
+             until the download finishes. If the connection drops you'll need to start over."
+        )
+    });
+    templates::GalleryExport {
+        image_count: estimate.image_count,
+        size_label,
+        href,
+        warning,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Gallery export (store-only ZIP64 stream of every image in the selection)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ExportQuery {
+    category: Option<String>,
+}
+
+async fn gallery_export(
+    State(state): State<WebState>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Response, WebError> {
+    let category = parse_gallery_category(query.category.as_deref())?;
+    let items = state.app.store.list_export_media(category).await?;
+
+    // An empty selection is a 404 rather than a valid zip of nothing, so a
+    // hand-typed export URL for a category with no images fails loudly.
+    if items.is_empty() {
+        return Err(WebError::NotFound);
+    }
+
+    let label = category.map(category_token).unwrap_or("all");
+    let filename = format!("bsky-archive-{label}-{}.zip", utc_date());
+
+    // Stream the archive: a background task writes the zip into one half of
+    // an in-memory pipe while the response body reads the other half, so
+    // memory stays bounded (one file buffer at a time) no matter how large
+    // the export is, and the first bytes go out before the last file is read.
+    let store = state.app.store.clone();
+    let (writer, reader) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Err(err) = stream_zip(writer, store, items).await {
+            // Headers are already sent, so a late error can't be signalled
+            // over HTTP; the client just gets a truncated zip. A client
+            // disconnect also surfaces here as a broken-pipe write error.
+            tracing::warn!(error = %err, "gallery export stream ended early");
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(reader)));
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/zip"),
+    );
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    response_headers.insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| header::HeaderValue::from_static("attachment")),
+    );
+    Ok(response)
+}
+
+/// Current UTC date as `YYYY-MM-DD`, for the export filename.
+fn utc_date() -> String {
+    let now = OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    )
+}
+
+/// Writes a store-only ZIP64 archive of `items` into `writer`. Each entry is
+/// streamed straight from disk (never buffered whole in memory) with its
+/// CRC32 computed on the fly and emitted via a data descriptor; `async-zip`'s
+/// streaming writer always emits ZIP64 structures, so archives over 4 GiB or
+/// 65,535 entries stay valid. A media row whose file is missing on disk is
+/// logged and skipped rather than aborting the whole export.
+async fn stream_zip(
+    writer: tokio::io::DuplexStream,
+    store: ArchiveStore,
+    items: Vec<MediaSummary>,
+) -> Result<(), async_zip::error::ZipError> {
+    let mut zip = ZipFileWriter::with_tokio(writer);
+    for item in items {
+        let file = match store
+            .open_media(item.category, &item.post_at_uri, &item.filename)
+            .await
+        {
+            Ok(Some(file)) => file,
+            Ok(None) => {
+                tracing::warn!(
+                    category = %item.category,
+                    post = %item.post_at_uri,
+                    filename = %item.filename,
+                    "export skipping media row with no file on disk"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    category = %item.category,
+                    post = %item.post_at_uri,
+                    filename = %item.filename,
+                    "export skipping media row that failed to open"
+                );
+                continue;
+            }
+        };
+
+        // `<category>/<encoded-post-id>/<filename>`: the per-post prefix is
+        // required, not cosmetic — `filename_for` numbers files per post
+        // (`000.jpg`, ...), so a flat layout would collide every post's
+        // `000.jpg`. The encoded (percent-encoded) AT-URI is ugly but unique
+        // and filesystem-safe on every platform.
+        let entry_path = format!(
+            "{}/{}/{}",
+            item.category,
+            encode_post_id(&item.post_at_uri),
+            item.filename
+        );
+        let builder = ZipEntryBuilder::new(entry_path.into(), Compression::Stored);
+        let mut entry_writer = zip.write_entry_stream(builder).await?;
+        let mut reader = file.compat();
+        futures_util::io::copy(&mut reader, &mut entry_writer).await?;
+        entry_writer.close().await?;
+    }
+    zip.close().await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -822,6 +1057,7 @@ mod tests {
         let page1 = gallery(
             State(app_state.clone()),
             Query(GalleryQuery {
+                category: None,
                 page: Some(1),
                 page_size: Some(10),
             }),
@@ -838,6 +1074,7 @@ mod tests {
         let page2 = gallery(
             State(app_state),
             Query(GalleryQuery {
+                category: None,
                 page: Some(2),
                 page_size: Some(10),
             }),
@@ -1265,5 +1502,221 @@ mod tests {
         let error_body = body_string(rejected).await;
         assert!(error_body.contains("Incorrect password"));
         assert!(error_body.contains("role=\"alert\""));
+    }
+
+    /// Seeds one image under `Post` and one video under `Like`, for the
+    /// gallery filter / export predicate tests.
+    async fn seed_image_and_video(store: &ArchiveStore) -> (String, String) {
+        let image_post = "at://did:plc:alice/app.bsky.feed.post/img";
+        store
+            .save_post(StorageCategory::Post, image_post, "cid-img", json!({}))
+            .await
+            .unwrap();
+        store
+            .save_media(
+                StorageCategory::Post,
+                image_post,
+                "000.jpg",
+                Some("image/jpeg".to_string()),
+                vec![0xFFu8; 8],
+            )
+            .await
+            .unwrap();
+
+        let video_like = "at://did:plc:bob/app.bsky.feed.post/vid";
+        store
+            .save_post(StorageCategory::Like, video_like, "cid-vid", json!({}))
+            .await
+            .unwrap();
+        store
+            .save_media(
+                StorageCategory::Like,
+                video_like,
+                "000.mp4",
+                Some("video/mp4".to_string()),
+                vec![0x00u8; 8],
+            )
+            .await
+            .unwrap();
+
+        (image_post.to_string(), video_like.to_string())
+    }
+
+    #[tokio::test]
+    async fn gallery_category_filter_isolates_media() {
+        let (_dir, state) = test_state().await;
+        let (image_post, video_like) = seed_image_and_video(&state.store).await;
+        let key = Key::derive_from(state.config.ui_session_secret.expose_secret().as_bytes());
+        let app_state = WebState {
+            app: Arc::clone(&state),
+            key,
+        };
+
+        // Filtering to likes shows only the like's media, not the post's.
+        let likes = gallery(
+            State(app_state.clone()),
+            Query(GalleryQuery {
+                category: Some("like".to_string()),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let likes_body = body_string(likes.into_response()).await;
+        assert!(likes_body.contains(&encode_post_id(&video_like)));
+        assert!(!likes_body.contains(&encode_post_id(&image_post)));
+        // The category nav marks the current selection.
+        assert!(likes_body.contains("<span class=\"current\">Likes</span>"));
+    }
+
+    #[tokio::test]
+    async fn gallery_export_estimate_counts_images_only_including_null_content_type() {
+        let (_dir, state) = test_state().await;
+        // A null-content-type row whose filename extension marks it an image
+        // (the case a bare `content_type LIKE 'image/%'` predicate would drop).
+        let null_ct = "at://did:plc:alice/app.bsky.feed.post/pngnull";
+        state
+            .store
+            .save_post(StorageCategory::Post, null_ct, "cid-png", json!({}))
+            .await
+            .unwrap();
+        state
+            .store
+            .save_media(
+                StorageCategory::Post,
+                null_ct,
+                "000.png",
+                None,
+                vec![0u8; 4],
+            )
+            .await
+            .unwrap();
+        // A video under the same category — excluded from the count.
+        seed_image_and_video(&state.store).await;
+
+        let key = Key::derive_from(state.config.ui_session_secret.expose_secret().as_bytes());
+        let app_state = WebState {
+            app: Arc::clone(&state),
+            key,
+        };
+
+        // Posts category: the jpg image + the null-content-type png = 2, no video.
+        let posts = gallery(
+            State(app_state.clone()),
+            Query(GalleryQuery {
+                category: Some("post".to_string()),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let posts_body = body_string(posts.into_response()).await;
+        assert!(posts_body.contains("2 images"));
+        assert!(posts_body.contains("Download zip"));
+
+        // Likes category: only a video → empty export selection.
+        let likes = gallery(
+            State(app_state),
+            Query(GalleryQuery {
+                category: Some("like".to_string()),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let likes_body = body_string(likes.into_response()).await;
+        assert!(likes_body.contains("No images in this selection to export."));
+        assert!(!likes_body.contains("Download zip"));
+    }
+
+    #[tokio::test]
+    async fn gallery_and_export_reject_unknown_category_with_400() {
+        let (_dir, state) = test_state().await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        for url in ["/gallery?category=bogus", "/gallery/export?category=bogus"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(url)
+                        .header(header::COOKIE, cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "unknown category on {url} should be 400"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gallery_export_empty_selection_is_404() {
+        let (_dir, state) = test_state().await;
+        // Only a video is archived, so the image export selection is empty.
+        seed_image_and_video(&state.store).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::get("/gallery/export?category=like")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn gallery_export_streams_store_only_zip_of_images() {
+        use std::io::Read as _;
+
+        let (_dir, state) = test_state().await;
+        let (image_post, _video_like) = seed_image_and_video(&state.store).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::get("/gallery/export")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/zip"
+        );
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("valid zip");
+        assert_eq!(archive.len(), 1, "only the image, not the video");
+        let mut entry = archive.by_index(0).unwrap();
+        assert_eq!(
+            entry.name(),
+            format!("posts/{}/000.jpg", encode_post_id(&image_post))
+        );
+        // Store-only: compression method 0.
+        assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, vec![0xFFu8; 8]);
     }
 }

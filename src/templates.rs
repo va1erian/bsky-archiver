@@ -307,11 +307,40 @@ pub fn gallery_item(summary: &MediaSummary) -> GalleryItem {
     }
 }
 
+/// Human-readable byte size using decimal (SI) units, e.g. `1.8 GB`, so the
+/// gallery's estimate and warning read the way a user expects ("about 1.8
+/// GB"). Whole bytes are shown without a decimal; larger units get one.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// The gallery's export panel: the current selection's image count and
+/// size, the download link, and (over the soft threshold) a warning.
+pub struct GalleryExport {
+    pub image_count: u64,
+    pub size_label: String,
+    pub href: String,
+    pub warning: Option<String>,
+}
+
 #[derive(Template)]
 #[template(path = "gallery.html")]
 pub struct GalleryTemplate {
     pub items: Vec<GalleryItem>,
     pub pagination: Pagination,
+    pub category_options: Vec<CategoryOption>,
+    pub export: GalleryExport,
 }
 
 #[derive(Template)]
@@ -401,6 +430,15 @@ mod tests {
         let last = build_pagination(3, 3, 25, |n| format!("/posts?page={n}"));
         assert!(last.prev_href.is_some());
         assert!(last.next_href.is_none());
+    }
+
+    #[test]
+    fn format_bytes_uses_decimal_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1_500), "1.5 KB");
+        assert_eq!(format_bytes(2_500_000), "2.5 MB");
+        assert_eq!(format_bytes(1_800_000_000), "1.8 GB");
     }
 
     #[test]

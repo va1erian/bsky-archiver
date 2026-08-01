@@ -447,7 +447,7 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
     let posts_page = store.list_posts(None, 1, 10).await.unwrap();
     assert_eq!(posts_page.total_items, 3);
 
-    let gallery_page = store.list_media(1, 10).await.unwrap();
+    let gallery_page = store.list_media(None, 1, 10).await.unwrap();
     assert_eq!(gallery_page.total_items, 3);
 
     // --- Assert: visible and correctly rendered via the real web UI
@@ -563,4 +563,177 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
 /// segment.
 fn web_encode(at_uri: &str) -> String {
     percent_encoding::utf8_percent_encode(at_uri, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// Drives the real `/gallery/export` route through the real `axum` router
+/// against a real on-disk store, parses the streamed response as a zip, and
+/// checks the entry count, the `<category>/<encoded-post-id>/<filename>`
+/// layout, that an archived video is excluded, and that one entry's bytes
+/// round-trip to the original file's contents.
+#[tokio::test]
+async fn gallery_export_streams_a_zip_of_images_only() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_dir = dir.path().join("archive");
+    let database_path = dir.path().join("index.sqlite3");
+
+    let store = ArchiveStore::open(archive_dir.clone(), database_path.clone())
+        .await
+        .expect("open store");
+
+    // Two images (one with an explicit content type, one with a null
+    // content type but an image filename extension) and one video.
+    let image_post = "at://did:plc:e2e-alice/app.bsky.feed.post/img";
+    store
+        .save_post(Category::Post, image_post, "cid-img", json!({}))
+        .await
+        .unwrap();
+    store
+        .save_media(
+            Category::Post,
+            image_post,
+            "000.jpg",
+            Some("image/jpeg".to_string()),
+            b"the-original-image-bytes".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let null_ct_like = "at://did:plc:e2e-bob/app.bsky.feed.post/png";
+    store
+        .save_post(Category::Like, null_ct_like, "cid-png", json!({}))
+        .await
+        .unwrap();
+    store
+        .save_media(Category::Like, null_ct_like, "000.png", None, vec![1u8; 16])
+        .await
+        .unwrap();
+
+    let video_post = "at://did:plc:e2e-alice/app.bsky.feed.post/vid";
+    store
+        .save_post(Category::Post, video_post, "cid-vid", json!({}))
+        .await
+        .unwrap();
+    store
+        .save_media(
+            Category::Post,
+            video_post,
+            "000.mp4",
+            Some("video/mp4".to_string()),
+            vec![9u8; 32],
+        )
+        .await
+        .unwrap();
+
+    let config = test_config(archive_dir, database_path);
+    let (_health_tx, health_rx) = health_channel();
+    let state: SharedAppState = std::sync::Arc::new(AppState {
+        config,
+        store: store.clone(),
+        health: health_rx,
+    });
+    let app = web::router(state);
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            Request::post("/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("password=e2e-ui-password"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login_response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("login sets a session cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let export_response = app
+        .oneshot(
+            Request::get("/gallery/export")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export_response.status(), StatusCode::OK);
+    assert_eq!(
+        export_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/zip"
+    );
+    assert!(
+        export_response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("bsky-archive-all-"),
+        "content-disposition names the whole-archive export"
+    );
+
+    let zip_bytes = export_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(zip_bytes.to_vec())).expect("parse zip");
+
+    // Two images in, one video excluded.
+    assert_eq!(
+        archive.len(),
+        2,
+        "video must be absent, both images present"
+    );
+
+    let mut names: Vec<String> = Vec::new();
+    let mut image_entry_bytes: Option<Vec<u8>> = None;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).unwrap();
+        let name = entry.name().to_string();
+        // `<category>/<encoded-post-id>/<filename>` layout.
+        let parts: Vec<&str> = name.split('/').collect();
+        assert_eq!(parts.len(), 3, "unexpected entry layout: {name}");
+        assert!(
+            ["posts", "likes", "bookmarks"].contains(&parts[0]),
+            "unexpected category segment: {name}"
+        );
+        assert!(
+            !name.contains("000.mp4"),
+            "video leaked into the zip: {name}"
+        );
+
+        if name == format!("posts/{}/000.jpg", web_encode(image_post)) {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).unwrap();
+            image_entry_bytes = Some(buf);
+        }
+        names.push(name);
+    }
+
+    assert!(
+        names.contains(&format!("posts/{}/000.jpg", web_encode(image_post))),
+        "expected the jpg image entry, got: {names:?}"
+    );
+    assert!(
+        names.contains(&format!("likes/{}/000.png", web_encode(null_ct_like))),
+        "expected the null-content-type png image entry, got: {names:?}"
+    );
+    assert_eq!(
+        image_entry_bytes.as_deref(),
+        Some(b"the-original-image-bytes".as_ref()),
+        "entry bytes must round-trip to the original file contents"
+    );
 }
