@@ -171,3 +171,17 @@ container logs/exit status rather than hanging.
 5. Confirm `ARCHIVE_DIR`'s volume is durable in your deployment environment (e.g. a
    named Docker volume, not an ephemeral container filesystem) — it is the only
    state that must survive an upgrade or restart.
+
+## The `.symphony/` directory
+
+`.symphony/` configures the Symphony agent daemon — an autonomous coding-agent that
+works this repository's own GitHub issues (`.symphony/WORKFLOW.md` holds its tracker
+config and per-ticket prompt). It's
+purely development tooling for maintaining this project — it is **not** part of the
+archiver application, plays no role at runtime, and is safe to ignore or delete if
+you're not running that daemon yourself.
+
+Note that `.symphony/Dockerfile` is unrelated to the `Dockerfile` at the repo root:
+the top-level one builds the archiver's production image (see [Deploying](#deploying)),
+while `.symphony/Dockerfile` builds the sandboxed image the coding agent runs inside
+while working a single ticket.
