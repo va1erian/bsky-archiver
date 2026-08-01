@@ -17,7 +17,7 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 thiserror = "1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rand = "0.8"
 
 [dev-dependencies]
