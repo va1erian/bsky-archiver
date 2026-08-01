@@ -3,6 +3,8 @@
 *.log
 /data
 .symphony-mcp.json
+/.symphony/.workspaces/
+/.symphony/symphony-report.html
 
 
 # Added by cargo
