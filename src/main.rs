@@ -6,6 +6,7 @@ mod health;
 mod media;
 mod pipeline;
 mod poller;
+mod ratelimit;
 mod state;
 mod storage;
 mod templates;

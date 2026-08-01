@@ -6,9 +6,13 @@
 //! likes/bookmarks poller (AR-7) need: session auth (with automatic
 //! re-login on a 401), `getAuthorFeed`, `getActorLikes`, and `getBookmarks`.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use serde::Deserialize;
 
 use crate::config::Secret;
+use crate::ratelimit::RequestLimiter;
 
 /// Errors produced by calls against the Bluesky HTTP API.
 #[derive(Debug, thiserror::Error)]
@@ -16,9 +20,53 @@ pub enum BlueskyError {
     #[error("http request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("bluesky api error (status {status}): {body}")]
-    Api { status: u16, body: String },
+    Api {
+        status: u16,
+        body: String,
+        /// How long the server asked us to wait before retrying, parsed
+        /// from a `Retry-After` or `ratelimit-reset` response header (in
+        /// that preference order) when present.
+        retry_after: Option<Duration>,
+    },
     #[error("failed to authenticate with bluesky: {0}")]
     Auth(String),
+}
+
+impl BlueskyError {
+    /// The server-provided retry hint, if this error carries one. Feeds
+    /// straight into [`crate::ratelimit::Backoff::on_failure`] so callers
+    /// honor the server's stated wait over a guessed backoff.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            BlueskyError::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+/// Parses a retry hint out of response headers, preferring `Retry-After`
+/// (seconds, per RFC 9110) over `ratelimit-reset` (a Unix timestamp of when
+/// the limit resets) when both are present. Shared with [`crate::media`],
+/// which honors the same headers on media CDN responses.
+pub(crate) fn parse_retry_hint(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(secs) = header_as_u64(headers, "retry-after") {
+        return Some(Duration::from_secs(secs));
+    }
+    if let Some(reset_at) = header_as_u64(headers, "ratelimit-reset") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        return Some(Duration::from_secs(reset_at.saturating_sub(now)));
+    }
+    None
+}
+
+fn header_as_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
 /// A view of an author, as embedded in a [`PostView`].
@@ -111,6 +159,10 @@ pub struct BlueskyClient {
     identifier: String,
     app_password: Secret,
     session: tokio::sync::RwLock<Option<Session>>,
+    /// Process-wide soft cap on requests in flight, shared with the media
+    /// downloader. `None` in tests/callers that don't opt in, in which case
+    /// requests are never throttled here.
+    request_limiter: Option<Arc<RequestLimiter>>,
 }
 
 impl BlueskyClient {
@@ -124,6 +176,22 @@ impl BlueskyClient {
             identifier,
             app_password,
             session: tokio::sync::RwLock::new(None),
+            request_limiter: None,
+        }
+    }
+
+    /// Attaches a process-wide request limiter: every request this client
+    /// makes will wait for a slot on `limiter` before hitting the network.
+    pub fn with_request_limiter(mut self, limiter: Arc<RequestLimiter>) -> Self {
+        self.request_limiter = Some(limiter);
+        self
+    }
+
+    /// Waits for a slot on the shared request limiter, if one is attached.
+    async fn throttle(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.request_limiter {
+            Some(limiter) => Some(limiter.acquire().await),
+            None => None,
         }
     }
 
@@ -137,6 +205,7 @@ impl BlueskyClient {
     /// for the first login and to force a fresh session after a 401.
     async fn login(&self) -> Result<String, BlueskyError> {
         let url = self.xrpc_url("com.atproto.server.createSession");
+        let _permit = self.throttle().await;
         let response = self
             .http
             .post(url)
@@ -183,16 +252,19 @@ impl BlueskyClient {
         let url = self.xrpc_url(method);
         let mut access_token = self.access_token().await?;
 
-        let mut response = self
-            .http
-            .get(url.clone())
-            .bearer_auth(&access_token)
-            .query(query)
-            .send()
-            .await?;
+        let mut response = {
+            let _permit = self.throttle().await;
+            self.http
+                .get(url.clone())
+                .bearer_auth(&access_token)
+                .query(query)
+                .send()
+                .await?
+        };
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             access_token = self.login().await?;
+            let _permit = self.throttle().await;
             response = self
                 .http
                 .get(url)
@@ -204,10 +276,12 @@ impl BlueskyClient {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = parse_retry_hint(response.headers());
             let body = response.text().await.unwrap_or_default();
             return Err(BlueskyError::Api {
                 status: status.as_u16(),
                 body,
+                retry_after,
             });
         }
 
@@ -594,6 +668,63 @@ mod tests {
             .await
             .expect_err("bad credentials should fail authenticate");
         assert!(matches!(err, BlueskyError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_response_surfaces_retry_after_hint() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_string("slow down"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let err = client
+            .get_bookmarks(None, 50)
+            .await
+            .expect_err("should surface api error");
+        match err {
+            BlueskyError::Api {
+                status,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(retry_after, Some(Duration::from_secs(30)));
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn retry_after_takes_precedence_over_ratelimit_reset() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "5")
+                    .insert_header("ratelimit-reset", "9999999999"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let err = client
+            .get_bookmarks(None, 50)
+            .await
+            .expect_err("should surface api error");
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(5)));
     }
 
     #[tokio::test]

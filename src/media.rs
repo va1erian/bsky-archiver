@@ -15,14 +15,17 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::pipeline::{CandidatePostReceiver, MediaRef, PostCategory};
+use crate::ratelimit::{Backoff, BackoffConfig, RequestLimiter};
 use crate::storage::{ArchiveStore, Category};
 
 /// Maximum number of attempts (including the first) made to download a
 /// single media file before giving up on it.
 const MAX_ATTEMPTS: u32 = 3;
 /// Base delay for exponential backoff between retry attempts; doubled after
-/// each failed attempt.
+/// each failed attempt (via the shared [`Backoff`] policy).
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+/// Upper bound the per-download retry backoff is capped at.
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// Errors that can occur while downloading a single media file.
 #[derive(Debug, thiserror::Error)]
@@ -34,7 +37,7 @@ enum DownloadError {
     #[error("downloaded body exceeded the configured cap after {0} bytes")]
     BodyTooLarge(u64),
     #[error("server returned status {0}")]
-    Status(reqwest::StatusCode),
+    Status(reqwest::StatusCode, Option<Duration>),
 }
 
 impl DownloadError {
@@ -45,10 +48,19 @@ impl DownloadError {
     fn is_retryable(&self) -> bool {
         match self {
             DownloadError::Http(err) => err.is_timeout() || err.is_connect() || err.is_request(),
-            DownloadError::Status(status) => {
+            DownloadError::Status(status, _) => {
                 status.is_server_error() || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
             }
             DownloadError::DeclaredTooLarge(_) | DownloadError::BodyTooLarge(_) => false,
+        }
+    }
+
+    /// A server-provided retry hint (`Retry-After`/`ratelimit-reset`), if
+    /// this failure carries one.
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            DownloadError::Status(_, retry_after) => *retry_after,
+            _ => None,
         }
     }
 }
@@ -66,6 +78,10 @@ pub struct MediaDownloader {
     store: ArchiveStore,
     semaphore: Arc<Semaphore>,
     max_bytes: u64,
+    /// Process-wide soft cap on requests in flight, shared with
+    /// [`crate::bluesky::BlueskyClient`]. `None` in tests/callers that
+    /// don't opt in, in which case downloads are never throttled here.
+    request_limiter: Option<Arc<RequestLimiter>>,
 }
 
 impl MediaDownloader {
@@ -79,7 +95,16 @@ impl MediaDownloader {
             store,
             semaphore: Arc::new(Semaphore::new(max_concurrent_downloads.max(1))),
             max_bytes,
+            request_limiter: None,
         }
+    }
+
+    /// Attaches a process-wide request limiter: every download this
+    /// instance makes will wait for a slot on `limiter` before hitting the
+    /// network, alongside REST polling requests sharing the same limiter.
+    pub fn with_request_limiter(mut self, limiter: Arc<RequestLimiter>) -> Self {
+        self.request_limiter = Some(limiter);
+        self
     }
 
     /// Drains `candidates` until the channel is closed, archiving each
@@ -152,21 +177,23 @@ impl MediaDownloader {
             .await
             .expect("semaphore is never closed");
 
+        let mut backoff = Backoff::new(BackoffConfig::new(RETRY_BASE_DELAY, RETRY_MAX_DELAY));
         let mut attempt = 0u32;
         let result = loop {
             attempt += 1;
             match self.download_once(&media).await {
                 Ok(downloaded) => break Ok(downloaded),
                 Err(err) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
-                    let backoff = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                    let delay = backoff.on_failure(err.retry_after());
                     tracing::warn!(
                         at_uri = %at_uri,
                         cdn_url = %media.cdn_url,
                         attempt,
                         error = %err,
+                        delay_ms = delay.as_millis() as u64,
                         "media download failed, retrying"
                     );
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(delay).await;
                 }
                 Err(err) => break Err(err),
             }
@@ -224,11 +251,16 @@ impl MediaDownloader {
     /// bytes received exceed `max_bytes`, without ever buffering an
     /// unbounded body into memory.
     async fn download_once(&self, media: &MediaRef) -> Result<Downloaded, DownloadError> {
+        let _request_permit = match &self.request_limiter {
+            Some(limiter) => Some(limiter.acquire().await),
+            None => None,
+        };
         let response = self.http.get(&media.cdn_url).send().await?;
 
         let status = response.status();
         if !status.is_success() {
-            return Err(DownloadError::Status(status));
+            let retry_after = crate::bluesky::parse_retry_hint(response.headers());
+            return Err(DownloadError::Status(status, retry_after));
         }
 
         if let Some(declared_len) = response.content_length()

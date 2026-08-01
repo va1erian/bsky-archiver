@@ -42,6 +42,7 @@ use crate::pipeline::{
     ConnectionHealthSender, candidate_post_channel, connection_health_channel,
 };
 use crate::poller::{LikesBookmarksPoller, PollerConfig, RestFallbackPoller};
+use crate::ratelimit::RequestLimiter;
 use crate::state::{AppState, SharedAppState};
 use crate::storage::{ArchiveStore, StorageError};
 
@@ -49,6 +50,12 @@ use crate::storage::{ArchiveStore, StorageError};
 /// schema (there is no `BSKY_BASE_URL`); overridable only for tests, which
 /// point [`init`] at a `wiremock` server instead.
 pub const DEFAULT_BLUESKY_BASE_URL: &str = "https://bsky.social";
+
+/// Process-wide soft cap on outbound Bluesky-related HTTP requests in
+/// flight at once (REST polling + media downloads combined). Not part of
+/// the canonical env var schema — a burst-smoothing safety net, not a
+/// user-facing tunable.
+const GLOBAL_INFLIGHT_REQUEST_CAP: usize = 16;
 
 /// Everything that can go wrong during startup, each wrapping the
 /// underlying error with enough context to log clearly and exit non-zero.
@@ -74,6 +81,7 @@ pub struct Started {
     candidate_rx: CandidatePostReceiver,
     conn_health_tx: ConnectionHealthSender,
     conn_health_rx: ConnectionHealthReceiver,
+    request_limiter: Arc<RequestLimiter>,
 }
 
 /// Runs the whole service: loads config from the environment, starts up
@@ -103,11 +111,15 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
         store.reindex().await.map_err(StartupError::from)?;
     }
 
-    let bluesky_client = Arc::new(BlueskyClient::new(
-        bluesky_base_url,
-        config.bsky_identifier.clone(),
-        config.bsky_app_password.clone(),
-    ));
+    let request_limiter = Arc::new(RequestLimiter::new(GLOBAL_INFLIGHT_REQUEST_CAP));
+    let bluesky_client = Arc::new(
+        BlueskyClient::new(
+            bluesky_base_url,
+            config.bsky_identifier.clone(),
+            config.bsky_app_password.clone(),
+        )
+        .with_request_limiter(Arc::clone(&request_limiter)),
+    );
     let self_did = bluesky_client
         .authenticate()
         .await
@@ -144,6 +156,7 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
         candidate_rx,
         conn_health_tx,
         conn_health_rx,
+        request_limiter,
     })
 }
 
@@ -183,6 +196,7 @@ pub async fn serve(started: Started) {
         candidate_rx,
         conn_health_tx,
         conn_health_rx,
+        request_limiter,
     } = started;
 
     let config = &state.config;
@@ -230,6 +244,7 @@ pub async fn serve(started: Started) {
         state.store.clone(),
         config.media_max_concurrent_downloads,
         config.media_max_bytes,
+        Arc::clone(&request_limiter),
         health_tx,
         shutdown_rx.clone(),
     ));
@@ -430,6 +445,7 @@ async fn run_media_downloader_supervised(
     store: ArchiveStore,
     max_concurrent_downloads: usize,
     max_bytes: u64,
+    request_limiter: Arc<RequestLimiter>,
     health_tx: HealthSender,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -440,7 +456,8 @@ async fn run_media_downloader_supervised(
         }
 
         health_tx.send_modify(|s| s.media_downloader = SubsystemHealth::connected());
-        let downloader = MediaDownloader::new(store.clone(), max_concurrent_downloads, max_bytes);
+        let downloader = MediaDownloader::new(store.clone(), max_concurrent_downloads, max_bytes)
+            .with_request_limiter(Arc::clone(&request_limiter));
         let outcome = AssertUnwindSafe(downloader.run(&mut candidates))
             .catch_unwind()
             .await;
@@ -741,8 +758,16 @@ mod tests {
         // they're all gone the channel closes.
         drop(tx);
 
-        run_media_downloader_supervised(rx, store.clone(), 4, 104_857_600, health_tx, shutdown_rx)
-            .await;
+        run_media_downloader_supervised(
+            rx,
+            store.clone(),
+            4,
+            104_857_600,
+            Arc::new(RequestLimiter::new(16)),
+            health_tx,
+            shutdown_rx,
+        )
+        .await;
 
         let page = store.list_posts(None, 1, 10).await.expect("list posts");
         assert_eq!(page.items.len(), 1);

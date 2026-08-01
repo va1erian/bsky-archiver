@@ -11,7 +11,6 @@
 
 use std::time::{Duration, Instant};
 
-use rand::Rng;
 use tracing::{debug, info, warn};
 
 use crate::bluesky::{BlueskyClient, BlueskyError, PostView};
@@ -19,6 +18,7 @@ use crate::pipeline::{
     CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver, MediaRef,
     PostCategory, has_archivable_media,
 };
+use crate::ratelimit::{Backoff, BackoffConfig};
 use crate::storage::{ArchiveStore, Category, SaveOutcome, StorageError};
 
 /// How many feed items to request per `getAuthorFeed` page.
@@ -95,8 +95,10 @@ impl AdaptiveInterval {
     }
 
     /// The poll attempt errored: back off (same growth curve as empty
-    /// results; a later ticket, AR-13, may want a steeper curve shared
-    /// across pollers, but that's out of scope here).
+    /// results). Consecutive errors also feed [`RestFallbackPoller`]'s
+    /// shared circuit breaker (AR-13), which kicks in with a much longer
+    /// pause if the endpoint keeps failing well past what this interval
+    /// alone backs off to.
     fn on_error(&mut self) {
         self.current = double_capped(self.current, self.max);
     }
@@ -108,15 +110,18 @@ impl AdaptiveInterval {
     }
 }
 
+/// Doubles `current`, capped at `max`. Delegates to the shared backoff
+/// growth curve ([`crate::ratelimit`]) so this and every other retry loop in
+/// the app grow at the same rate.
 fn double_capped(current: Duration, max: Duration) -> Duration {
-    current.saturating_mul(2).min(max)
+    crate::ratelimit::grow_capped(current, 2.0, max)
 }
 
-/// Applies +/-20% jitter to `base`.
+/// Applies +/-20% jitter to `base`. Delegates to the shared jitter formula
+/// ([`crate::ratelimit::jittered`]) so this and every other retry loop in
+/// the app apply jitter the same way.
 fn jitter(base: Duration) -> Duration {
-    let millis = base.as_millis().max(1) as f64;
-    let factor = rand::thread_rng().gen_range(0.8..=1.2);
-    Duration::from_millis((millis * factor).round() as u64)
+    crate::ratelimit::jittered(base, 0.2)
 }
 
 /// Whether the REST-polling fallback should currently be active, given the
@@ -176,22 +181,50 @@ impl RestFallbackPoller {
     /// "active" (per [`is_active`]) and polling all watched handles on an
     /// adaptive interval. Returns only if the candidate-post channel is
     /// closed (the downstream consumer shut down).
+    ///
+    /// Alongside the adaptive interval (which governs the normal empty/
+    /// content-found cadence), a shared [`Backoff`] circuit breaker (AR-13)
+    /// tracks consecutive `Error` outcomes: once it trips, its cooldown
+    /// floors the sleep so a persistently failing endpoint gets a much
+    /// longer rest instead of being hammered at the interval's own capped
+    /// backoff rate.
     pub async fn run(mut self) {
         let mut interval =
             AdaptiveInterval::new(self.config.baseline_interval, self.config.max_interval);
+        let mut breaker = Backoff::new(BackoffConfig::new(
+            self.config.baseline_interval,
+            self.config.max_interval,
+        ));
 
         loop {
             if !self.wait_until_active().await {
                 return;
             }
 
-            match self.poll_all_handles().await {
-                CycleOutcome::NewContent => interval.on_content_found(),
-                CycleOutcome::Empty => interval.on_empty(),
-                CycleOutcome::Error => interval.on_error(),
-            }
+            let delay = match self.poll_all_handles().await {
+                CycleOutcome::NewContent => {
+                    interval.on_content_found();
+                    breaker.on_success();
+                    interval.jittered()
+                }
+                CycleOutcome::Empty => {
+                    interval.on_empty();
+                    breaker.on_success();
+                    interval.jittered()
+                }
+                CycleOutcome::Error => {
+                    interval.on_error();
+                    let breaker_delay = breaker.on_failure(None);
+                    if breaker.is_open() {
+                        warn!(
+                            cooldown_ms = breaker_delay.as_millis() as u64,
+                            "rest poller circuit breaker open; pausing well past the normal backoff"
+                        );
+                    }
+                    interval.jittered().max(breaker_delay)
+                }
+            };
 
-            let delay = interval.jittered();
             debug!(delay_ms = delay.as_millis() as u64, "rest poller sleeping");
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
@@ -406,9 +439,6 @@ fn extract_media_from_view(embed: &serde_json::Value) -> Vec<MediaRef> {
 /// Page size requested per `getActorLikes` / `getBookmarks` call.
 const PAGE_SIZE: u32 = 50;
 
-/// Cap on exponential backoff multiplier (2^N baseline intervals).
-const MAX_BACKOFF_EXPONENT: u32 = 5;
-
 /// Errors that can end a single poll pass for one category.
 #[derive(Debug, thiserror::Error)]
 pub enum PollError {
@@ -416,6 +446,17 @@ pub enum PollError {
     Bluesky(#[from] BlueskyError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+}
+
+impl PollError {
+    /// The server-provided retry hint carried by the underlying error, if
+    /// any (see [`BlueskyError::retry_after`]).
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            PollError::Bluesky(err) => err.retry_after(),
+            PollError::Storage(_) => None,
+        }
+    }
 }
 
 /// Polls the watched account's likes and bookmarks on a timer, archiving
@@ -447,10 +488,17 @@ impl LikesBookmarksPoller {
     }
 
     /// Runs the poll loop forever: alternates likes and bookmarks passes on
-    /// `base_interval`, backing off (with jitter) after consecutive
-    /// failures and resetting to `base_interval` on success.
+    /// `base_interval`, backing off (with jitter, via the shared
+    /// [`Backoff`] policy) after consecutive failures and resetting to
+    /// `base_interval` on success. Honors a server-provided `Retry-After`/
+    /// `ratelimit-reset` hint over the computed backoff when either poll
+    /// pass surfaces one, and opens a circuit breaker (pausing much longer)
+    /// after too many consecutive failed cycles.
     pub async fn run(&self) {
-        let mut consecutive_errors: u32 = 0;
+        let mut backoff = Backoff::new(BackoffConfig::new(
+            self.base_interval,
+            self.base_interval.saturating_mul(32),
+        ));
         loop {
             let likes_result = self.poll_likes().await;
             if let Err(err) = &likes_result {
@@ -461,13 +509,38 @@ impl LikesBookmarksPoller {
                 warn!(error = %err, "bookmarks poll pass failed");
             }
 
-            if likes_result.is_err() || bookmarks_result.is_err() {
-                consecutive_errors = consecutive_errors.saturating_add(1);
-            } else {
-                consecutive_errors = 0;
-            }
+            let delay = match (&likes_result, &bookmarks_result) {
+                (Ok(_), Ok(_)) => {
+                    backoff.on_success();
+                    crate::ratelimit::jittered(self.base_interval, 0.2)
+                }
+                _ => {
+                    let hint = likes_result
+                        .as_ref()
+                        .err()
+                        .and_then(PollError::retry_after)
+                        .or_else(|| {
+                            bookmarks_result
+                                .as_ref()
+                                .err()
+                                .and_then(PollError::retry_after)
+                        });
+                    let delay = backoff.on_failure(hint);
+                    if backoff.is_open() {
+                        warn!(
+                            cooldown_ms = delay.as_millis() as u64,
+                            "likes/bookmarks poller circuit breaker open; pausing well past the normal backoff"
+                        );
+                    }
+                    delay
+                }
+            };
 
-            let delay = backoff_delay(self.base_interval, consecutive_errors);
+            debug!(
+                delay_ms = delay.as_millis() as u64,
+                next_backoff_ms = backoff.current_delay().as_millis() as u64,
+                "likes/bookmarks poller sleeping"
+            );
             tokio::time::sleep(delay).await;
         }
     }
@@ -583,19 +656,6 @@ impl LikesBookmarksPoller {
 
         Ok(false)
     }
-}
-
-/// Computes the delay before the next poll pass: `base` doubled per
-/// consecutive error (capped at [`MAX_BACKOFF_EXPONENT`]), plus up to 20%
-/// jitter so multiple deployments don't all retry in lockstep.
-fn backoff_delay(base: Duration, consecutive_errors: u32) -> Duration {
-    let exponent = consecutive_errors.min(MAX_BACKOFF_EXPONENT);
-    let multiplier = 1u32 << exponent;
-    let backed_off = base.saturating_mul(multiplier);
-
-    let jitter_fraction = rand::thread_rng().gen_range(0.0..0.2);
-    let jitter = backed_off.mul_f64(jitter_fraction);
-    backed_off + jitter
 }
 
 /// Extracts downloadable media references from a hydrated post-view embed
@@ -1254,16 +1314,26 @@ mod tests {
         assert!(rx.try_recv().is_err(), "text-only post has no media");
     }
 
-    #[test]
-    fn backoff_delay_grows_and_caps() {
-        let base = Duration::from_secs(10);
-        let d0 = backoff_delay(base, 0);
-        let d1 = backoff_delay(base, 1);
-        let d_capped = backoff_delay(base, 100);
+    // `LikesBookmarksPoller::run` used to compute its own backoff via a
+    // private `backoff_delay` free function (tested here directly as
+    // `backoff_delay_grows_and_caps`). AR-13 replaced that ad hoc backoff
+    // with the shared `ratelimit::Backoff` policy, which has its own
+    // dedicated growth/cap/circuit-breaker test suite in `ratelimit.rs` —
+    // so that coverage now lives there instead of being duplicated here.
+    // What's still poller-specific (and still covered below) is extracting
+    // a server-provided retry hint out of a failed poll pass.
 
-        assert!(d0 >= base && d0 < base.mul_f64(1.2) + Duration::from_millis(1));
-        assert!(d1 >= base.mul_f64(2.0));
-        assert!(d_capped <= base.mul_f64((1u32 << MAX_BACKOFF_EXPONENT) as f64 * 1.2 + 1.0));
+    #[test]
+    fn poll_error_retry_after_extracts_bluesky_hint() {
+        let bluesky_err = PollError::Bluesky(BlueskyError::Api {
+            status: 429,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(30)),
+        });
+        assert_eq!(bluesky_err.retry_after(), Some(Duration::from_secs(30)));
+
+        let storage_err = PollError::Storage(StorageError::NotFound("at://x".to_string()));
+        assert_eq!(storage_err.retry_after(), None);
     }
 
     #[test]
