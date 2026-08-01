@@ -518,19 +518,35 @@ fn spawn_web_server(
 
 /// Resolves once SIGINT (Ctrl+C, all platforms) or SIGTERM (Unix only —
 /// there is no such signal on Windows) is received.
+///
+/// If installing either OS signal handler itself fails (an unusual runtime
+/// condition, not a startup-validation failure — e.g. another part of the
+/// process already registered a conflicting handler), that path is logged
+/// and treated as never resolving rather than panicking: the process stays
+/// up and can still be stopped via the other signal (or a hard kill)
+/// instead of crashing outright over a failure in the shutdown path itself.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install ctrl_c handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "failed to install ctrl_c handler");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();

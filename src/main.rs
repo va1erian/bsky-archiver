@@ -1,16 +1,4 @@
-mod app;
-mod bluesky;
-mod config;
-mod firehose;
-mod health;
-mod media;
-mod pipeline;
-mod poller;
-mod ratelimit;
-mod state;
-mod storage;
-mod templates;
-mod web;
+use bsky_archiver::app;
 
 #[tokio::main]
 async fn main() {
