@@ -151,6 +151,23 @@ pub struct MediaSummary {
     pub indexed_at: String,
 }
 
+/// One archived account (the authority/DID embedded in an authored post's
+/// `at_uri`) plus how many archived media files it has, used to build the
+/// gallery's per-account filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaAccount {
+    pub account: String,
+    pub media_count: u64,
+}
+
+/// SQL expression that extracts the AT URI *authority* (the DID) from a
+/// `media.post_at_uri`. `at://` is 5 characters, so the authority starts at
+/// SQLite's 1-based offset 6 and runs up to the next `/`; appending a
+/// trailing `/` guarantees `instr` finds a separator even for a bare
+/// `at://<authority>` with no collection. Kept as a single source of truth
+/// so the account-filter and account-listing queries stay in lock-step.
+const AUTHOR_EXPR: &str = "substr(post_at_uri, 6, instr(substr(post_at_uri, 6) || '/', '/') - 1)";
+
 /// The outcome of a save-if-absent call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveOutcome {
@@ -557,45 +574,100 @@ impl ArchiveStore {
         join_result(result)
     }
 
-    /// Lists archived media newest-first, for the gallery view.
+    /// Lists archived media newest-first, for the gallery view, optionally
+    /// scoped to a single [`Category`] (a distinct liked/bookmarked gallery)
+    /// and/or a single archived account (the DID embedded in each item's
+    /// `post_at_uri`). Passing `None` for either leaves that dimension
+    /// unfiltered.
     pub async fn list_media(
         &self,
+        category: Option<Category>,
+        account: Option<&str>,
         page: u32,
         page_size: u32,
     ) -> Result<Page<MediaSummary>, StorageError> {
         let db = Arc::clone(&self.db);
         let page = page.max(1);
         let page_size = page_size.max(1);
+        let category_filter = category.map(|c| c.as_dir().to_string());
+        let account_filter = account.map(|a| a.to_string());
 
         let result =
             tokio::task::spawn_blocking(move || -> Result<Page<MediaSummary>, StorageError> {
                 let conn = db.lock().unwrap_or_else(|e| e.into_inner());
 
-                let total_items: u64 = conn
-                    .query_row("SELECT COUNT(*) FROM media", [], |row| row.get::<_, i64>(0))?
-                    as u64;
+                // Both filters are expressed as "param IS NULL OR <col> =
+                // param" so a `None` filter matches every row without
+                // needing a second query shape.
+                let where_clause = format!(
+                    "WHERE (?1 IS NULL OR category = ?1) \
+                     AND (?2 IS NULL OR {AUTHOR_EXPR} = ?2)"
+                );
+
+                let total_items: u64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM media {where_clause}"),
+                    params![category_filter, account_filter],
+                    |row| row.get::<_, i64>(0),
+                )? as u64;
 
                 let offset = (page - 1) as i64 * page_size as i64;
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare(&format!(
                     "SELECT post_at_uri, category, filename, content_type, size_bytes, indexed_at
-                 FROM media
-                 ORDER BY indexed_at DESC, id DESC
-                 LIMIT ?1 OFFSET ?2",
+                     FROM media
+                     {where_clause}
+                     ORDER BY indexed_at DESC, id DESC
+                     LIMIT ?3 OFFSET ?4"
+                ))?;
+                let rows = stmt.query_map(
+                    params![category_filter, account_filter, page_size as i64, offset],
+                    |row| {
+                        let category: String = row.get(1)?;
+                        Ok(MediaSummary {
+                            post_at_uri: row.get(0)?,
+                            category: category.parse().unwrap_or(Category::Post),
+                            filename: row.get(2)?,
+                            content_type: row.get(3)?,
+                            size_bytes: row.get::<_, i64>(4)? as u64,
+                            indexed_at: row.get(5)?,
+                        })
+                    },
                 )?;
-                let rows = stmt.query_map(params![page_size as i64, offset], |row| {
-                    let category: String = row.get(1)?;
-                    Ok(MediaSummary {
-                        post_at_uri: row.get(0)?,
-                        category: category.parse().unwrap_or(Category::Post),
-                        filename: row.get(2)?,
-                        content_type: row.get(3)?,
-                        size_bytes: row.get::<_, i64>(4)? as u64,
-                        indexed_at: row.get(5)?,
-                    })
-                })?;
                 let items = rows.collect::<Result<Vec<_>, _>>()?;
 
                 Ok(paginate(items, page, page_size, total_items))
+            })
+            .await;
+
+        join_result(result)
+    }
+
+    /// Lists the distinct archived accounts that have authored-post media,
+    /// newest-largest-first by count then account, for the gallery's
+    /// per-account filter. Only [`Category::Post`] is considered: an
+    /// authored post's author DID *is* one of the watched accounts, whereas
+    /// a like/bookmark's `at_uri` points at some third party's post, so it
+    /// wouldn't identify which watched account archived it.
+    pub async fn list_media_accounts(&self) -> Result<Vec<MediaAccount>, StorageError> {
+        let db = Arc::clone(&self.db);
+
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<MediaAccount>, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {AUTHOR_EXPR} AS account, COUNT(*)
+                 FROM media
+                 WHERE category = 'posts'
+                 GROUP BY account
+                 ORDER BY COUNT(*) DESC, account ASC"
+                ))?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(MediaAccount {
+                        account: row.get(0)?,
+                        media_count: row.get::<_, i64>(1)? as u64,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StorageError::from)
             })
             .await;
 
@@ -890,7 +962,7 @@ mod tests {
         assert_eq!(record.media[0].filename, "image1.jpg");
         assert_eq!(record.media[0].size_bytes, "fake-image-bytes".len() as u64);
 
-        let gallery = store.list_media(1, 10).await.unwrap();
+        let gallery = store.list_media(None, None, 1, 10).await.unwrap();
         assert_eq!(gallery.total_items, 1);
         assert_eq!(gallery.items[0].filename, "image1.jpg");
         assert_eq!(gallery.items[0].post_at_uri, at_uri);
@@ -946,8 +1018,114 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record_again.media.len(), 1);
-        let gallery_again = store.list_media(1, 10).await.unwrap();
+        let gallery_again = store.list_media(None, None, 1, 10).await.unwrap();
         assert_eq!(gallery_again.total_items, 1);
+    }
+
+    /// Seeds one media file under `category` authored by `did`.
+    async fn seed_media(store: &ArchiveStore, category: Category, did: &str, rkey: &str) {
+        let at_uri = format!("at://{did}/app.bsky.feed.post/{rkey}");
+        store
+            .save_post(category, &at_uri, &format!("cid-{rkey}"), json!({}))
+            .await
+            .unwrap();
+        store
+            .save_media(
+                category,
+                &at_uri,
+                "img.jpg",
+                Some("image/jpeg".to_string()),
+                vec![0u8; 4],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_media_filters_by_category_and_account() {
+        let (_dir, store) = open_store().await;
+        // Two watched accounts with authored-post media, plus a like and a
+        // bookmark authored by a third party.
+        seed_media(&store, Category::Post, "did:plc:alice", "a1").await;
+        seed_media(&store, Category::Post, "did:plc:alice", "a2").await;
+        seed_media(&store, Category::Post, "did:plc:bob", "b1").await;
+        seed_media(&store, Category::Like, "did:plc:carol", "c1").await;
+        seed_media(&store, Category::Bookmark, "did:plc:dave", "d1").await;
+
+        // Unfiltered sees everything.
+        assert_eq!(
+            store
+                .list_media(None, None, 1, 50)
+                .await
+                .unwrap()
+                .total_items,
+            5
+        );
+
+        // Category-scoped views are independent.
+        assert_eq!(
+            store
+                .list_media(Some(Category::Like), None, 1, 50)
+                .await
+                .unwrap()
+                .total_items,
+            1
+        );
+        assert_eq!(
+            store
+                .list_media(Some(Category::Bookmark), None, 1, 50)
+                .await
+                .unwrap()
+                .total_items,
+            1
+        );
+        assert_eq!(
+            store
+                .list_media(Some(Category::Post), None, 1, 50)
+                .await
+                .unwrap()
+                .total_items,
+            3
+        );
+
+        // Account-scoped views isolate a single account's media.
+        let alice = store
+            .list_media(None, Some("did:plc:alice"), 1, 50)
+            .await
+            .unwrap();
+        assert_eq!(alice.total_items, 2);
+        assert!(alice.items.iter().all(|m| m.post_at_uri.contains("alice")));
+
+        // Category + account compose.
+        let alice_posts = store
+            .list_media(Some(Category::Post), Some("did:plc:alice"), 1, 50)
+            .await
+            .unwrap();
+        assert_eq!(alice_posts.total_items, 2);
+        let alice_likes = store
+            .list_media(Some(Category::Like), Some("did:plc:alice"), 1, 50)
+            .await
+            .unwrap();
+        assert_eq!(alice_likes.total_items, 0);
+    }
+
+    #[tokio::test]
+    async fn list_media_accounts_returns_distinct_post_authors_by_count() {
+        let (_dir, store) = open_store().await;
+        seed_media(&store, Category::Post, "did:plc:alice", "a1").await;
+        seed_media(&store, Category::Post, "did:plc:alice", "a2").await;
+        seed_media(&store, Category::Post, "did:plc:bob", "b1").await;
+        // Likes/bookmarks authors must not appear as "archived accounts".
+        seed_media(&store, Category::Like, "did:plc:carol", "c1").await;
+
+        let accounts = store.list_media_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        // Ordered by descending media count, so alice (2) precedes bob (1).
+        assert_eq!(accounts[0].account, "did:plc:alice");
+        assert_eq!(accounts[0].media_count, 2);
+        assert_eq!(accounts[1].account, "did:plc:bob");
+        assert_eq!(accounts[1].media_count, 1);
+        assert!(!accounts.iter().any(|a| a.account == "did:plc:carol"));
     }
 
     #[tokio::test]
@@ -1072,7 +1250,7 @@ mod tests {
             .unwrap();
 
         let before_posts = store.list_posts(None, 1, 100).await.unwrap();
-        let before_media = store.list_media(1, 100).await.unwrap();
+        let before_media = store.list_media(None, None, 1, 100).await.unwrap();
 
         // A brand-new store pointed at a fresh database file, over the
         // same on-disk archive: the index starts empty.
@@ -1086,7 +1264,7 @@ mod tests {
         fresh_store.reindex().await.unwrap();
 
         let after_posts = fresh_store.list_posts(None, 1, 100).await.unwrap();
-        let after_media = fresh_store.list_media(1, 100).await.unwrap();
+        let after_media = fresh_store.list_media(None, None, 1, 100).await.unwrap();
 
         assert_eq!(after_posts.total_items, before_posts.total_items);
         let mut before_uris: Vec<_> = before_posts

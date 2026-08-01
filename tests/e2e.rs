@@ -447,7 +447,7 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
     let posts_page = store.list_posts(None, 1, 10).await.unwrap();
     assert_eq!(posts_page.total_items, 3);
 
-    let gallery_page = store.list_media(1, 10).await.unwrap();
+    let gallery_page = store.list_media(None, None, 1, 10).await.unwrap();
     assert_eq!(gallery_page.total_items, 3);
 
     // --- Assert: visible and correctly rendered via the real web UI

@@ -1,7 +1,27 @@
 {% extends "base.html" %}
-{% block title %}Gallery – bsky-archiver{% endblock %}
+{% block title %}{{ heading }} – bsky-archiver{% endblock %}
 {% block content %}
-<h1>Gallery</h1>
+<h1>{{ heading }}</h1>
+<nav aria-label="Gallery category filter">
+{% for link in category_links %}
+{% if link.selected %}
+<span class="current">{{ link.label }}</span>
+{% else %}
+<a href="{{ link.href }}">{{ link.label }}</a>
+{% endif %}
+{% endfor %}
+</nav>
+{% if !account_links.is_empty() %}
+<nav aria-label="Account filter">
+{% for link in account_links %}
+{% if link.selected %}
+<span class="current">{{ link.label }}</span>
+{% else %}
+<a href="{{ link.href }}">{{ link.label }}</a>
+{% endif %}
+{% endfor %}
+</nav>
+{% endif %}
 {% include "gallery_grid.html" %}
 
 <dialog id="lightbox">

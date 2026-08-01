@@ -8,8 +8,16 @@ A self-hosted daemon + web UI that watches one Bluesky account and archives:
 
 For each archived item, the full post record is stored as JSON and any attached
 images/video are downloaded and stored alongside it. A small web UI lets a human
-browse the archive (post list + detail), view a gallery of archived media, and see
+browse the archive (post list + detail), view galleries of archived media, and see
 the active (non-secret) configuration.
+
+The media galleries are split into independently-paginated, category-scoped views:
+a combined gallery at `/gallery`, plus dedicated liked (`/gallery/likes`) and
+bookmarked (`/gallery/bookmarks`) galleries (authored posts-with-media are at
+`/gallery/posts`), all reachable from the nav. When more than one handle is
+configured via `BSKY_WATCH_HANDLES`, each gallery also offers a per-account filter
+(`?account=<did>`) so a single archived account's media can be browsed on its own
+rather than mixed into one grid.
 
 Real-time capture of the watched account's own posts uses a Jetstream firehose
 subscription; a REST-polling path fully substitutes for it whenever the firehose

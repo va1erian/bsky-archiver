@@ -307,9 +307,21 @@ pub fn gallery_item(summary: &MediaSummary) -> GalleryItem {
     }
 }
 
+/// One entry in the gallery's category or per-account filter nav. Unlike
+/// [`CategoryOption`] (whose labels are compile-time constants), an account
+/// label is a runtime DID, so this carries an owned `String`.
+pub struct FilterLink {
+    pub label: String,
+    pub href: String,
+    pub selected: bool,
+}
+
 #[derive(Template)]
 #[template(path = "gallery.html")]
 pub struct GalleryTemplate {
+    pub heading: String,
+    pub category_links: Vec<FilterLink>,
+    pub account_links: Vec<FilterLink>,
     pub items: Vec<GalleryItem>,
     pub pagination: Pagination,
 }

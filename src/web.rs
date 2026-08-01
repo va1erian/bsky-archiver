@@ -51,6 +51,7 @@ pub fn router(app: SharedAppState) -> Router {
         .route("/posts", get(list_posts))
         .route("/posts/:id", get(post_detail))
         .route("/gallery", get(gallery))
+        .route("/gallery/:category", get(gallery_scoped))
         .route("/config", get(config_view))
         .route("/media/:category/:id/:filename", get(media_file))
         .route("/logout", axum::routing::post(logout))
@@ -407,30 +408,181 @@ async fn post_detail(
 struct GalleryQuery {
     page: Option<u32>,
     page_size: Option<u32>,
+    /// Optional per-account filter: the DID (AT URI authority) of an
+    /// archived account, matched against each media item's post.
+    account: Option<String>,
 }
 
+/// The combined gallery (`/gallery`): every archived category's media.
 async fn gallery(
     State(state): State<WebState>,
     Query(query): Query<GalleryQuery>,
     headers: HeaderMap,
 ) -> Result<Response, WebError> {
+    render_gallery(&state, None, query, &headers).await
+}
+
+/// A category-scoped gallery (`/gallery/likes`, `/gallery/bookmarks`,
+/// `/gallery/posts`): each is independently paginated.
+async fn gallery_scoped(
+    State(state): State<WebState>,
+    Path(category): Path<String>,
+    Query(query): Query<GalleryQuery>,
+    headers: HeaderMap,
+) -> Result<Response, WebError> {
+    let category = category
+        .parse::<Category>()
+        .map_err(|_| WebError::BadRequest {
+            message: format!("unknown gallery category {category:?}"),
+        })?;
+    render_gallery(&state, Some(category), query, &headers).await
+}
+
+/// Shared rendering for the combined and category-scoped galleries.
+/// `category == None` is the combined view; `Some(_)` scopes to one
+/// category. An `account` query param further scopes to a single archived
+/// account. Both filters are preserved across pagination and htmx swaps.
+async fn render_gallery(
+    state: &WebState,
+    category: Option<Category>,
+    query: GalleryQuery,
+    headers: &HeaderMap,
+) -> Result<Response, WebError> {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = clamp_page_size(query.page_size);
+    // Treat an empty `account=` the same as no filter at all.
+    let account = query.account.as_deref().filter(|s| !s.is_empty());
 
-    let result = state.app.store.list_media(page, page_size).await?;
+    let result = state
+        .app
+        .store
+        .list_media(category, account, page, page_size)
+        .await?;
     let items: Vec<_> = result.items.iter().map(templates::gallery_item).collect();
+
+    let base = gallery_base_path(category);
     let pagination =
         templates::build_pagination(result.page, result.total_pages, result.total_items, |n| {
-            format!("/gallery?page={n}&page_size={page_size}")
+            gallery_page_href(&base, account, n, page_size)
         });
 
-    if is_htmx_request(&headers) {
+    if is_htmx_request(headers) {
         let fragment = templates::GalleryGridTemplate { items, pagination };
-        Ok(askama_axum::into_response(&fragment))
-    } else {
-        let template = templates::GalleryTemplate { items, pagination };
-        Ok(askama_axum::into_response(&template))
+        return Ok(askama_axum::into_response(&fragment));
     }
+
+    let category_links = build_gallery_category_links(category, account);
+    let account_links = build_gallery_account_links(state, category, account).await?;
+    let template = templates::GalleryTemplate {
+        heading: gallery_heading(category),
+        category_links,
+        account_links,
+        items,
+        pagination,
+    };
+    Ok(askama_axum::into_response(&template))
+}
+
+/// The route path for a gallery view, without any query string.
+fn gallery_base_path(category: Option<Category>) -> String {
+    match category {
+        Some(category) => format!("/gallery/{category}"),
+        None => "/gallery".to_string(),
+    }
+}
+
+/// Percent-encodes a query-string value (an account DID contains `:` and
+/// other reserved characters) so it survives a round-trip through the URL.
+fn encode_query_value(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// A gallery link that navigates to a specific page while preserving the
+/// active account filter (used for prev/next/numbered pagination links).
+fn gallery_page_href(base: &str, account: Option<&str>, page: u32, page_size: u32) -> String {
+    match account {
+        Some(account) => format!(
+            "{base}?account={}&page={page}&page_size={page_size}",
+            encode_query_value(account)
+        ),
+        None => format!("{base}?page={page}&page_size={page_size}"),
+    }
+}
+
+/// A gallery filter link (category or account nav): resets to page 1 while
+/// preserving the given account filter, if any.
+fn gallery_filter_href(base: &str, account: Option<&str>) -> String {
+    match account {
+        Some(account) => format!("{base}?account={}", encode_query_value(account)),
+        None => base.to_string(),
+    }
+}
+
+fn gallery_heading(category: Option<Category>) -> String {
+    match category {
+        None => "Gallery",
+        Some(Category::Post) => "Posts gallery",
+        Some(Category::Like) => "Liked gallery",
+        Some(Category::Bookmark) => "Bookmarked gallery",
+    }
+    .to_string()
+}
+
+/// Builds the gallery's category-filter nav (All / Posts / Liked /
+/// Bookmarked), keeping the active account filter across category switches.
+fn build_gallery_category_links(
+    selected: Option<Category>,
+    account: Option<&str>,
+) -> Vec<templates::FilterLink> {
+    let entries: [(Option<Category>, &str); 4] = [
+        (None, "All"),
+        (Some(Category::Post), "Posts"),
+        (Some(Category::Like), "Liked"),
+        (Some(Category::Bookmark), "Bookmarked"),
+    ];
+    entries
+        .into_iter()
+        .map(|(category, label)| templates::FilterLink {
+            label: label.to_string(),
+            href: gallery_filter_href(&gallery_base_path(category), account),
+            selected: category == selected,
+        })
+        .collect()
+}
+
+/// Builds the gallery's per-account filter nav, but only when more than one
+/// handle is configured via `BSKY_WATCH_HANDLES` (otherwise there's nothing
+/// to disambiguate). The account list is derived from which accounts
+/// actually have archived authored-post media, keeping the current
+/// category scope in each link's href.
+async fn build_gallery_account_links(
+    state: &WebState,
+    category: Option<Category>,
+    selected: Option<&str>,
+) -> Result<Vec<templates::FilterLink>, WebError> {
+    if state.app.config.bsky_watch_handles.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let accounts = state.app.store.list_media_accounts().await?;
+    if accounts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let base = gallery_base_path(category);
+    let mut links = Vec::with_capacity(accounts.len() + 1);
+    links.push(templates::FilterLink {
+        label: "All accounts".to_string(),
+        href: base.clone(),
+        selected: selected.is_none(),
+    });
+    for account in accounts {
+        links.push(templates::FilterLink {
+            label: format!("{} ({})", account.account, account.media_count),
+            href: gallery_filter_href(&base, Some(&account.account)),
+            selected: selected == Some(account.account.as_str()),
+        });
+    }
+    Ok(links)
 }
 
 // ---------------------------------------------------------------------
@@ -577,6 +729,15 @@ mod tests {
     use tower::ServiceExt;
 
     async fn test_state() -> (tempfile::TempDir, SharedAppState) {
+        state_with_watch_handles(vec!["alice.bsky.social".to_string()]).await
+    }
+
+    /// Like [`test_state`], but with an explicit `BSKY_WATCH_HANDLES` list,
+    /// so tests can exercise the multi-account gallery filter (which only
+    /// surfaces when more than one handle is configured).
+    async fn state_with_watch_handles(
+        bsky_watch_handles: Vec<String>,
+    ) -> (tempfile::TempDir, SharedAppState) {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive_dir = dir.path().join("archive");
         let database_path = dir.path().join("index.sqlite3");
@@ -587,7 +748,7 @@ mod tests {
         let config = AppConfig {
             bsky_identifier: "alice.bsky.social".to_string(),
             bsky_app_password: Secret::from("bsky-app-password-secret".to_string()),
-            bsky_watch_handles: vec!["alice.bsky.social".to_string()],
+            bsky_watch_handles,
             archive_dir,
             database_path: dir.path().join("index.sqlite3"),
             ui_password: Secret::from("correct horse battery staple".to_string()),
@@ -824,6 +985,7 @@ mod tests {
             Query(GalleryQuery {
                 page: Some(1),
                 page_size: Some(10),
+                account: None,
             }),
             HeaderMap::new(),
         )
@@ -840,6 +1002,7 @@ mod tests {
             Query(GalleryQuery {
                 page: Some(2),
                 page_size: Some(10),
+                account: None,
             }),
             HeaderMap::new(),
         )
@@ -1158,6 +1321,231 @@ mod tests {
         assert!(body.contains("data-lightbox"));
         assert!(body.contains("id=\"lightbox\""));
         assert!(body.contains("class=\"pagination\""));
+    }
+
+    /// Seeds one media item in each category, each authored by a distinct
+    /// account, so the category- and account-scoped galleries have
+    /// unambiguous, mutually-exclusive content to assert on.
+    async fn seed_gallery_fixture(store: &ArchiveStore) {
+        for (category, did, filename, content_type) in [
+            (
+                StorageCategory::Post,
+                "did:plc:alice",
+                "alice.jpg",
+                "image/jpeg",
+            ),
+            (
+                StorageCategory::Post,
+                "did:plc:bob",
+                "bob.jpg",
+                "image/jpeg",
+            ),
+            (
+                StorageCategory::Like,
+                "did:plc:carol",
+                "liked.jpg",
+                "image/jpeg",
+            ),
+            (
+                StorageCategory::Bookmark,
+                "did:plc:dave",
+                "booked.mp4",
+                "video/mp4",
+            ),
+        ] {
+            let at_uri = format!("at://{did}/app.bsky.feed.post/{filename}");
+            store
+                .save_post(category, &at_uri, "cid", json!({}))
+                .await
+                .unwrap();
+            store
+                .save_media(
+                    category,
+                    &at_uri,
+                    filename,
+                    Some(content_type.to_string()),
+                    vec![0u8; 4],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn liked_and_bookmarked_galleries_are_separate_and_scoped() {
+        let (_dir, state) = test_state().await;
+        seed_gallery_fixture(&state.store).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let likes = app
+            .clone()
+            .oneshot(
+                Request::get("/gallery/likes")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(likes.status(), StatusCode::OK);
+        let likes_body = body_string(likes).await;
+        assert!(likes_body.contains("Liked gallery"));
+        assert!(likes_body.contains("Like media from did:plc:carol"));
+        // The liked gallery must not leak bookmarked or authored-post media.
+        assert!(!likes_body.contains("Bookmark media from"));
+        assert!(!likes_body.contains("Post media from"));
+        // The category filter nav marks the current view.
+        assert!(likes_body.contains("<span class=\"current\">Liked</span>"));
+        assert!(likes_body.contains("class=\"pagination\""));
+
+        let bookmarks = app
+            .oneshot(
+                Request::get("/gallery/bookmarks")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bookmarks.status(), StatusCode::OK);
+        let bookmarks_body = body_string(bookmarks).await;
+        assert!(bookmarks_body.contains("Bookmarked gallery"));
+        assert!(bookmarks_body.contains("Bookmark media from did:plc:dave"));
+        assert!(!bookmarks_body.contains("Like media from"));
+        assert!(bookmarks_body.contains("<span class=\"current\">Bookmarked</span>"));
+    }
+
+    #[tokio::test]
+    async fn scoped_gallery_htmx_request_returns_only_the_grid_fragment() {
+        let (_dir, state) = test_state().await;
+        seed_gallery_fixture(&state.store).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::get("/gallery/likes")
+                    .header(header::COOKIE, cookie)
+                    .header("HX-Request", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+
+        assert!(body.contains("id=\"gallery-grid\""));
+        assert!(
+            !body.contains("Dashboard</a>"),
+            "fragment must not include full-page chrome"
+        );
+        assert!(
+            !body.contains("Liked gallery"),
+            "fragment must not include the page heading"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_gallery_category_is_a_bad_request() {
+        let (_dir, state) = test_state().await;
+        let app = router(state);
+        let cookie = login(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::get("/gallery/nonsense")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn account_filter_appears_only_with_multiple_watch_handles() {
+        // Single configured handle: no account filter nav at all.
+        let (_dir, single) = test_state().await;
+        seed_gallery_fixture(&single.store).await;
+        let single_app = router(Arc::clone(&single));
+        let single_cookie = login(&single_app).await;
+        let single_body = body_string(
+            single_app
+                .oneshot(
+                    Request::get("/gallery")
+                        .header(header::COOKIE, single_cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!single_body.contains("aria-label=\"Account filter\""));
+        assert!(!single_body.contains("All accounts"));
+
+        // Two configured handles: the per-account filter is offered, listing
+        // the accounts that actually have archived authored-post media.
+        let (_dir2, multi) = state_with_watch_handles(vec![
+            "alice.bsky.social".to_string(),
+            "bob.bsky.social".to_string(),
+        ])
+        .await;
+        seed_gallery_fixture(&multi.store).await;
+        let multi_app = router(Arc::clone(&multi));
+        let multi_cookie = login(&multi_app).await;
+        let multi_body = body_string(
+            multi_app
+                .oneshot(
+                    Request::get("/gallery")
+                        .header(header::COOKIE, multi_cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(multi_body.contains("aria-label=\"Account filter\""));
+        assert!(multi_body.contains("All accounts"));
+        assert!(multi_body.contains("did:plc:alice"));
+        assert!(multi_body.contains("did:plc:bob"));
+    }
+
+    #[tokio::test]
+    async fn gallery_scoped_to_a_single_account_isolates_its_media() {
+        let (_dir, state) = state_with_watch_handles(vec![
+            "alice.bsky.social".to_string(),
+            "bob.bsky.social".to_string(),
+        ])
+        .await;
+        seed_gallery_fixture(&state.store).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::get("/gallery/posts?account=did:plc:alice")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+
+        // Only alice's authored-post media is in the grid; bob's is excluded.
+        assert!(body.contains("Post media from did:plc:alice"));
+        assert!(!body.contains("Post media from did:plc:bob"));
+        // The selected account is marked current in the account filter nav.
+        assert!(body.contains("<span class=\"current\">did:plc:alice"));
+        // The account filter survives navigation: the category filter links
+        // carry the percent-encoded account query param through.
+        assert!(body.contains("account=did%3Aplc%3Aalice"));
     }
 
     #[tokio::test]
