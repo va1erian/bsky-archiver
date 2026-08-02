@@ -8,8 +8,10 @@ A self-hosted daemon + web UI that watches one Bluesky account and archives:
 
 For each archived item, the full post record is stored as JSON and any attached
 images/video are downloaded and stored alongside it. A small web UI lets a human
-browse the archive (post list + detail), view a gallery of archived media, and see
-the active (non-secret) configuration.
+browse the archive (post list + detail), view a gallery of archived media —
+filterable by category (posts / likes / bookmarks) and downloadable as a single
+zip of every image in the current selection — and see the active (non-secret)
+configuration.
 
 Real-time capture of the watched account's own posts uses a Jetstream firehose
 subscription; a REST-polling path fully substitutes for it whenever the firehose
@@ -83,7 +85,8 @@ for anything that talks to Jetstream — the real Bluesky network is never conta
 from a test) plus an end-to-end test (`tests/e2e.rs`) that drives a real `AppState`,
 real on-disk storage, and a real `axum` router through the full pipeline: an authored
 post with media, a like, and a bookmark, each archived end to end and then verified
-through the actual web UI routes (list, detail, gallery, and raw media bytes).
+through the actual web UI routes (list, detail, gallery, raw media bytes, and the
+gallery's zip export at `GET /gallery/export`).
 
 The crate is structured as a library (`src/lib.rs`) with a thin binary shim
 (`src/main.rs`) specifically so `tests/e2e.rs` can exercise real internal types

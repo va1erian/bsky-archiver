@@ -151,6 +151,33 @@ pub struct MediaSummary {
     pub indexed_at: String,
 }
 
+/// The image count and total byte size of an export selection, for the
+/// gallery's size estimate / soft warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExportEstimate {
+    pub image_count: u64,
+    pub total_bytes: u64,
+}
+
+/// SQL predicate (over a `media` row) selecting exactly the rows the zip
+/// export treats as an image.
+///
+/// `content_type` is nullable and `media::extension_for` falls back to the
+/// CDN URL's extension when the MIME type is unknown, so a bare
+/// `content_type LIKE 'image/%'` predicate would silently drop real images
+/// archived with a null content type. This predicate therefore also admits
+/// a null-content-type row whose filename ends in a known image extension,
+/// while still excluding `video/*`, `.bin` fallbacks, and unrecognised
+/// extensions. The identical predicate backs both [`ArchiveStore::export_estimate`]
+/// and [`ArchiveStore::list_export_media`] so the warning can never disagree
+/// with what the download actually contains.
+const IMAGE_PREDICATE_SQL: &str = "(content_type LIKE 'image/%' \
+    OR (content_type IS NULL AND ( \
+        lower(filename) LIKE '%.jpg' \
+        OR lower(filename) LIKE '%.png' \
+        OR lower(filename) LIKE '%.gif' \
+        OR lower(filename) LIKE '%.webp')))";
+
 /// The outcome of a save-if-absent call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveOutcome {
@@ -285,6 +312,8 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
             FOREIGN KEY (category, post_at_uri) REFERENCES posts(category, at_uri) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_media_indexed_at ON media(indexed_at, id);
+        CREATE INDEX IF NOT EXISTS idx_media_category_indexed_at
+            ON media(category, indexed_at, id);
         ",
     )?;
 
@@ -557,9 +586,13 @@ impl ArchiveStore {
         join_result(result)
     }
 
-    /// Lists archived media newest-first, for the gallery view.
+    /// Lists archived media newest-first, for the gallery view. `category`
+    /// filters to a single category; `None` lists every category (today's
+    /// behaviour). This still returns every media kind (images *and* video)
+    /// — only the zip export narrows to images.
     pub async fn list_media(
         &self,
+        category: Option<Category>,
         page: u32,
         page_size: u32,
     ) -> Result<Page<MediaSummary>, StorageError> {
@@ -570,19 +603,100 @@ impl ArchiveStore {
         let result =
             tokio::task::spawn_blocking(move || -> Result<Page<MediaSummary>, StorageError> {
                 let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let category_filter = category.map(|c| c.as_dir().to_string());
 
-                let total_items: u64 = conn
-                    .query_row("SELECT COUNT(*) FROM media", [], |row| row.get::<_, i64>(0))?
-                    as u64;
+                let total_items: u64 = conn.query_row(
+                    "SELECT COUNT(*) FROM media WHERE ?1 IS NULL OR category = ?1",
+                    params![category_filter],
+                    |row| row.get::<_, i64>(0),
+                )? as u64;
 
                 let offset = (page - 1) as i64 * page_size as i64;
                 let mut stmt = conn.prepare(
                     "SELECT post_at_uri, category, filename, content_type, size_bytes, indexed_at
                  FROM media
+                 WHERE ?1 IS NULL OR category = ?1
                  ORDER BY indexed_at DESC, id DESC
-                 LIMIT ?1 OFFSET ?2",
+                 LIMIT ?2 OFFSET ?3",
                 )?;
-                let rows = stmt.query_map(params![page_size as i64, offset], |row| {
+                let rows =
+                    stmt.query_map(params![category_filter, page_size as i64, offset], |row| {
+                        let category: String = row.get(1)?;
+                        Ok(MediaSummary {
+                            post_at_uri: row.get(0)?,
+                            category: category.parse().unwrap_or(Category::Post),
+                            filename: row.get(2)?,
+                            content_type: row.get(3)?,
+                            size_bytes: row.get::<_, i64>(4)? as u64,
+                            indexed_at: row.get(5)?,
+                        })
+                    })?;
+                let items = rows.collect::<Result<Vec<_>, _>>()?;
+
+                Ok(paginate(items, page, page_size, total_items))
+            })
+            .await;
+
+        join_result(result)
+    }
+
+    /// The image count and total byte size of an export selection
+    /// (optionally filtered by `category`), from a single aggregate query
+    /// using [`IMAGE_PREDICATE_SQL`]. Reads `size_bytes` straight from the
+    /// index, so it needs no filesystem access.
+    pub async fn export_estimate(
+        &self,
+        category: Option<Category>,
+    ) -> Result<ExportEstimate, StorageError> {
+        let db = Arc::clone(&self.db);
+
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<ExportEstimate, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let category_filter = category.map(|c| c.as_dir().to_string());
+
+                let sql = format!(
+                    "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM media
+                 WHERE (?1 IS NULL OR category = ?1) AND {IMAGE_PREDICATE_SQL}"
+                );
+                let (image_count, total_bytes) =
+                    conn.query_row(&sql, params![category_filter], |row| {
+                        Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+                    })?;
+
+                Ok(ExportEstimate {
+                    image_count,
+                    total_bytes,
+                })
+            })
+            .await;
+
+        join_result(result)
+    }
+
+    /// Lists every image row (optionally filtered by `category`) the zip
+    /// export should contain, newest-first, using the same
+    /// [`IMAGE_PREDICATE_SQL`] as [`ArchiveStore::export_estimate`]. Unpaged:
+    /// the export is a single archive of the whole selection.
+    pub async fn list_export_media(
+        &self,
+        category: Option<Category>,
+    ) -> Result<Vec<MediaSummary>, StorageError> {
+        let db = Arc::clone(&self.db);
+
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<MediaSummary>, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let category_filter = category.map(|c| c.as_dir().to_string());
+
+                let sql = format!(
+                    "SELECT post_at_uri, category, filename, content_type, size_bytes, indexed_at
+                 FROM media
+                 WHERE (?1 IS NULL OR category = ?1) AND {IMAGE_PREDICATE_SQL}
+                 ORDER BY indexed_at DESC, id DESC"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params![category_filter], |row| {
                     let category: String = row.get(1)?;
                     Ok(MediaSummary {
                         post_at_uri: row.get(0)?,
@@ -593,13 +707,39 @@ impl ArchiveStore {
                         indexed_at: row.get(5)?,
                     })
                 })?;
-                let items = rows.collect::<Result<Vec<_>, _>>()?;
-
-                Ok(paginate(items, page, page_size, total_items))
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StorageError::from)
             })
             .await;
 
         join_result(result)
+    }
+
+    /// Opens a previously-archived media file for streaming reads, without
+    /// loading it into memory (unlike [`ArchiveStore::read_media`], which is
+    /// a download-side path). Returns `None` if the file is missing on disk
+    /// — the export skips such orphaned rows rather than aborting. Applies
+    /// the same bare-filename guard as `read_media`.
+    pub async fn open_media(
+        &self,
+        category: Category,
+        at_uri: &str,
+        filename: &str,
+    ) -> Result<Option<tokio::fs::File>, StorageError> {
+        if filename.is_empty()
+            || filename.contains('/')
+            || filename.contains('\\')
+            || filename == ".."
+        {
+            return Ok(None);
+        }
+
+        let path = media_dir(&self.archive_dir, category, at_uri).join(filename);
+        match tokio::fs::File::open(&path).await {
+            Ok(file) => Ok(Some(file)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(StorageError::Io(err)),
+        }
     }
 
     /// Reads a previously-archived media file's raw bytes straight from
@@ -890,7 +1030,7 @@ mod tests {
         assert_eq!(record.media[0].filename, "image1.jpg");
         assert_eq!(record.media[0].size_bytes, "fake-image-bytes".len() as u64);
 
-        let gallery = store.list_media(1, 10).await.unwrap();
+        let gallery = store.list_media(None, 1, 10).await.unwrap();
         assert_eq!(gallery.total_items, 1);
         assert_eq!(gallery.items[0].filename, "image1.jpg");
         assert_eq!(gallery.items[0].post_at_uri, at_uri);
@@ -946,7 +1086,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record_again.media.len(), 1);
-        let gallery_again = store.list_media(1, 10).await.unwrap();
+        let gallery_again = store.list_media(None, 1, 10).await.unwrap();
         assert_eq!(gallery_again.total_items, 1);
     }
 
@@ -1072,7 +1212,7 @@ mod tests {
             .unwrap();
 
         let before_posts = store.list_posts(None, 1, 100).await.unwrap();
-        let before_media = store.list_media(1, 100).await.unwrap();
+        let before_media = store.list_media(None, 1, 100).await.unwrap();
 
         // A brand-new store pointed at a fresh database file, over the
         // same on-disk archive: the index starts empty.
@@ -1086,7 +1226,7 @@ mod tests {
         fresh_store.reindex().await.unwrap();
 
         let after_posts = fresh_store.list_posts(None, 1, 100).await.unwrap();
-        let after_media = fresh_store.list_media(1, 100).await.unwrap();
+        let after_media = fresh_store.list_media(None, 1, 100).await.unwrap();
 
         assert_eq!(after_posts.total_items, before_posts.total_items);
         let mut before_uris: Vec<_> = before_posts
@@ -1133,5 +1273,99 @@ mod tests {
         store.reindex().await.unwrap();
         let page = store.list_posts(None, 1, 10).await.unwrap();
         assert_eq!(page.total_items, 0);
+    }
+
+    /// Seeds one image under each category so category-filtered queries have
+    /// something to isolate.
+    async fn seed_one_image_per_category(store: &ArchiveStore) {
+        for category in Category::ALL {
+            let at_uri = format!("at://did:plc:alice/app.bsky.feed.post/{category}");
+            store
+                .save_post(category, &at_uri, "cid", json!({}))
+                .await
+                .unwrap();
+            store
+                .save_media(
+                    category,
+                    &at_uri,
+                    "000.jpg",
+                    Some("image/jpeg".to_string()),
+                    vec![0u8; 10],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_media_filters_by_category() {
+        let (_dir, store) = open_store().await;
+        seed_one_image_per_category(&store).await;
+
+        let all = store.list_media(None, 1, 100).await.unwrap();
+        assert_eq!(all.total_items, 3);
+
+        let likes = store
+            .list_media(Some(Category::Like), 1, 100)
+            .await
+            .unwrap();
+        assert_eq!(likes.total_items, 1);
+        assert_eq!(likes.items.len(), 1);
+        assert!(likes.items.iter().all(|m| m.category == Category::Like));
+    }
+
+    #[tokio::test]
+    async fn export_predicate_selects_images_and_skips_video_and_bin() {
+        let (_dir, store) = open_store().await;
+        let at_uri = "at://did:plc:alice/app.bsky.feed.post/mixed";
+        store
+            .save_post(Category::Post, at_uri, "cid", json!({}))
+            .await
+            .unwrap();
+        // An image with an explicit content type.
+        store
+            .save_media(
+                Category::Post,
+                at_uri,
+                "000.jpg",
+                Some("image/jpeg".to_string()),
+                vec![0u8; 100],
+            )
+            .await
+            .unwrap();
+        // A null-content-type row whose filename extension marks it as an
+        // image — must still be included.
+        store
+            .save_media(Category::Post, at_uri, "001.png", None, vec![0u8; 200])
+            .await
+            .unwrap();
+        // A video — excluded.
+        store
+            .save_media(
+                Category::Post,
+                at_uri,
+                "002.mp4",
+                Some("video/mp4".to_string()),
+                vec![0u8; 400],
+            )
+            .await
+            .unwrap();
+        // A `.bin` fallback with an unknown/null content type — excluded.
+        store
+            .save_media(Category::Post, at_uri, "003.bin", None, vec![0u8; 800])
+            .await
+            .unwrap();
+
+        let estimate = store.export_estimate(None).await.unwrap();
+        assert_eq!(estimate.image_count, 2);
+        assert_eq!(estimate.total_bytes, 300);
+
+        let items = store.list_export_media(None).await.unwrap();
+        let names: Vec<_> = items.iter().map(|m| m.filename.as_str()).collect();
+        assert_eq!(items.len(), 2);
+        assert!(names.contains(&"000.jpg"));
+        assert!(names.contains(&"001.png"));
+        assert!(!names.contains(&"002.mp4"));
+        assert!(!names.contains(&"003.bin"));
     }
 }

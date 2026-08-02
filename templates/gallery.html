@@ -2,6 +2,28 @@
 {% block title %}Gallery – bsky-archiver{% endblock %}
 {% block content %}
 <h1>Gallery</h1>
+<nav aria-label="Category filter">
+{% for opt in category_options %}
+{% if opt.selected %}
+<span class="current">{{ opt.label }}</span>
+{% else %}
+<a href="{{ opt.href }}">{{ opt.label }}</a>
+{% endif %}
+{% endfor %}
+</nav>
+
+<section class="export-panel">
+{% if export.image_count == 0 %}
+<p class="export-empty">No images in this selection to export.</p>
+{% else %}
+{% if let Some(warning) = export.warning %}
+<p class="export-warning" role="alert">{{ warning }}</p>
+{% endif %}
+<p class="export-summary">{{ export.image_count }} image{% if export.image_count != 1 %}s{% endif %} · {{ export.size_label }}</p>
+<a class="export-button" role="button" href="{{ export.href }}">Download zip</a>
+{% endif %}
+</section>
+
 {% include "gallery_grid.html" %}
 
 <dialog id="lightbox">
