@@ -10,6 +10,10 @@ use askama::Template;
 use crate::health::{Status, SubsystemHealth};
 use crate::storage::{Category, MediaSummary, PostSummary};
 
+/// The running build's package version, surfaced on `/healthz` and in the
+/// web UI footer so ops can tell which build is deployed.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// How many characters of a post's text are shown in list views before
 /// truncating with an ellipsis.
 const MAX_EXCERPT_CHARS: usize = 220;
@@ -180,6 +184,7 @@ pub fn subsystem_row(name: &'static str, health: &SubsystemHealth) -> SubsystemR
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 pub struct DashboardTemplate {
+    pub version: &'static str,
     pub posts_count: u64,
     pub likes_count: u64,
     pub bookmarks_count: u64,
@@ -373,6 +378,7 @@ pub struct ConfigRow {
 #[derive(Template)]
 #[template(path = "config.html")]
 pub struct ConfigTemplate {
+    pub version: &'static str,
     pub rows: Vec<ConfigRow>,
 }
 

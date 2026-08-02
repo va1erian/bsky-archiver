@@ -198,7 +198,7 @@ async fn healthz(State(state): State<WebState>) -> Response {
         StatusCode::OK
     };
 
-    (status, format!("{snapshot:?}")).into_response()
+    (status, axum::Json(snapshot)).into_response()
 }
 
 // ---------------------------------------------------------------------
@@ -238,6 +238,7 @@ async fn dashboard(State(state): State<WebState>) -> Result<Response, WebError> 
     ];
 
     let template = templates::DashboardTemplate {
+        version: templates::APP_VERSION,
         posts_count,
         likes_count,
         bookmarks_count,
@@ -764,7 +765,10 @@ async fn config_view(State(state): State<WebState>) -> Response {
             redacted: false,
         },
     ];
-    askama_axum::into_response(&templates::ConfigTemplate { rows })
+    askama_axum::into_response(&templates::ConfigTemplate {
+        version: templates::APP_VERSION,
+        rows,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -873,6 +877,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_response_contains_version() {
+        let (_dir, state) = test_state().await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(
+            parsed["version"].as_str().expect("version field"),
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     #[tokio::test]
@@ -1272,6 +1295,10 @@ mod tests {
             body.contains("<img") && body.contains("alt="),
             "image thumbnail missing alt"
         );
+        assert!(
+            body.contains(&format!("Version {}", env!("CARGO_PKG_VERSION"))),
+            "version footer missing"
+        );
     }
 
     #[tokio::test]
@@ -1474,6 +1501,10 @@ mod tests {
         assert!(body.matches("&lt;redacted&gt;").count() >= 3);
         assert!(body.contains("alice.bsky.social"));
         assert!(body.contains("class=\"redacted\""));
+        assert!(
+            body.contains(&format!("Version {}", env!("CARGO_PKG_VERSION"))),
+            "version footer missing"
+        );
     }
 
     #[tokio::test]

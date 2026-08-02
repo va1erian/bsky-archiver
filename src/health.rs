@@ -6,10 +6,11 @@
 //! serve `/healthz` and the config page. This module only defines the type
 //! and the channel — no HTTP endpoint lives here.
 
+use serde::Serialize;
 use tokio::sync::watch;
 
 /// Coarse status of one subsystem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Status {
     /// Running normally.
     Connected,
@@ -26,7 +27,7 @@ pub enum Status {
 }
 
 /// The status of one subsystem plus a short human-readable reason, if any.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubsystemHealth {
     pub status: Status,
     pub detail: Option<String>,
@@ -58,8 +59,9 @@ impl SubsystemHealth {
 
 /// Health of every supervised subsystem, as a single snapshot suitable for
 /// serving over `/healthz`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HealthSnapshot {
+    pub version: String,
     pub firehose: SubsystemHealth,
     pub rest_fallback: SubsystemHealth,
     pub likes_bookmarks: SubsystemHealth,
@@ -70,6 +72,7 @@ impl Default for HealthSnapshot {
     fn default() -> Self {
         let starting = SubsystemHealth::degraded("starting up");
         HealthSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
             firehose: starting.clone(),
             rest_fallback: starting.clone(),
             likes_bookmarks: starting.clone(),
@@ -98,6 +101,7 @@ mod tests {
     #[test]
     fn default_snapshot_starts_degraded() {
         let snapshot = HealthSnapshot::default();
+        assert_eq!(snapshot.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(snapshot.firehose.status, Status::Degraded);
         assert_eq!(snapshot.rest_fallback.status, Status::Degraded);
         assert_eq!(snapshot.likes_bookmarks.status, Status::Degraded);
