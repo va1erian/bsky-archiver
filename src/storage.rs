@@ -26,6 +26,7 @@
 //! writing to a temp file in the same directory and renaming it into
 //! place, so a reader can never observe a partially written file.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -38,29 +39,56 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// The three top-level categories of archived item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A category of archived item. The first three are the fixed, built-in
+/// kinds; [`Category::Feed`] is one archived custom feed, keyed by a stable,
+/// filesystem/URL-safe slug derived from the feed generator's DID + rkey
+/// (never its display name). Each feed is its own category on disk
+/// (`feeds/<slug>/…`), in the index (`category = 'feeds/<slug>'`), and in
+/// URLs — not a single shared `feeds` bucket.
+///
+/// No longer `Copy`, because [`Category::Feed`] owns its slug; callers pass
+/// it by value (cloning cheap built-in variants) or by reference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Category {
     Post,
     Like,
     Bookmark,
+    Feed(String),
 }
 
 impl Category {
-    const ALL: [Category; 3] = [Category::Post, Category::Like, Category::Bookmark];
-
-    fn as_dir(self) -> &'static str {
+    /// The archive sub-directory (and the string stored in the index's
+    /// `category` column) for this category. A borrowed `&'static str` for
+    /// the three built-ins, an owned `feeds/<slug>` for a feed. Round-trips
+    /// through [`Category::from_str`].
+    pub fn as_dir(&self) -> Cow<'static, str> {
         match self {
-            Category::Post => "posts",
-            Category::Like => "likes",
-            Category::Bookmark => "bookmarks",
+            Category::Post => Cow::Borrowed("posts"),
+            Category::Like => Cow::Borrowed("likes"),
+            Category::Bookmark => Cow::Borrowed("bookmarks"),
+            Category::Feed(slug) => Cow::Owned(format!("feeds/{slug}")),
         }
     }
 }
 
+/// Whether `slug` is a safe feed slug: non-empty and built only from
+/// characters that are safe as a single filesystem path component and URL
+/// segment, with no `.`-only or path-traversal forms. Slugs produced by
+/// [`crate::config::feed_slug`] always satisfy this; this guard is what keeps
+/// a hand-typed `/media/feeds%2F..%2F/...` URL (or a corrupt index row) from
+/// escaping `ARCHIVE_DIR`.
+fn is_safe_feed_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug != "."
+        && slug != ".."
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 impl fmt::Display for Category {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_dir())
+        f.write_str(&self.as_dir())
     }
 }
 
@@ -72,7 +100,10 @@ impl std::str::FromStr for Category {
             "posts" => Ok(Category::Post),
             "likes" => Ok(Category::Like),
             "bookmarks" => Ok(Category::Bookmark),
-            other => Err(StorageError::InvalidCategory(other.to_string())),
+            other => match other.strip_prefix("feeds/") {
+                Some(slug) if is_safe_feed_slug(slug) => Ok(Category::Feed(slug.to_string())),
+                _ => Err(StorageError::InvalidCategory(other.to_string())),
+            },
         }
     }
 }
@@ -232,17 +263,20 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn item_dir(archive_dir: &Path, category: Category, at_uri: &str) -> PathBuf {
+fn item_dir(archive_dir: &Path, category: &Category, at_uri: &str) -> PathBuf {
     let id = item_id(at_uri);
     let shard = &id[..2];
-    archive_dir.join(category.as_dir()).join(shard).join(id)
+    archive_dir
+        .join(category.as_dir().as_ref())
+        .join(shard)
+        .join(id)
 }
 
-fn record_path(archive_dir: &Path, category: Category, at_uri: &str) -> PathBuf {
+fn record_path(archive_dir: &Path, category: &Category, at_uri: &str) -> PathBuf {
     item_dir(archive_dir, category, at_uri).join("record.json")
 }
 
-fn media_dir(archive_dir: &Path, category: Category, at_uri: &str) -> PathBuf {
+fn media_dir(archive_dir: &Path, category: &Category, at_uri: &str) -> PathBuf {
     item_dir(archive_dir, category, at_uri).join("media")
 }
 
@@ -390,7 +424,7 @@ impl ArchiveStore {
         let cid = cid.to_string();
 
         let result = tokio::task::spawn_blocking(move || -> Result<SaveOutcome, StorageError> {
-            let path = record_path(&archive_dir, category, &at_uri);
+            let path = record_path(&archive_dir, &category, &at_uri);
             if path.exists() {
                 return Ok(SaveOutcome::AlreadyArchived);
             }
@@ -412,7 +446,7 @@ impl ArchiveStore {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     at_uri,
-                    category.as_dir(),
+                    category.as_dir().as_ref(),
                     cid,
                     indexed_at,
                     relative_str(&archive_dir, &path)
@@ -443,12 +477,12 @@ impl ArchiveStore {
         let filename = filename.to_string();
 
         let result = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            let record_file = record_path(&archive_dir, category, &at_uri);
+            let record_file = record_path(&archive_dir, &category, &at_uri);
             if !record_file.exists() {
                 return Err(StorageError::NotFound(at_uri.clone()));
             }
 
-            let media_path = media_dir(&archive_dir, category, &at_uri).join(&filename);
+            let media_path = media_dir(&archive_dir, &category, &at_uri).join(&filename);
             let size_bytes = bytes.len() as u64;
             if !media_path.exists() {
                 atomic_write(&media_path, &bytes)?;
@@ -474,7 +508,7 @@ impl ArchiveStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     at_uri,
-                    category.as_dir(),
+                    category.as_dir().as_ref(),
                     filename,
                     content_type,
                     size_bytes as i64,
@@ -500,7 +534,7 @@ impl ArchiveStore {
         let archive_dir = self.archive_dir.clone();
         let at_uri = at_uri.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            Ok(record_path(&archive_dir, category, &at_uri).exists())
+            Ok(record_path(&archive_dir, &category, &at_uri).exists())
         })
         .await;
         join_result(result)
@@ -516,7 +550,7 @@ impl ArchiveStore {
         let archive_dir = self.archive_dir.clone();
         let at_uri = at_uri.to_string();
         let result = tokio::task::spawn_blocking(move || -> Result<_, StorageError> {
-            let path = record_path(&archive_dir, category, &at_uri);
+            let path = record_path(&archive_dir, &category, &at_uri);
             if !path.exists() {
                 return Ok(None);
             }
@@ -734,7 +768,7 @@ impl ArchiveStore {
             return Ok(None);
         }
 
-        let path = media_dir(&self.archive_dir, category, at_uri).join(filename);
+        let path = media_dir(&self.archive_dir, &category, at_uri).join(filename);
         match tokio::fs::File::open(&path).await {
             Ok(file) => Ok(Some(file)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -766,7 +800,7 @@ impl ArchiveStore {
         let filename = filename.to_string();
         let result =
             tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, StorageError> {
-                let path = media_dir(&archive_dir, category, &at_uri).join(&filename);
+                let path = media_dir(&archive_dir, &category, &at_uri).join(&filename);
                 if !path.is_file() {
                     return Ok(None);
                 }
@@ -789,8 +823,13 @@ impl ArchiveStore {
             let mut found_posts = Vec::new();
             let mut found_media = Vec::new();
 
-            for category in Category::ALL {
-                let category_dir = archive_dir.join(category.as_dir());
+            // Discover every category directory on disk rather than iterating
+            // a hardcoded list: the three built-ins plus one directory per
+            // archived feed under `feeds/`. A feed no longer in
+            // `BSKY_WATCH_FEEDS` is still discovered here, so removing a feed
+            // from config never orphans or hides what it already archived.
+            for category in discover_categories(&archive_dir)? {
+                let category_dir = archive_dir.join(category.as_dir().as_ref());
                 if !category_dir.is_dir() {
                     continue;
                 }
@@ -811,7 +850,7 @@ impl ArchiveStore {
                         for media in &archived.media {
                             found_media.push((
                                 archived.at_uri.clone(),
-                                category,
+                                category.clone(),
                                 media.filename.clone(),
                                 media.content_type.clone(),
                                 media.size_bytes,
@@ -821,7 +860,7 @@ impl ArchiveStore {
 
                         found_posts.push((
                             archived.at_uri.clone(),
-                            category,
+                            category.clone(),
                             archived.cid.clone(),
                             archived.indexed_at.clone(),
                             relative_str(&archive_dir, &record_file),
@@ -838,7 +877,13 @@ impl ArchiveStore {
                 tx.execute(
                     "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![at_uri, category.as_dir(), cid, indexed_at, record_path],
+                    params![
+                        at_uri,
+                        category.as_dir().as_ref(),
+                        cid,
+                        indexed_at,
+                        record_path
+                    ],
                 )?;
             }
             for (post_at_uri, category, filename, content_type, size_bytes, indexed_at) in
@@ -850,7 +895,7 @@ impl ArchiveStore {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         post_at_uri,
-                        category.as_dir(),
+                        category.as_dir().as_ref(),
                         filename,
                         content_type,
                         size_bytes as i64,
@@ -866,6 +911,78 @@ impl ArchiveStore {
 
         join_result(result)
     }
+
+    /// Total bytes of media archived under `category`, from
+    /// `SUM(media.size_bytes)` in the index. This is the quantity the
+    /// per-feed size cap is enforced against (JSON records are not counted).
+    pub async fn category_media_bytes(&self, category: &Category) -> Result<u64, StorageError> {
+        let db = Arc::clone(&self.db);
+        let category = category.as_dir().to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<u64, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let total: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM media WHERE category = ?1",
+                params![category],
+                |row| row.get(0),
+            )?;
+            Ok(total.max(0) as u64)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Every category `at_uri` is archived under, according to the index
+    /// (an `at_uri` can appear under several — e.g. liked *and* surfaced by a
+    /// feed). Used by post detail to locate an item without knowing its
+    /// category up front, including feed categories no longer in config.
+    pub async fn find_categories(&self, at_uri: &str) -> Result<Vec<Category>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let at_uri = at_uri.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<Category>, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt =
+                conn.prepare("SELECT category FROM posts WHERE at_uri = ?1 ORDER BY category")?;
+            let rows = stmt.query_map(params![at_uri], |row| row.get::<_, String>(0))?;
+            let mut categories = Vec::new();
+            for row in rows {
+                if let Ok(category) = row?.parse::<Category>() {
+                    categories.push(category);
+                }
+            }
+            Ok(categories)
+        })
+        .await;
+        join_result(result)
+    }
+}
+
+/// Every category directory present under `archive_dir`: the three built-ins
+/// (whether or not they exist yet) plus one [`Category::Feed`] per
+/// subdirectory of `feeds/`, so [`ArchiveStore::reindex`] rebuilds feed
+/// categories discovered from disk rather than from a hardcoded list.
+fn discover_categories(archive_dir: &Path) -> Result<Vec<Category>, StorageError> {
+    let mut categories = vec![Category::Post, Category::Like, Category::Bookmark];
+
+    let feeds_dir = archive_dir.join("feeds");
+    if feeds_dir.is_dir() {
+        for entry in std::fs::read_dir(&feeds_dir)? {
+            let entry = entry?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(slug) = name.to_str() else {
+                continue;
+            };
+            if is_safe_feed_slug(slug) {
+                categories.push(Category::Feed(slug.to_string()));
+            } else {
+                tracing::warn!(slug, "skipping feed directory with an unsafe slug during reindex");
+            }
+        }
+    }
+
+    Ok(categories)
 }
 
 fn relative_str(base: &Path, path: &Path) -> String {
@@ -1267,7 +1384,7 @@ mod tests {
         // Simulate index drift: delete the on-disk record directly,
         // bypassing the store, then reindex and confirm the stale row is
         // gone.
-        let path = record_path(&dir.path().join("archive"), Category::Post, at_uri);
+        let path = record_path(&dir.path().join("archive"), &Category::Post, at_uri);
         std::fs::remove_file(&path).unwrap();
 
         store.reindex().await.unwrap();
@@ -1278,10 +1395,10 @@ mod tests {
     /// Seeds one image under each category so category-filtered queries have
     /// something to isolate.
     async fn seed_one_image_per_category(store: &ArchiveStore) {
-        for category in Category::ALL {
+        for category in [Category::Post, Category::Like, Category::Bookmark] {
             let at_uri = format!("at://did:plc:alice/app.bsky.feed.post/{category}");
             store
-                .save_post(category, &at_uri, "cid", json!({}))
+                .save_post(category.clone(), &at_uri, "cid", json!({}))
                 .await
                 .unwrap();
             store
@@ -1312,6 +1429,125 @@ mod tests {
         assert_eq!(likes.total_items, 1);
         assert_eq!(likes.items.len(), 1);
         assert!(likes.items.iter().all(|m| m.category == Category::Like));
+    }
+
+    #[test]
+    fn feed_category_round_trips_through_dir_and_from_str() {
+        let feed = Category::Feed("cats-abc123".to_string());
+        assert_eq!(feed.as_dir(), "feeds/cats-abc123");
+        assert_eq!(feed.to_string(), "feeds/cats-abc123");
+        assert_eq!("feeds/cats-abc123".parse::<Category>().unwrap(), feed);
+
+        // Built-ins still round-trip.
+        for c in [Category::Post, Category::Like, Category::Bookmark] {
+            assert_eq!(c.as_dir().parse::<Category>().unwrap(), c);
+        }
+    }
+
+    #[test]
+    fn unsafe_feed_slugs_are_rejected() {
+        for bad in [
+            "feeds/",           // empty slug
+            "feeds/..",         // parent traversal
+            "feeds/.",          // current dir
+            "feeds/a/b",        // nested (would escape the single dir)
+            "feeds/../secrets", // traversal
+            "feeds/a b",        // space
+            "unknown",          // not a feed and not a built-in
+        ] {
+            assert!(
+                bad.parse::<Category>().is_err(),
+                "slug {bad:?} must be rejected"
+            );
+        }
+        // A legitimate slug is accepted.
+        assert!("feeds/goose-0a1b2c3d".parse::<Category>().is_ok());
+    }
+
+    #[tokio::test]
+    async fn feed_media_is_isolated_and_bytes_are_summed() {
+        let (_dir, store) = open_store().await;
+        let feed = Category::Feed("goose-abc".to_string());
+        let at_uri = "at://did:plc:bob/app.bsky.feed.post/1";
+        store
+            .save_post(feed.clone(), at_uri, "cid-1", json!({}))
+            .await
+            .unwrap();
+        store
+            .save_media(
+                feed.clone(),
+                at_uri,
+                "000.jpg",
+                Some("image/jpeg".to_string()),
+                vec![0u8; 40],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.category_media_bytes(&feed).await.unwrap(), 40);
+        // A different feed sees nothing.
+        assert_eq!(
+            store
+                .category_media_bytes(&Category::Feed("other".to_string()))
+                .await
+                .unwrap(),
+            0
+        );
+
+        let listed = store.list_media(Some(feed.clone()), 1, 10).await.unwrap();
+        assert_eq!(listed.total_items, 1);
+        assert!(listed.items.iter().all(|m| m.category == feed));
+
+        let cats = store.find_categories(at_uri).await.unwrap();
+        assert_eq!(cats, vec![feed]);
+    }
+
+    #[tokio::test]
+    async fn reindex_discovers_feed_directories_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        let database_path = dir.path().join("index.sqlite3");
+
+        let store = ArchiveStore::open(archive_dir.clone(), database_path.clone())
+            .await
+            .unwrap();
+        let feed = Category::Feed("cats-deadbeef".to_string());
+        let at_uri = "at://did:plc:bob/app.bsky.feed.post/1";
+        store
+            .save_post(feed.clone(), at_uri, "cid-1", json!({"text": "hi"}))
+            .await
+            .unwrap();
+        store
+            .save_media(
+                feed.clone(),
+                at_uri,
+                "000.jpg",
+                Some("image/jpeg".to_string()),
+                vec![7u8; 12],
+            )
+            .await
+            .unwrap();
+
+        // A brand-new index over the same on-disk archive: reindex must
+        // rediscover the feed directory even though no config lists it.
+        let fresh_db = dir.path().join("index-fresh.sqlite3");
+        let fresh = ArchiveStore::open(archive_dir, fresh_db).await.unwrap();
+        assert_eq!(
+            fresh
+                .list_posts(Some(feed.clone()), 1, 10)
+                .await
+                .unwrap()
+                .total_items,
+            0
+        );
+        fresh.reindex().await.unwrap();
+
+        let posts = fresh.list_posts(Some(feed.clone()), 1, 10).await.unwrap();
+        assert_eq!(posts.total_items, 1);
+        assert_eq!(posts.items[0].at_uri, at_uri);
+        let media = fresh.list_media(Some(feed.clone()), 1, 10).await.unwrap();
+        assert_eq!(media.total_items, 1);
+        assert_eq!(fresh.category_media_bytes(&feed).await.unwrap(), 12);
     }
 
     #[tokio::test]

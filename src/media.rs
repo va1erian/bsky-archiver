@@ -29,7 +29,7 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// Errors that can occur while downloading a single media file.
 #[derive(Debug, thiserror::Error)]
-enum DownloadError {
+pub enum DownloadError {
     #[error("http request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("declared content-length {0} bytes exceeds the configured cap")]
@@ -65,9 +65,97 @@ impl DownloadError {
     }
 }
 
-struct Downloaded {
-    bytes: Vec<u8>,
-    content_type: Option<String>,
+/// A media file downloaded into memory, size-capped, along with its
+/// server-reported content type.
+pub struct Downloaded {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
+/// Downloads one media file with the shared retry/backoff policy, honouring
+/// `max_bytes` (per-file cap) and any `Retry-After`/`ratelimit-reset` hint on
+/// a transient failure. Returns the bytes + content type on success, or the
+/// terminal error after retries are exhausted or on a non-retryable failure.
+///
+/// Shared by [`MediaDownloader`] (the async pipeline consumer) and the feed
+/// poller (which downloads inline so it can enforce its per-feed byte cap
+/// before each file); both need identical streaming, capping, and retry
+/// behaviour.
+pub(crate) async fn fetch_media_with_retries(
+    http: &reqwest::Client,
+    request_limiter: Option<&Arc<RequestLimiter>>,
+    media: &MediaRef,
+    max_bytes: u64,
+) -> Result<Downloaded, DownloadError> {
+    let mut backoff = Backoff::new(BackoffConfig::new(RETRY_BASE_DELAY, RETRY_MAX_DELAY));
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match download_once(http, request_limiter, media, max_bytes).await {
+            Ok(downloaded) => break Ok(downloaded),
+            Err(err) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
+                let delay = backoff.on_failure(err.retry_after());
+                tracing::warn!(
+                    cdn_url = %media.cdn_url,
+                    attempt,
+                    error = %err,
+                    delay_ms = delay.as_millis() as u64,
+                    "media download failed, retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => break Err(err),
+        }
+    }
+}
+
+/// Performs a single download attempt: streams the response body, aborting as
+/// soon as the declared `Content-Length` or the actual bytes received exceed
+/// `max_bytes`, without ever buffering an unbounded body into memory.
+async fn download_once(
+    http: &reqwest::Client,
+    request_limiter: Option<&Arc<RequestLimiter>>,
+    media: &MediaRef,
+    max_bytes: u64,
+) -> Result<Downloaded, DownloadError> {
+    let _request_permit = match request_limiter {
+        Some(limiter) => Some(limiter.acquire().await),
+        None => None,
+    };
+    let response = http.get(&media.cdn_url).send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = crate::bluesky::parse_retry_hint(response.headers());
+        return Err(DownloadError::Status(status, retry_after));
+    }
+
+    if let Some(declared_len) = response.content_length()
+        && declared_len > max_bytes
+    {
+        return Err(DownloadError::DeclaredTooLarge(declared_len));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > max_bytes {
+            return Err(DownloadError::BodyTooLarge(bytes.len() as u64));
+        }
+    }
+
+    Ok(Downloaded {
+        bytes,
+        content_type,
+    })
 }
 
 /// Consumes [`CandidatePost`]s from a [`CandidatePostReceiver`], archiving
@@ -127,7 +215,7 @@ impl MediaDownloader {
             match downloader
                 .store
                 .save_post(
-                    category,
+                    category.clone(),
                     &candidate.at_uri,
                     &candidate.cid,
                     candidate.record.clone(),
@@ -148,6 +236,7 @@ impl MediaDownloader {
             for (index, media) in candidate.media.into_iter().enumerate() {
                 let downloader = Arc::clone(&downloader);
                 let at_uri = candidate.at_uri.clone();
+                let category = category.clone();
                 media_tasks.spawn(async move {
                     downloader
                         .download_and_store(category, at_uri, index, media)
@@ -177,27 +266,13 @@ impl MediaDownloader {
             .await
             .expect("semaphore is never closed");
 
-        let mut backoff = Backoff::new(BackoffConfig::new(RETRY_BASE_DELAY, RETRY_MAX_DELAY));
-        let mut attempt = 0u32;
-        let result = loop {
-            attempt += 1;
-            match self.download_once(&media).await {
-                Ok(downloaded) => break Ok(downloaded),
-                Err(err) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
-                    let delay = backoff.on_failure(err.retry_after());
-                    tracing::warn!(
-                        at_uri = %at_uri,
-                        cdn_url = %media.cdn_url,
-                        attempt,
-                        error = %err,
-                        delay_ms = delay.as_millis() as u64,
-                        "media download failed, retrying"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-                Err(err) => break Err(err),
-            }
-        };
+        let result = fetch_media_with_retries(
+            &self.http,
+            self.request_limiter.as_ref(),
+            &media,
+            self.max_bytes,
+        )
+        .await;
 
         let downloaded = match result {
             Ok(downloaded) => downloaded,
@@ -246,50 +321,6 @@ impl MediaDownloader {
         }
     }
 
-    /// Performs a single download attempt: streams the response body,
-    /// aborting as soon as the declared `Content-Length` or the actual
-    /// bytes received exceed `max_bytes`, without ever buffering an
-    /// unbounded body into memory.
-    async fn download_once(&self, media: &MediaRef) -> Result<Downloaded, DownloadError> {
-        let _request_permit = match &self.request_limiter {
-            Some(limiter) => Some(limiter.acquire().await),
-            None => None,
-        };
-        let response = self.http.get(&media.cdn_url).send().await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = crate::bluesky::parse_retry_hint(response.headers());
-            return Err(DownloadError::Status(status, retry_after));
-        }
-
-        if let Some(declared_len) = response.content_length()
-            && declared_len > self.max_bytes
-        {
-            return Err(DownloadError::DeclaredTooLarge(declared_len));
-        }
-
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-
-        let mut bytes = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            bytes.extend_from_slice(&chunk);
-            if bytes.len() as u64 > self.max_bytes {
-                return Err(DownloadError::BodyTooLarge(bytes.len() as u64));
-            }
-        }
-
-        Ok(Downloaded {
-            bytes,
-            content_type,
-        })
-    }
 }
 
 fn map_category(category: PostCategory) -> Category {
@@ -297,6 +328,7 @@ fn map_category(category: PostCategory) -> Category {
         PostCategory::Authored => Category::Post,
         PostCategory::Like => Category::Like,
         PostCategory::Bookmark => Category::Bookmark,
+        PostCategory::Feed(slug) => Category::Feed(slug),
     }
 }
 
@@ -310,7 +342,11 @@ fn base_mime(mime: &str) -> &str {
 /// prefix (so multiple files never collide) plus an extension guessed from
 /// the actual/declared content-type, falling back to the CDN URL's own
 /// extension, and finally a generic `.bin`.
-fn filename_for(index: usize, media: &MediaRef, actual_content_type: Option<&str>) -> String {
+pub(crate) fn filename_for(
+    index: usize,
+    media: &MediaRef,
+    actual_content_type: Option<&str>,
+) -> String {
     let content_type = actual_content_type.or(media.declared_mime_type.as_deref());
     let ext = extension_for(content_type, &media.cdn_url);
     format!("{index:03}.{ext}")

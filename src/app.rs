@@ -33,7 +33,7 @@ use tokio::sync::watch;
 use url::Url;
 
 use crate::bluesky::{BlueskyClient, BlueskyError};
-use crate::config::{AppConfig, ConfigError};
+use crate::config::{AppConfig, ConfigError, ResolvedFeed, feed_at_uri, feed_slug};
 use crate::firehose::FirehoseConsumer;
 use crate::health::{self, HealthSender, HealthSnapshot, SubsystemHealth};
 use crate::media::MediaDownloader;
@@ -41,7 +41,7 @@ use crate::pipeline::{
     CandidatePostReceiver, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver,
     ConnectionHealthSender, candidate_post_channel, connection_health_channel,
 };
-use crate::poller::{LikesBookmarksPoller, PollerConfig, RestFallbackPoller};
+use crate::poller::{FeedPoller, LikesBookmarksPoller, PollerConfig, RestFallbackPoller};
 use crate::ratelimit::RequestLimiter;
 use crate::state::{AppState, SharedAppState};
 use crate::storage::{ArchiveStore, StorageError};
@@ -67,6 +67,8 @@ pub enum StartupError {
     Storage(#[from] StorageError),
     #[error("bluesky startup error: {0}")]
     Bluesky(#[from] BlueskyError),
+    #[error("feed configuration error: {0}")]
+    Feed(String),
 }
 
 /// Everything [`serve`] needs to spawn the supervised background tasks,
@@ -136,6 +138,14 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
     }
     tracing::info!(watched_dids = ?watched_dids, "resolved watched handles");
 
+    let feeds = resolve_feeds(&bluesky_client, &config, &self_did).await?;
+    if !feeds.is_empty() {
+        tracing::info!(
+            feeds = ?feeds.iter().map(|f| &f.at_uri).collect::<Vec<_>>(),
+            "resolved custom feeds"
+        );
+    }
+
     let (health_tx, health_rx) = health::health_channel();
     let (conn_health_tx, conn_health_rx) = connection_health_channel(ConnectionHealth::Disabled);
     let (candidate_tx, candidate_rx) = candidate_post_channel(64);
@@ -144,6 +154,7 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
         config,
         store,
         health: health_rx,
+        feeds,
     });
 
     Ok(Started {
@@ -176,6 +187,65 @@ async fn resolve_watched_handle(
     } else {
         client.resolve_handle(handle).await
     }
+}
+
+/// Resolves every configured feed's handle segment to a DID, derives its
+/// stable slug + canonical `at://` URI, and fetches its display name once
+/// (best-effort). Fails fast — naming the offending entry — on an
+/// unresolvable handle or on two entries resolving to the same feed.
+async fn resolve_feeds(
+    client: &BlueskyClient,
+    config: &AppConfig,
+    self_did: &str,
+) -> Result<Vec<ResolvedFeed>, StartupError> {
+    let mut feeds = Vec::with_capacity(config.watch_feeds.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for feed in &config.watch_feeds {
+        let did = if feed.actor == config.bsky_identifier {
+            self_did.to_string()
+        } else if feed.actor.starts_with("did:") {
+            feed.actor.clone()
+        } else {
+            client.resolve_handle(&feed.actor).await.map_err(|err| {
+                StartupError::Feed(format!(
+                    "could not resolve handle {:?} in feed entry {:?}: {err}",
+                    feed.actor, feed.input
+                ))
+            })?
+        };
+
+        let at_uri = feed_at_uri(&did, &feed.rkey);
+        let slug = feed_slug(&did, &feed.rkey);
+        if !seen.insert(slug.clone()) {
+            return Err(StartupError::Feed(format!(
+                "feed entry {:?} resolves to the same feed ({at_uri}) as an earlier entry",
+                feed.input
+            )));
+        }
+
+        // Display name is cosmetic: a failure here must not fail startup.
+        let display_name = match client.get_feed_generator(&at_uri).await {
+            Ok(name) => name,
+            Err(err) => {
+                tracing::warn!(
+                    feed = %at_uri,
+                    error = %err,
+                    "could not fetch feed generator display name; falling back to slug"
+                );
+                None
+            }
+        };
+
+        feeds.push(ResolvedFeed {
+            slug,
+            at_uri,
+            input: feed.input.clone(),
+            display_name,
+        });
+    }
+
+    Ok(feeds)
 }
 
 /// Spawns the supervised background tasks and runs until SIGINT/SIGTERM
@@ -234,6 +304,35 @@ pub async fn serve(started: Started) {
         shutdown_rx.clone(),
     );
 
+    // The feed poller has no producer/channel role (it downloads inline, to
+    // enforce each feed's byte cap), so it doesn't hold `candidate_tx`. It is
+    // only spawned when feeds are configured; otherwise the map stays empty.
+    let feeds_handle = if state.feeds.is_empty() {
+        None
+    } else {
+        // Seed each feed's health entry so the dashboard/`/healthz` list them
+        // as starting up before the first poll completes.
+        let starting = SubsystemHealth::degraded("starting up");
+        health_tx.send_modify(|snapshot| {
+            for feed in &state.feeds {
+                snapshot
+                    .feeds
+                    .insert(feed.slug.clone(), starting.clone());
+            }
+        });
+        Some(spawn_feeds(
+            Arc::clone(&bluesky_client),
+            state.store.clone(),
+            Arc::clone(&request_limiter),
+            state.feeds.clone(),
+            config.feed_max_bytes,
+            config.media_max_bytes,
+            PollerConfig::new(Duration::from_secs(config.poll_interval_seconds)),
+            health_tx.clone(),
+            shutdown_rx.clone(),
+        ))
+    };
+
     // Every producer above holds its own clone of `candidate_tx`; dropping
     // this one is what lets the channel close (and the media downloader
     // drain and stop) once all three producer tasks have actually ended.
@@ -261,6 +360,9 @@ pub async fn serve(started: Started) {
         likes_bookmarks_handle,
         web_handle
     );
+    if let Some(feeds_handle) = feeds_handle {
+        let _ = feeds_handle.await;
+    }
 
     match tokio::time::timeout(Duration::from_secs(30), media_handle).await {
         Ok(_) => tracing::info!("media downloader drained cleanly"),
@@ -356,6 +458,45 @@ fn spawn_likes_bookmarks(
                 candidate_tx.clone(),
                 actor.clone(),
                 base_interval,
+            );
+            async move { poller.run().await }
+        },
+    ))
+}
+
+/// Spawns the supervised custom-feed poller. Uses the same generic
+/// [`supervise`] restart loop as the other pollers, but with a no-op
+/// `set_field`: the feed poller owns a *map* of per-feed health entries (one
+/// per slug) that it updates itself, rather than a single fixed
+/// [`HealthSnapshot`] field. Only ever called when at least one feed is
+/// configured, so the inner task never returns on its own.
+#[allow(clippy::too_many_arguments)]
+fn spawn_feeds(
+    client: Arc<BlueskyClient>,
+    store: ArchiveStore,
+    request_limiter: Arc<RequestLimiter>,
+    feeds: Vec<ResolvedFeed>,
+    feed_max_bytes: u64,
+    media_max_bytes: u64,
+    poller_config: PollerConfig,
+    health_tx: HealthSender,
+    shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(supervise(
+        "feeds",
+        shutdown_rx,
+        health_tx.clone(),
+        |_snapshot, _health| {},
+        move || {
+            let poller = FeedPoller::new(
+                Arc::clone(&client),
+                store.clone(),
+                Some(Arc::clone(&request_limiter)),
+                feeds.clone(),
+                feed_max_bytes,
+                media_max_bytes,
+                health_tx.clone(),
+                poller_config.clone(),
             );
             async move { poller.run().await }
         },
@@ -571,6 +712,7 @@ mod tests {
             bsky_identifier: "alice.bsky.social".to_string(),
             bsky_app_password: Secret::from("app-password".to_string()),
             bsky_watch_handles: vec!["alice.bsky.social".to_string()],
+            watch_feeds: Vec::new(),
             archive_dir,
             database_path,
             ui_password: Secret::from("ui-password".to_string()),
@@ -580,6 +722,7 @@ mod tests {
             jetstream_url: Url::parse("wss://jetstream.example.com/subscribe").unwrap(),
             media_max_concurrent_downloads: 4,
             media_max_bytes: 104_857_600,
+            feed_max_bytes: 2_147_483_648,
         }
     }
 

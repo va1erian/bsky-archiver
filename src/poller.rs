@@ -9,16 +9,20 @@
 //! [`crate::storage::ArchiveStore`] so a post already captured by another
 //! producer is never reprocessed here, and vice versa.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
 use crate::bluesky::{BlueskyClient, BlueskyError, PostView};
+use crate::config::ResolvedFeed;
+use crate::health::{HealthSender, SubsystemHealth};
+use crate::media::{fetch_media_with_retries, filename_for};
 use crate::pipeline::{
     CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver, MediaRef,
     PostCategory, has_archivable_media,
 };
-use crate::ratelimit::{Backoff, BackoffConfig};
+use crate::ratelimit::{Backoff, BackoffConfig, RequestLimiter};
 use crate::storage::{ArchiveStore, Category, SaveOutcome, StorageError};
 
 /// How many feed items to request per `getAuthorFeed` page.
@@ -615,14 +619,14 @@ impl LikesBookmarksPoller {
         post_category: PostCategory,
         post: &PostView,
     ) -> Result<bool, PollError> {
-        if self.store.is_archived(category, &post.uri).await? {
+        if self.store.is_archived(category.clone(), &post.uri).await? {
             debug!(at_uri = %post.uri, %category, "reached dedup boundary");
             return Ok(true);
         }
 
         let outcome = self
             .store
-            .save_post(category, &post.uri, &post.cid, post.record.clone())
+            .save_post(category.clone(), &post.uri, &post.cid, post.record.clone())
             .await?;
 
         if outcome == SaveOutcome::Inserted && has_archivable_media(&post.record) {
@@ -700,6 +704,384 @@ fn extract_media_refs(embed: &serde_json::Value) -> Vec<MediaRef> {
             .map(extract_media_refs)
             .unwrap_or_default(),
         _ => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Custom-feed poller
+// ---------------------------------------------------------------------
+
+/// Errors from a single poll pass over one feed.
+#[derive(Debug, thiserror::Error)]
+pub enum FeedPollError {
+    #[error(transparent)]
+    Bluesky(#[from] BlueskyError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+/// The result of one poll pass over one feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeedPass {
+    /// How many new media-bearing posts were archived this pass.
+    archived: u64,
+    /// Whether the pass stopped because the feed reached its byte cap.
+    at_cap: bool,
+    /// Bytes of media archived under the feed after this pass (for the
+    /// health message).
+    bytes_used: u64,
+}
+
+/// Polls every configured custom feed on an adaptive timer, archiving each
+/// feed's media-bearing posts under its own [`Category::Feed`] category,
+/// enforcing a per-feed byte cap.
+///
+/// Unlike the other producers, the feed poller downloads media inline
+/// (serially per file) rather than handing candidates to the shared async
+/// downloader: that is what lets it check `SUM(media.size_bytes)` against the
+/// cap immediately *before each file*, so a feed is never overshot by more
+/// than a single in-flight download and never leaves a partial file on disk.
+///
+/// Every feed is polled and reported independently: one feed erroring,
+/// 404ing, or hitting its cap only degrades that feed's own health entry and
+/// never disturbs another feed or subsystem.
+pub struct FeedPoller {
+    client: Arc<BlueskyClient>,
+    store: ArchiveStore,
+    http: reqwest::Client,
+    request_limiter: Option<Arc<RequestLimiter>>,
+    feeds: Vec<ResolvedFeed>,
+    feed_max_bytes: u64,
+    media_max_bytes: u64,
+    health_tx: HealthSender,
+    config: PollerConfig,
+}
+
+impl FeedPoller {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: Arc<BlueskyClient>,
+        store: ArchiveStore,
+        request_limiter: Option<Arc<RequestLimiter>>,
+        feeds: Vec<ResolvedFeed>,
+        feed_max_bytes: u64,
+        media_max_bytes: u64,
+        health_tx: HealthSender,
+        config: PollerConfig,
+    ) -> Self {
+        FeedPoller {
+            client,
+            store,
+            http: reqwest::Client::new(),
+            request_limiter,
+            feeds,
+            feed_max_bytes,
+            media_max_bytes,
+            health_tx,
+            config,
+        }
+    }
+
+    /// Runs the poll loop forever (meant to be supervised), polling every
+    /// feed each cycle on the shared adaptive interval + circuit breaker,
+    /// exactly like the other REST pollers. Returns only if there are no
+    /// feeds to poll.
+    pub async fn run(self) {
+        if self.feeds.is_empty() {
+            return;
+        }
+        let mut interval =
+            AdaptiveInterval::new(self.config.baseline_interval, self.config.max_interval);
+        let mut breaker = Backoff::new(BackoffConfig::new(
+            self.config.baseline_interval,
+            self.config.max_interval,
+        ));
+
+        loop {
+            let delay = match self.poll_all_feeds().await {
+                CycleOutcome::NewContent => {
+                    interval.on_content_found();
+                    breaker.on_success();
+                    interval.jittered()
+                }
+                CycleOutcome::Empty => {
+                    interval.on_empty();
+                    breaker.on_success();
+                    interval.jittered()
+                }
+                CycleOutcome::Error => {
+                    interval.on_error();
+                    let breaker_delay = breaker.on_failure(None);
+                    if breaker.is_open() {
+                        warn!(
+                            cooldown_ms = breaker_delay.as_millis() as u64,
+                            "feed poller circuit breaker open; pausing well past the normal backoff"
+                        );
+                    }
+                    interval.jittered().max(breaker_delay)
+                }
+            };
+            debug!(delay_ms = delay.as_millis() as u64, "feed poller sleeping");
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Polls every feed once, updating each feed's health entry in isolation.
+    async fn poll_all_feeds(&self) -> CycleOutcome {
+        let mut any_new = false;
+        let mut any_error = false;
+
+        for feed in &self.feeds {
+            match self.poll_feed_once(feed).await {
+                Ok(pass) => {
+                    if pass.at_cap {
+                        self.set_health(
+                            &feed.slug,
+                            SubsystemHealth::degraded(format!(
+                                "feed {:?} at cap: {} of {} bytes used; not archiving further",
+                                feed.label(),
+                                pass.bytes_used,
+                                self.feed_max_bytes
+                            )),
+                        );
+                    } else {
+                        self.set_health(&feed.slug, SubsystemHealth::connected());
+                    }
+                    if pass.archived > 0 {
+                        info!(feed = %feed.slug, archived = pass.archived, "feed poller archived new posts");
+                        any_new = true;
+                    }
+                }
+                Err(err) => {
+                    warn!(feed = %feed.slug, error = %err, "feed poll pass failed");
+                    self.set_health(
+                        &feed.slug,
+                        SubsystemHealth::degraded(format!("feed {:?} poll failed: {err}", feed.label())),
+                    );
+                    any_error = true;
+                }
+            }
+        }
+
+        if any_new {
+            CycleOutcome::NewContent
+        } else if any_error {
+            CycleOutcome::Error
+        } else {
+            CycleOutcome::Empty
+        }
+    }
+
+    fn set_health(&self, slug: &str, health: SubsystemHealth) {
+        self.health_tx.send_modify(|snapshot| {
+            snapshot.feeds.insert(slug.to_string(), health);
+        });
+    }
+
+    /// One poll pass over a single feed: walks it newest-first, page by page,
+    /// archiving each media-bearing post not already archived, until the cap
+    /// is reached, the feed is exhausted, a page yields no new media posts,
+    /// or the cursor stops advancing.
+    ///
+    /// Differs from [`poll_handle_once`] deliberately: an already-archived
+    /// item is *skipped* (an algorithmic feed can reorder or inject older
+    /// posts at any position), it never terminates the pass.
+    async fn poll_feed_once(&self, feed: &ResolvedFeed) -> Result<FeedPass, FeedPollError> {
+        let category = Category::Feed(feed.slug.clone());
+        let cap = self.feed_max_bytes;
+
+        let mut bytes_used = self.store.category_media_bytes(&category).await?;
+        // Already at (or over, e.g. after FEED_MAX_BYTES was lowered) the cap:
+        // the poll is a no-op. Nothing is fetched, downloaded, or deleted.
+        if bytes_used >= cap {
+            return Ok(FeedPass {
+                archived: 0,
+                at_cap: true,
+                bytes_used,
+            });
+        }
+
+        let mut cursor: Option<String> = None;
+        let mut archived = 0u64;
+        let mut at_cap = false;
+
+        'pages: loop {
+            let page = self
+                .client
+                .get_feed(&feed.at_uri, cursor.as_deref(), self.config.page_limit)
+                .await?;
+            if page.feed.is_empty() {
+                break;
+            }
+
+            let mut new_this_page = 0u64;
+            for item in &page.feed {
+                let Some(post) = item.get("post") else {
+                    continue;
+                };
+                let (Some(at_uri), Some(cid), Some(_author_did)) = (
+                    post.get("uri").and_then(|v| v.as_str()),
+                    post.get("cid").and_then(|v| v.as_str()),
+                    post.get("author")
+                        .and_then(|a| a.get("did"))
+                        .and_then(|v| v.as_str()),
+                ) else {
+                    warn!(feed = %feed.slug, "feed poller skipping item missing uri/cid/author.did");
+                    continue;
+                };
+
+                // Skip, don't stop: an already-archived item is not a
+                // pagination boundary for an algorithmic feed.
+                if self.store.is_archived(category.clone(), at_uri).await? {
+                    continue;
+                }
+
+                let Some(record) = post.get("record") else {
+                    continue;
+                };
+                if !has_archivable_media(record) {
+                    continue;
+                }
+
+                new_this_page += 1;
+                let media = post
+                    .get("embed")
+                    .map(extract_media_from_view)
+                    .unwrap_or_default();
+
+                let (did_archive, new_used) = self
+                    .archive_candidate(
+                        &category,
+                        at_uri,
+                        cid,
+                        record,
+                        &media,
+                        cap,
+                        bytes_used,
+                        &mut at_cap,
+                    )
+                    .await?;
+                bytes_used = new_used;
+                if did_archive {
+                    archived += 1;
+                }
+
+                if at_cap {
+                    break 'pages;
+                }
+            }
+
+            // A full page with no new media posts bounds the walk without a
+            // dedicated env var (a mostly-text or already-caught-up feed).
+            if new_this_page == 0 {
+                break;
+            }
+
+            match page.cursor {
+                // A repeated / non-advancing cursor would loop forever; end
+                // the pass instead.
+                Some(next) if Some(next.as_str()) == cursor.as_deref() => break,
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(FeedPass {
+            archived,
+            at_cap,
+            bytes_used,
+        })
+    }
+
+    /// Archives one media-bearing feed post: downloads and stores each media
+    /// file serially, enforcing the feed's byte cap before each download and
+    /// skipping (never leaving a partial file for) any file that would push
+    /// the feed over its cap.
+    ///
+    /// The post's JSON record is saved *lazily* — only once the first media
+    /// file has actually been stored within the cap. That is what makes a
+    /// feed at cap a genuine no-op: a candidate whose media can't be archived
+    /// (the cap is already full, or its first file exceeds the remaining
+    /// headroom) leaves nothing on disk at all, so it is neither counted as
+    /// archived nor turned into a media-less record that would "creep" the
+    /// walk forward on every subsequent poll.
+    ///
+    /// Returns whether anything was archived (at least one media file stored)
+    /// and the feed's updated byte total, and sets `at_cap` if the cap was
+    /// reached.
+    #[allow(clippy::too_many_arguments)]
+    async fn archive_candidate(
+        &self,
+        category: &Category,
+        at_uri: &str,
+        cid: &str,
+        record: &serde_json::Value,
+        media: &[MediaRef],
+        cap: u64,
+        mut bytes_used: u64,
+        at_cap: &mut bool,
+    ) -> Result<(bool, u64), FeedPollError> {
+        let mut record_saved = false;
+        let mut archived_any = false;
+
+        for (index, media_ref) in media.iter().enumerate() {
+            // Cap checked before each download is started.
+            if bytes_used >= cap {
+                *at_cap = true;
+                break;
+            }
+
+            let downloaded = match fetch_media_with_retries(
+                &self.http,
+                self.request_limiter.as_ref(),
+                media_ref,
+                self.media_max_bytes,
+            )
+            .await
+            {
+                Ok(downloaded) => downloaded,
+                Err(err) => {
+                    warn!(
+                        at_uri,
+                        cdn_url = %media_ref.cdn_url,
+                        error = %err,
+                        "feed media download failed; skipping this file"
+                    );
+                    continue;
+                }
+            };
+
+            // A single file that alone would exceed the remaining headroom is
+            // skipped (nothing written), and the feed goes to cap-reached
+            // state — so the on-disk total never exceeds the cap.
+            let size = downloaded.bytes.len() as u64;
+            if bytes_used + size > cap {
+                *at_cap = true;
+                break;
+            }
+
+            if !record_saved {
+                self.store
+                    .save_post(category.clone(), at_uri, cid, record.clone())
+                    .await?;
+                record_saved = true;
+            }
+
+            let filename = filename_for(index, media_ref, downloaded.content_type.as_deref());
+            self.store
+                .save_media(
+                    category.clone(),
+                    at_uri,
+                    &filename,
+                    downloaded.content_type,
+                    downloaded.bytes,
+                )
+                .await?;
+            bytes_used += size;
+            archived_any = true;
+        }
+
+        Ok((archived_any, bytes_used))
     }
 }
 
@@ -1355,5 +1737,347 @@ mod tests {
     fn extract_media_refs_ignores_unknown_embed() {
         let embed = json!({"$type": "app.bsky.embed.external#view"});
         assert!(extract_media_refs(&embed).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // FeedPoller
+    // -----------------------------------------------------------------
+
+    use crate::config::ResolvedFeed;
+    use crate::health::{Status, health_channel};
+
+    const FEED_URI: &str = "at://did:plc:feedgen/app.bsky.feed.generator/mycats";
+
+    /// A hydrated feed item (`{"post": {...}}`) with one image embed whose
+    /// CDN URL points back at `server_uri` + `cdn_path`.
+    fn feed_media_item(server_uri: &str, rkey: &str, cdn_path: &str) -> serde_json::Value {
+        json!({
+            "post": {
+                "uri": format!("at://did:plc:author/app.bsky.feed.post/{rkey}"),
+                "cid": format!("cid-{rkey}"),
+                "author": {"did": "did:plc:author"},
+                "record": {
+                    "text": format!("feed post {rkey}"),
+                    "embed": {
+                        "$type": "app.bsky.embed.images",
+                        "images": [{"alt": "", "image": {"ref": "bafy"}}],
+                    }
+                },
+                "embed": {
+                    "$type": "app.bsky.embed.images#view",
+                    "images": [{"fullsize": format!("{server_uri}{cdn_path}"), "thumb": "", "alt": ""}],
+                },
+            }
+        })
+    }
+
+    fn text_only_feed_item(rkey: &str) -> serde_json::Value {
+        json!({
+            "post": {
+                "uri": format!("at://did:plc:author/app.bsky.feed.post/{rkey}"),
+                "cid": format!("cid-{rkey}"),
+                "author": {"did": "did:plc:author"},
+                "record": {"text": "no media here"},
+            }
+        })
+    }
+
+    async fn mount_cdn(server: &MockServer, cdn_path: &str, size: usize) {
+        Mock::given(method("GET"))
+            .and(path(cdn_path.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/jpeg")
+                    .set_body_bytes(vec![0u8; size]),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn resolved_feed() -> ResolvedFeed {
+        ResolvedFeed {
+            slug: "mycats-abc123".to_string(),
+            at_uri: FEED_URI.to_string(),
+            input: FEED_URI.to_string(),
+            display_name: Some("My Cats".to_string()),
+        }
+    }
+
+    fn feed_poller(server: &MockServer, store: ArchiveStore, feed_max_bytes: u64) -> FeedPoller {
+        let (health_tx, _health_rx) = health_channel();
+        FeedPoller::new(
+            make_client(server),
+            store,
+            None,
+            vec![resolved_feed()],
+            feed_max_bytes,
+            10_000_000,
+            health_tx,
+            PollerConfig::new(Duration::from_millis(20)),
+        )
+    }
+
+    #[tokio::test]
+    async fn feed_backfill_walks_multiple_pages() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+        let (_dir, store) = open_store().await;
+
+        mount_cdn(&server, "/cdn/a.jpg", 10).await;
+        mount_cdn(&server, "/cdn/b.jpg", 10).await;
+        mount_cdn(&server, "/cdn/c.jpg", 10).await;
+
+        // Page 2 (older), reached only if the walk paginates past page 1.
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .and(query_param("cursor", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [feed_media_item(&server.uri(), "c", "/cdn/c.jpg")],
+                "cursor": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 1 (newest).
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [
+                    feed_media_item(&server.uri(), "a", "/cdn/a.jpg"),
+                    feed_media_item(&server.uri(), "b", "/cdn/b.jpg"),
+                ],
+                "cursor": "page-2",
+            })))
+            .mount(&server)
+            .await;
+
+        let poller = feed_poller(&server, store.clone(), 10_000_000);
+        let pass = poller.poll_feed_once(&resolved_feed()).await.expect("poll");
+        assert_eq!(pass.archived, 3);
+        assert!(!pass.at_cap);
+
+        let category = Category::Feed("mycats-abc123".to_string());
+        for rkey in ["a", "b", "c"] {
+            let at_uri = format!("at://did:plc:author/app.bsky.feed.post/{rkey}");
+            let record = store
+                .get_post(category.clone(), &at_uri)
+                .await
+                .unwrap()
+                .expect("archived under the feed category");
+            assert_eq!(record.media.len(), 1, "media downloaded for {rkey}");
+        }
+        assert_eq!(store.category_media_bytes(&category).await.unwrap(), 30);
+    }
+
+    #[tokio::test]
+    async fn feed_skips_already_archived_without_stopping() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+        let (_dir, store) = open_store().await;
+        let category = Category::Feed("mycats-abc123".to_string());
+
+        // Pre-archive the *first* (newest) item. Unlike the author-feed
+        // poller, hitting it must NOT stop the walk — the second item must
+        // still be archived.
+        store
+            .save_post(
+                category.clone(),
+                "at://did:plc:author/app.bsky.feed.post/a",
+                "cid-a",
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        mount_cdn(&server, "/cdn/b.jpg", 10).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [
+                    feed_media_item(&server.uri(), "a", "/cdn/a.jpg"),
+                    feed_media_item(&server.uri(), "b", "/cdn/b.jpg"),
+                ],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let poller = feed_poller(&server, store.clone(), 10_000_000);
+        let pass = poller.poll_feed_once(&resolved_feed()).await.expect("poll");
+        assert_eq!(pass.archived, 1, "only the second (new) item archived");
+        assert!(
+            store
+                .is_archived(category, "at://did:plc:author/app.bsky.feed.post/b")
+                .await
+                .unwrap(),
+            "walk must continue past an already-archived item"
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_text_only_posts_are_not_archived() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+        let (_dir, store) = open_store().await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [text_only_feed_item("t1"), text_only_feed_item("t2")],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let poller = feed_poller(&server, store.clone(), 10_000_000);
+        let pass = poller.poll_feed_once(&resolved_feed()).await.expect("poll");
+        assert_eq!(pass.archived, 0);
+        let category = Category::Feed("mycats-abc123".to_string());
+        assert_eq!(
+            store.list_posts(Some(category), 1, 10).await.unwrap().total_items,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_cap_halts_downloads_without_partial_files() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            ArchiveStore::open(dir.path().join("archive"), dir.path().join("index.sqlite3"))
+                .await
+                .expect("open store");
+
+        // Three 100-byte images, cap of 150 bytes: only the first fits; the
+        // second would exceed the remaining headroom and is skipped, taking
+        // the feed to cap-reached state before the third is even considered.
+        mount_cdn(&server, "/cdn/a.jpg", 100).await;
+        mount_cdn(&server, "/cdn/b.jpg", 100).await;
+        mount_cdn(&server, "/cdn/c.jpg", 100).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [
+                    feed_media_item(&server.uri(), "a", "/cdn/a.jpg"),
+                    feed_media_item(&server.uri(), "b", "/cdn/b.jpg"),
+                    feed_media_item(&server.uri(), "c", "/cdn/c.jpg"),
+                ],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let poller = feed_poller(&server, store.clone(), 150);
+        let pass = poller.poll_feed_once(&resolved_feed()).await.expect("poll");
+        assert!(pass.at_cap, "should report cap reached");
+
+        let category = Category::Feed("mycats-abc123".to_string());
+        let used = store.category_media_bytes(&category).await.unwrap();
+        assert!(used <= 150, "on-disk media must never exceed the cap: {used}");
+        assert_eq!(used, 100, "exactly the one file that fits");
+
+        // No partial media file for the skipped downloads.
+        let media = store.list_media(Some(category), 1, 100).await.unwrap();
+        assert_eq!(media.total_items, 1);
+
+        // A subsequent poll is a no-op: already at cap.
+        let again = poller.poll_feed_once(&resolved_feed()).await.expect("poll");
+        assert!(again.at_cap);
+        assert_eq!(again.archived, 0);
+    }
+
+    #[tokio::test]
+    async fn feed_health_is_isolated_per_feed() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+        let (_dir, store) = open_store().await;
+
+        let good = ResolvedFeed {
+            slug: "good-1".to_string(),
+            at_uri: "at://did:plc:x/app.bsky.feed.generator/good".to_string(),
+            input: "good".to_string(),
+            display_name: Some("Good Feed".to_string()),
+        };
+        let bad = ResolvedFeed {
+            slug: "bad-1".to_string(),
+            at_uri: "at://did:plc:x/app.bsky.feed.generator/bad".to_string(),
+            input: "bad".to_string(),
+            display_name: Some("Bad Feed".to_string()),
+        };
+
+        // The good feed returns an empty page; the bad feed 500s.
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .and(query_param("feed", good.at_uri.clone()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"feed": [], "cursor": null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .and(query_param("feed", bad.at_uri.clone()))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let (health_tx, health_rx) = health_channel();
+        let poller = FeedPoller::new(
+            make_client(&server),
+            store,
+            None,
+            vec![good.clone(), bad.clone()],
+            10_000_000,
+            10_000_000,
+            health_tx,
+            PollerConfig::new(Duration::from_millis(20)),
+        );
+        poller.poll_all_feeds().await;
+
+        let snapshot = health_rx.borrow().clone();
+        assert_eq!(
+            snapshot.feeds.get(&good.slug).unwrap().status,
+            Status::Connected,
+            "the healthy feed stays connected"
+        );
+        // The failing feed only *degrades* (never Error), so /healthz stays 200.
+        assert_eq!(
+            snapshot.feeds.get(&bad.slug).unwrap().status,
+            Status::Degraded
+        );
+        assert!(!snapshot.any_error(), "a feed error must not fail /healthz");
+    }
+
+    #[tokio::test]
+    async fn feed_non_advancing_cursor_ends_the_pass() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+        let (_dir, store) = open_store().await;
+
+        mount_cdn(&server, "/cdn/a.jpg", 10).await;
+        // The server keeps returning the same non-advancing cursor. Without
+        // the guard this would loop forever; the pass must end instead.
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [feed_media_item(&server.uri(), "a", "/cdn/a.jpg")],
+                "cursor": "stuck",
+            })))
+            .mount(&server)
+            .await;
+
+        let poller = feed_poller(&server, store.clone(), 10_000_000);
+        // The first page uses cursor=None; page two returns cursor "stuck"
+        // again (== the cursor we just requested with), ending the walk.
+        let pass = tokio::time::timeout(
+            Duration::from_secs(5),
+            poller.poll_feed_once(&resolved_feed()),
+        )
+        .await
+        .expect("must not loop forever")
+        .expect("poll");
+        assert_eq!(pass.archived, 1);
     }
 }

@@ -6,6 +6,8 @@
 //! serve `/healthz` and the config page. This module only defines the type
 //! and the channel — no HTTP endpoint lives here.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use tokio::sync::watch;
 
@@ -66,6 +68,28 @@ pub struct HealthSnapshot {
     pub rest_fallback: SubsystemHealth,
     pub likes_bookmarks: SubsystemHealth,
     pub media_downloader: SubsystemHealth,
+    /// One entry per configured custom feed, keyed by the feed's slug. A feed
+    /// that errors, 404s, or hits its size cap reports `Degraded` here
+    /// (never `Error`, so it never fails a container healthcheck) in complete
+    /// isolation from every other feed and subsystem.
+    #[serde(default)]
+    pub feeds: BTreeMap<String, SubsystemHealth>,
+}
+
+impl HealthSnapshot {
+    /// Whether any tracked subsystem — the four fixed ones or any feed — is
+    /// in the `Error` state, which is what makes `/healthz` return 503.
+    pub fn any_error(&self) -> bool {
+        let fixed = [
+            &self.firehose,
+            &self.rest_fallback,
+            &self.likes_bookmarks,
+            &self.media_downloader,
+        ]
+        .iter()
+        .any(|s| s.status == Status::Error);
+        fixed || self.feeds.values().any(|s| s.status == Status::Error)
+    }
 }
 
 impl Default for HealthSnapshot {
@@ -77,6 +101,7 @@ impl Default for HealthSnapshot {
             rest_fallback: starting.clone(),
             likes_bookmarks: starting.clone(),
             media_downloader: starting,
+            feeds: BTreeMap::new(),
         }
     }
 }

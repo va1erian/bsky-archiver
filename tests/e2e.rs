@@ -63,6 +63,7 @@ fn test_config(archive_dir: std::path::PathBuf, database_path: std::path::PathBu
         bsky_identifier: WATCHED_HANDLE.to_string(),
         bsky_app_password: Secret::from("e2e-app-password".to_string()),
         bsky_watch_handles: vec![WATCHED_HANDLE.to_string()],
+        watch_feeds: Vec::new(),
         archive_dir,
         database_path,
         ui_password: Secret::from("e2e-ui-password".to_string()),
@@ -72,6 +73,7 @@ fn test_config(archive_dir: std::path::PathBuf, database_path: std::path::PathBu
         jetstream_url: url::Url::parse("wss://jetstream.example.invalid/subscribe").unwrap(),
         media_max_concurrent_downloads: 4,
         media_max_bytes: 10_000_000,
+        feed_max_bytes: 2_147_483_648,
     }
 }
 
@@ -402,7 +404,7 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
             Duration::from_secs(5),
             &format!("{category} {at_uri} archived with media"),
             || async {
-                let record = store.get_post(category, at_uri).await.unwrap()?;
+                let record = store.get_post(category.clone(), at_uri).await.unwrap()?;
                 if record.media.is_empty() {
                     None
                 } else {
@@ -458,6 +460,7 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
         config,
         store: store.clone(),
         health: health_rx,
+        feeds: Vec::new(),
     });
 
     let app = web::router(state);
@@ -632,6 +635,7 @@ async fn gallery_export_streams_a_zip_of_images_only() {
         config,
         store: store.clone(),
         health: health_rx,
+        feeds: Vec::new(),
     });
     let app = web::router(state);
 
