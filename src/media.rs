@@ -320,7 +320,6 @@ impl MediaDownloader {
             );
         }
     }
-
 }
 
 fn map_category(category: PostCategory) -> Category {

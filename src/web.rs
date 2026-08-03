@@ -320,8 +320,7 @@ async fn list_posts(
         let fragment = templates::PostsListTemplate { rows, pagination };
         Ok(askama_axum::into_response(&fragment))
     } else {
-        let category_options =
-            build_category_options(query.category.as_deref(), &state.app.feeds);
+        let category_options = build_category_options(query.category.as_deref(), &state.app.feeds);
         let template = templates::PostsTemplate {
             rows,
             pagination,
@@ -467,9 +466,11 @@ fn parse_gallery_category(raw: Option<&str>) -> Result<Option<Category>, WebErro
             "bookmark" | "bookmarks" => Category::Bookmark,
             // A feed category token is `feeds/<slug>`; `Category::from_str`
             // validates the slug (rejecting path-traversal forms).
-            other => other.parse::<Category>().map_err(|_| WebError::BadRequest {
-                message: format!("unknown category {other:?}"),
-            })?,
+            other => other
+                .parse::<Category>()
+                .map_err(|_| WebError::BadRequest {
+                    message: format!("unknown category {other:?}"),
+                })?,
         }),
     };
     Ok(category)
@@ -575,8 +576,7 @@ async fn gallery(
     } else {
         let estimate = state.app.store.export_estimate(category.clone()).await?;
         let export = build_gallery_export(category.as_ref(), estimate);
-        let category_options =
-            build_gallery_category_options(category.as_ref(), &state.app.feeds);
+        let category_options = build_gallery_category_options(category.as_ref(), &state.app.feeds);
         let template = templates::GalleryTemplate {
             items,
             pagination,

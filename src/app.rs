@@ -315,9 +315,7 @@ pub async fn serve(started: Started) {
         let starting = SubsystemHealth::degraded("starting up");
         health_tx.send_modify(|snapshot| {
             for feed in &state.feeds {
-                snapshot
-                    .feeds
-                    .insert(feed.slug.clone(), starting.clone());
+                snapshot.feeds.insert(feed.slug.clone(), starting.clone());
             }
         });
         Some(spawn_feeds(
@@ -806,6 +804,114 @@ mod tests {
             Ok(_) => panic!("unresolvable watch handle should fail startup"),
         };
         assert!(matches!(err, StartupError::Bluesky(_)));
+    }
+
+    #[tokio::test]
+    async fn init_fails_fast_when_a_feed_handle_cannot_be_resolved() {
+        let server = MockServer::start().await;
+        mount_login(&server, "did:plc:alice").await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "InvalidRequest",
+                "message": "unable to resolve handle",
+            })))
+            .mount(&server)
+            .await;
+
+        let archive_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = archive_dir.path().join("index.sqlite3");
+        let mut config = test_config(archive_dir.path().to_path_buf(), database_path);
+        config.watch_feeds = vec![crate::config::FeedConfig {
+            input: "https://bsky.app/profile/nobody.bsky.social/feed/x".to_string(),
+            actor: "nobody.bsky.social".to_string(),
+            rkey: "x".to_string(),
+        }];
+        let base_url = Url::parse(&server.uri()).unwrap();
+
+        let err = match init(config, base_url).await {
+            Err(err) => err,
+            Ok(_) => panic!("unresolvable feed handle should fail startup"),
+        };
+        match err {
+            StartupError::Feed(message) => assert!(
+                message.contains("nobody.bsky.social"),
+                "error should name the offending entry: {message}"
+            ),
+            other => panic!("expected StartupError::Feed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn init_fails_fast_when_two_feeds_resolve_to_the_same_feed() {
+        let server = MockServer::start().await;
+        mount_login(&server, "did:plc:alice").await;
+        // `getFeedGenerator` is best-effort (display name only); leaving it
+        // unmocked (404) exercises the non-fatal fallback for the first entry.
+
+        let archive_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = archive_dir.path().join("index.sqlite3");
+        let mut config = test_config(archive_dir.path().to_path_buf(), database_path);
+        // Two entries with the same DID + rkey (one as an at:// URI, one as a
+        // bsky.app URL for the same DID) resolve to the same slug.
+        config.watch_feeds = vec![
+            crate::config::FeedConfig {
+                input: "at://did:plc:dup/app.bsky.feed.generator/samerkey".to_string(),
+                actor: "did:plc:dup".to_string(),
+                rkey: "samerkey".to_string(),
+            },
+            crate::config::FeedConfig {
+                input: "https://bsky.app/profile/did:plc:dup/feed/samerkey".to_string(),
+                actor: "did:plc:dup".to_string(),
+                rkey: "samerkey".to_string(),
+            },
+        ];
+        let base_url = Url::parse(&server.uri()).unwrap();
+
+        let err = match init(config, base_url).await {
+            Err(err) => err,
+            Ok(_) => panic!("duplicate feeds should fail startup"),
+        };
+        match err {
+            StartupError::Feed(message) => assert!(
+                message.contains("same feed"),
+                "error should explain the duplicate: {message}"
+            ),
+            other => panic!("expected StartupError::Feed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn init_resolves_a_feed_with_display_name_and_stable_slug() {
+        let server = MockServer::start().await;
+        mount_login(&server, "did:plc:alice").await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeedGenerator"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "view": {"displayName": "Cool Cats"},
+            })))
+            .mount(&server)
+            .await;
+
+        let archive_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = archive_dir.path().join("index.sqlite3");
+        let mut config = test_config(archive_dir.path().to_path_buf(), database_path);
+        config.watch_feeds = vec![crate::config::FeedConfig {
+            input: "at://did:plc:feedgen/app.bsky.feed.generator/cats".to_string(),
+            actor: "did:plc:feedgen".to_string(),
+            rkey: "cats".to_string(),
+        }];
+        let base_url = Url::parse(&server.uri()).unwrap();
+
+        let started = init(config, base_url).await.expect("init should succeed");
+        assert_eq!(started.state.feeds.len(), 1);
+        let feed = &started.state.feeds[0];
+        assert_eq!(feed.display_name.as_deref(), Some("Cool Cats"));
+        assert_eq!(
+            feed.at_uri,
+            "at://did:plc:feedgen/app.bsky.feed.generator/cats"
+        );
+        assert_eq!(feed.slug, feed_slug("did:plc:feedgen", "cats"));
     }
 
     #[tokio::test]

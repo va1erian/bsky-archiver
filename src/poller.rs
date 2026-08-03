@@ -856,7 +856,10 @@ impl FeedPoller {
                     warn!(feed = %feed.slug, error = %err, "feed poll pass failed");
                     self.set_health(
                         &feed.slug,
-                        SubsystemHealth::degraded(format!("feed {:?} poll failed: {err}", feed.label())),
+                        SubsystemHealth::degraded(format!(
+                            "feed {:?} poll failed: {err}",
+                            feed.label()
+                        )),
                     );
                     any_error = true;
                 }
@@ -1935,7 +1938,11 @@ mod tests {
         assert_eq!(pass.archived, 0);
         let category = Category::Feed("mycats-abc123".to_string());
         assert_eq!(
-            store.list_posts(Some(category), 1, 10).await.unwrap().total_items,
+            store
+                .list_posts(Some(category), 1, 10)
+                .await
+                .unwrap()
+                .total_items,
             0
         );
     }
@@ -1975,7 +1982,10 @@ mod tests {
 
         let category = Category::Feed("mycats-abc123".to_string());
         let used = store.category_media_bytes(&category).await.unwrap();
-        assert!(used <= 150, "on-disk media must never exceed the cap: {used}");
+        assert!(
+            used <= 150,
+            "on-disk media must never exceed the cap: {used}"
+        );
         assert_eq!(used, 100, "exactly the one file that fits");
 
         // No partial media file for the skipped downloads.

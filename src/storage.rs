@@ -977,7 +977,10 @@ fn discover_categories(archive_dir: &Path) -> Result<Vec<Category>, StorageError
             if is_safe_feed_slug(slug) {
                 categories.push(Category::Feed(slug.to_string()));
             } else {
-                tracing::warn!(slug, "skipping feed directory with an unsafe slug during reindex");
+                tracing::warn!(
+                    slug,
+                    "skipping feed directory with an unsafe slug during reindex"
+                );
             }
         }
     }

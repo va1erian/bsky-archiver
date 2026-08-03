@@ -763,10 +763,8 @@ mod tests {
         assert_eq!(url.actor, "goose.art");
         assert_eq!(url.rkey, "aaaf2pqeodmpy");
 
-        let url_did = parse_feed_entry(
-            "https://bsky.app/profile/did:plc:abc123/feed/whats-hot",
-        )
-        .expect("bsky.app feed URL with a DID actor");
+        let url_did = parse_feed_entry("https://bsky.app/profile/did:plc:abc123/feed/whats-hot")
+            .expect("bsky.app feed URL with a DID actor");
         assert_eq!(url_did.actor, "did:plc:abc123");
         assert_eq!(url_did.rkey, "whats-hot");
 
@@ -782,10 +780,10 @@ mod tests {
             "not a url at all",
             "https://example.com/profile/goose.art/feed/x", // wrong host
             "https://bsky.app/profile/goose.art",           // missing feed/rkey
-            "https://bsky.app/profile/goose.art/feed/",      // empty rkey
+            "https://bsky.app/profile/goose.art/feed/",     // empty rkey
             "at://did:plc:xyz/app.bsky.feed.post/x",        // wrong collection
-            "at://did:plc:xyz/app.bsky.feed.generator/",     // empty rkey
-            "at:///app.bsky.feed.generator/x",               // empty authority
+            "at://did:plc:xyz/app.bsky.feed.generator/",    // empty rkey
+            "at:///app.bsky.feed.generator/x",              // empty authority
         ] {
             let err = parse_feed_entry(bad).expect_err(bad);
             match err {
