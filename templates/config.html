@@ -8,8 +8,8 @@
 <tbody>
 {% for row in rows %}
 <tr>
-<td>{{ row.key }}</td>
-<td>{% if row.redacted %}<span class="redacted">{{ row.value }}</span>{% else %}{{ row.value }}{% endif %}</td>
+<td data-label="Variable">{{ row.key }}</td>
+<td data-label="Value">{% if row.redacted %}<span class="redacted">{{ row.value }}</span>{% else %}{{ row.value }}{% endif %}</td>
 </tr>
 {% endfor %}
 </tbody>

@@ -16,14 +16,14 @@
 </div>
 
 <h2>Subsystem health</h2>
-<table>
+<table class="health-table">
 <thead><tr><th>Subsystem</th><th>Status</th><th>Detail</th></tr></thead>
 <tbody>
 {% for row in health %}
 <tr>
-<td>{{ row.name }}</td>
-<td><span class="status-badge"><span class="status-dot {{ row.status_class }}"></span>{{ row.status_text }}</span></td>
-<td>{{ row.detail.as_deref().unwrap_or("") }}</td>
+<td data-label="Subsystem">{{ row.name }}</td>
+<td data-label="Status"><span class="status-badge"><span class="status-dot {{ row.status_class }}"></span>{{ row.status_text }}</span></td>
+<td data-label="Detail">{{ row.detail.as_deref().unwrap_or("") }}</td>
 </tr>
 {% endfor %}
 </tbody>
