@@ -26,6 +26,10 @@
   background: #059669;
 }
 
+.badge-feed {
+  background: #7c3aed;
+}
+
 .status-badge {
   display: inline-flex;
   align-items: center;

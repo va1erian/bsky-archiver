@@ -130,6 +130,19 @@ pub struct AuthorFeedPage {
     pub cursor: Option<String>,
 }
 
+/// The subset of `app.bsky.feed.getFeedGenerator`'s response we use: the
+/// generator view's human-readable display name, for UI labelling only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeedGeneratorView {
+    #[serde(rename = "displayName")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GetFeedGeneratorResponse {
+    view: FeedGeneratorView,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct CreateSessionResponse {
     #[serde(rename = "accessJwt")]
@@ -303,6 +316,39 @@ impl BlueskyClient {
         }
         self.get_authenticated("app.bsky.feed.getAuthorFeed", &query)
             .await
+    }
+
+    /// Fetches one page of a custom feed (`app.bsky.feed.getFeed`),
+    /// newest-first, optionally continuing from a previous page's `cursor`.
+    /// `feed` is the generator's `at://` URI. Returns the same hydrated
+    /// `feedViewPost` shape as `getAuthorFeed`, so the shared media-detection
+    /// and extraction paths apply unchanged.
+    pub async fn get_feed(
+        &self,
+        feed: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<AuthorFeedPage, BlueskyError> {
+        let mut query = vec![("feed", feed.to_string()), ("limit", limit.to_string())];
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        self.get_authenticated("app.bsky.feed.getFeed", &query)
+            .await
+    }
+
+    /// Fetches a feed generator's human-readable display name via
+    /// `app.bsky.feed.getFeedGenerator`. `None` if the generator returns no
+    /// display name. Used once at startup for UI labelling; a failure here is
+    /// non-fatal to the caller.
+    pub async fn get_feed_generator(&self, feed: &str) -> Result<Option<String>, BlueskyError> {
+        let response: GetFeedGeneratorResponse = self
+            .get_authenticated(
+                "app.bsky.feed.getFeedGenerator",
+                &[("feed", feed.to_string())],
+            )
+            .await?;
+        Ok(response.view.display_name)
     }
 
     /// Fetches one page of the watched account's likes, newest-first.

@@ -81,28 +81,35 @@ pub fn build_pagination(
 // Shared formatting helpers
 // ---------------------------------------------------------------------
 
-pub fn category_label(category: Category) -> &'static str {
+pub fn category_label(category: &Category) -> &'static str {
     match category {
         Category::Post => "Post",
         Category::Like => "Like",
         Category::Bookmark => "Bookmark",
+        Category::Feed(_) => "Feed",
     }
 }
 
-pub fn category_badge_class(category: Category) -> &'static str {
+pub fn category_badge_class(category: &Category) -> &'static str {
     match category {
         Category::Post => "badge-post",
         Category::Like => "badge-like",
         Category::Bookmark => "badge-bookmark",
+        Category::Feed(_) => "badge-feed",
     }
 }
 
 /// The URL this app serves a stored media file's raw bytes at (see
-/// `crate::web`'s `/media/:category/:id/:filename` route).
-pub fn media_url(category: Category, post_at_uri: &str, filename: &str) -> String {
+/// `crate::web`'s `/media/:category/:id/:filename` route). The category is
+/// percent-encoded so a feed category (`feeds/<slug>`, which contains a `/`)
+/// stays inside a single path segment; axum decodes it back before matching.
+pub fn media_url(category: &Category, post_at_uri: &str, filename: &str) -> String {
     format!(
         "/media/{}/{}/{}",
-        category,
+        percent_encoding::utf8_percent_encode(
+            &category.as_dir(),
+            percent_encoding::NON_ALPHANUMERIC
+        ),
         crate::web::encode_post_id(post_at_uri),
         percent_encoding::utf8_percent_encode(filename, percent_encoding::NON_ALPHANUMERIC)
     )
@@ -161,20 +168,20 @@ pub fn bluesky_post_url(at_uri: &str) -> Option<String> {
 // ---------------------------------------------------------------------
 
 pub struct SubsystemRow {
-    pub name: &'static str,
+    pub name: String,
     pub status_class: &'static str,
     pub status_text: &'static str,
     pub detail: Option<String>,
 }
 
-pub fn subsystem_row(name: &'static str, health: &SubsystemHealth) -> SubsystemRow {
+pub fn subsystem_row(name: impl Into<String>, health: &SubsystemHealth) -> SubsystemRow {
     let (status_class, status_text) = match health.status {
         Status::Connected => ("status-connected", "Connected"),
         Status::Degraded => ("status-degraded", "Degraded"),
         Status::Error => ("status-error", "Error"),
     };
     SubsystemRow {
-        name,
+        name: name.into(),
         status_class,
         status_text,
         detail: health.detail.clone(),
@@ -218,8 +225,8 @@ pub struct PostRow {
 /// index deliberately doesn't store full record bodies).
 pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
     PostRow {
-        category_label: category_label(summary.category),
-        category_badge_class: category_badge_class(summary.category),
+        category_label: category_label(&summary.category),
+        category_badge_class: category_badge_class(&summary.category),
         author: author_did_from_at_uri(&summary.at_uri).to_string(),
         excerpt: text
             .map(|t| excerpt(t, MAX_EXCERPT_CHARS))
@@ -231,18 +238,18 @@ pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
             .thumbnail_filename
             .as_deref()
             .map(|filename| MediaThumb {
-                url: media_url(summary.category, &summary.at_uri, filename),
+                url: media_url(&summary.category, &summary.at_uri, filename),
                 is_video: is_video_content_type(summary.thumbnail_content_type.as_deref()),
                 alt: format!(
                     "Media attached to this {}",
-                    category_label(summary.category)
+                    category_label(&summary.category)
                 ),
             }),
     }
 }
 
 pub struct CategoryOption {
-    pub label: &'static str,
+    pub label: String,
     pub href: String,
     pub selected: bool,
 }
@@ -295,7 +302,7 @@ pub struct GalleryItem {
 }
 
 pub fn gallery_item(summary: &MediaSummary) -> GalleryItem {
-    let url = media_url(summary.category, &summary.post_at_uri, &summary.filename);
+    let url = media_url(&summary.category, &summary.post_at_uri, &summary.filename);
     GalleryItem {
         thumb_url: url.clone(),
         full_url: url,
@@ -306,7 +313,7 @@ pub fn gallery_item(summary: &MediaSummary) -> GalleryItem {
         ),
         alt: format!(
             "{} media from {}",
-            category_label(summary.category),
+            category_label(&summary.category),
             author_did_from_at_uri(&summary.post_at_uri)
         ),
     }
@@ -375,11 +382,22 @@ pub struct ConfigRow {
     pub redacted: bool,
 }
 
+/// One configured custom feed, as shown on `/config`: its resolved URI,
+/// display name, per-feed cap, and current bytes used.
+pub struct ConfigFeedRow {
+    pub name: String,
+    pub input: String,
+    pub uri: String,
+    pub cap: String,
+    pub used: String,
+}
+
 #[derive(Template)]
 #[template(path = "config.html")]
 pub struct ConfigTemplate {
     pub version: &'static str,
     pub rows: Vec<ConfigRow>,
+    pub feeds: Vec<ConfigFeedRow>,
 }
 
 #[cfg(test)]

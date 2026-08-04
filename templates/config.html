@@ -15,5 +15,23 @@
 </tbody>
 </table>
 
+{% if !feeds.is_empty() %}
+<h2>Custom feeds</h2>
+<table class="config-table">
+<thead><tr><th>Name</th><th>URI</th><th>Configured as</th><th>Cap</th><th>Used</th></tr></thead>
+<tbody>
+{% for feed in feeds %}
+<tr>
+<td>{{ feed.name }}</td>
+<td><code>{{ feed.uri }}</code></td>
+<td><code>{{ feed.input }}</code></td>
+<td>{{ feed.cap }}</td>
+<td>{{ feed.used }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
 <p class="app-version">Version {{ version }}</p>
 {% endblock %}

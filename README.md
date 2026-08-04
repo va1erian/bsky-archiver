@@ -5,13 +5,22 @@ A self-hosted daemon + web UI that watches one Bluesky account and archives:
 1. That account's own posts which contain media (images or video).
 2. That account's likes.
 3. That account's bookmarks.
+4. Any custom feeds (`app.bsky.feed.generator`) listed in `BSKY_WATCH_FEEDS` —
+   each polled periodically and archived as its own browsable category, capped
+   per feed at `FEED_MAX_BYTES` (default 2 GiB).
 
 For each archived item, the full post record is stored as JSON and any attached
 images/video are downloaded and stored alongside it. A small web UI lets a human
 browse the archive (post list + detail), view a gallery of archived media —
-filterable by category (posts / likes / bookmarks) and downloadable as a single
-zip of every image in the current selection — and see the active (non-secret)
-configuration.
+filterable by category (posts / likes / bookmarks / each configured feed) and
+downloadable as a single zip of every image in the current selection — and see
+the active (non-secret) configuration.
+
+Custom feeds are poll-only by necessity: Jetstream carries raw repo commits, so
+there is no firehose path for an algorithmic feed. A newly configured feed
+backfills newest-first until it hits its cap, then stops (it never evicts);
+removing a feed from `BSKY_WATCH_FEEDS` stops polling it but leaves everything
+already archived under it browsable and exportable.
 
 Real-time capture of the watched account's own posts uses a Jetstream firehose
 subscription; a REST-polling path fully substitutes for it whenever the firehose
@@ -122,6 +131,8 @@ Docker Compose-style service definitions).
 | Variable | Default | Description |
 | --- | --- | --- |
 | `BSKY_WATCH_HANDLES` | `BSKY_IDENTIFIER` alone | Comma-separated list of handles/DIDs to watch for authored posts with media. |
+| `BSKY_WATCH_FEEDS` | *(none)* | Comma-separated list of custom feeds to archive, each browsable and exportable as its own category. Accepts `bsky.app` feed URLs (`https://bsky.app/profile/<handle-or-did>/feed/<rkey>`) and/or `at://<did>/app.bsky.feed.generator/<rkey>` URIs, mixed freely. Each feed is polled on `POLL_INTERVAL_SECONDS` and its media-bearing posts archived newest-first until it fills `FEED_MAX_BYTES`. Startup fails fast on an unparseable entry, an unresolvable handle, or two entries resolving to the same feed. |
+| `FEED_MAX_BYTES` | `2147483648` (2 GiB) | Per-feed hard cap on archived media bytes. Applies **per feed**, not globally. A feed at cap stops archiving (it never evicts) and reports `Degraded`; raising this is the lever to let it resume. |
 | `ARCHIVE_DIR` | `/data/archive` | Root directory for archived JSON records and media. **Must persist across restarts and upgrades** (mount a volume here). |
 | `DATABASE_PATH` | `<ARCHIVE_DIR>/index.sqlite3` | SQLite index file path. Safe to delete — it is rebuilt automatically from `ARCHIVE_DIR` on next startup — but persisting it avoids a slow reindex. |
 | `UI_PORT` | `8080` | Port the web UI listens on inside the container. |
