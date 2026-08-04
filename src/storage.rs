@@ -26,7 +26,6 @@
 //! writing to a temp file in the same directory and renaming it into
 //! place, so a reader can never observe a partially written file.
 
-use std::borrow::Cow;
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -39,56 +38,29 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// A category of archived item. The first three are the fixed, built-in
-/// kinds; [`Category::Feed`] is one archived custom feed, keyed by a stable,
-/// filesystem/URL-safe slug derived from the feed generator's DID + rkey
-/// (never its display name). Each feed is its own category on disk
-/// (`feeds/<slug>/…`), in the index (`category = 'feeds/<slug>'`), and in
-/// URLs — not a single shared `feeds` bucket.
-///
-/// No longer `Copy`, because [`Category::Feed`] owns its slug; callers pass
-/// it by value (cloning cheap built-in variants) or by reference.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// The three top-level categories of archived item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Category {
     Post,
     Like,
     Bookmark,
-    Feed(String),
 }
 
 impl Category {
-    /// The archive sub-directory (and the string stored in the index's
-    /// `category` column) for this category. A borrowed `&'static str` for
-    /// the three built-ins, an owned `feeds/<slug>` for a feed. Round-trips
-    /// through [`Category::from_str`].
-    pub fn as_dir(&self) -> Cow<'static, str> {
+    const ALL: [Category; 3] = [Category::Post, Category::Like, Category::Bookmark];
+
+    fn as_dir(self) -> &'static str {
         match self {
-            Category::Post => Cow::Borrowed("posts"),
-            Category::Like => Cow::Borrowed("likes"),
-            Category::Bookmark => Cow::Borrowed("bookmarks"),
-            Category::Feed(slug) => Cow::Owned(format!("feeds/{slug}")),
+            Category::Post => "posts",
+            Category::Like => "likes",
+            Category::Bookmark => "bookmarks",
         }
     }
 }
 
-/// Whether `slug` is a safe feed slug: non-empty and built only from
-/// characters that are safe as a single filesystem path component and URL
-/// segment, with no `.`-only or path-traversal forms. Slugs produced by
-/// [`crate::config::feed_slug`] always satisfy this; this guard is what keeps
-/// a hand-typed `/media/feeds%2F..%2F/...` URL (or a corrupt index row) from
-/// escaping `ARCHIVE_DIR`.
-fn is_safe_feed_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug != "."
-        && slug != ".."
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
 impl fmt::Display for Category {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.as_dir())
+        f.write_str(self.as_dir())
     }
 }
 
@@ -100,12 +72,63 @@ impl std::str::FromStr for Category {
             "posts" => Ok(Category::Post),
             "likes" => Ok(Category::Like),
             "bookmarks" => Ok(Category::Bookmark),
-            other => match other.strip_prefix("feeds/") {
-                Some(slug) if is_safe_feed_slug(slug) => Ok(Category::Feed(slug.to_string())),
-                _ => Err(StorageError::InvalidCategory(other.to_string())),
-            },
+            other => Err(StorageError::InvalidCategory(other.to_string())),
         }
     }
+}
+
+/// What kind of source a watched row points at: a single account (handle or
+/// DID) whose authored posts are archived, or an algorithm/custom feed (an
+/// `at://` `app.bsky.feed.generator` URI) whose posts are archived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Account,
+    Feed,
+}
+
+impl SourceKind {
+    /// The canonical string form stored in `watched_sources.source_kind`.
+    fn as_str(self) -> &'static str {
+        match self {
+            SourceKind::Account => "account",
+            SourceKind::Feed => "feed",
+        }
+    }
+}
+
+impl std::fmt::Display for SourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SourceKind {
+    type Err = StorageError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "account" => Ok(SourceKind::Account),
+            "feed" => Ok(SourceKind::Feed),
+            other => Err(StorageError::InvalidSourceKind(other.to_string())),
+        }
+    }
+}
+
+/// One row of the `watched_sources` table: a UI-managed, live-reloadable
+/// account or feed the archiver watches. This table is the single source of
+/// truth for what the daemon watches; the in-memory roster
+/// ([`crate::watchlist::Watchlist`]) is a live cache of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchedSource {
+    pub id: i64,
+    pub kind: SourceKind,
+    /// For accounts: the handle or DID the user entered. For feeds: the
+    /// `at://` feed URI.
+    pub value: String,
+    /// Resolved DID for accounts (always `Some` once resolution has
+    /// happened); `None` for feeds, which aren't DID-scoped.
+    pub did: Option<String>,
+    pub added_at: String,
 }
 
 /// Errors produced by the storage layer.
@@ -119,6 +142,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("unknown category on disk: {0:?}")]
     InvalidCategory(String),
+    #[error("unknown watched source kind on disk: {0:?}")]
+    InvalidSourceKind(String),
     #[error("post not archived: {0}")]
     NotFound(String),
     #[error("background storage task panicked")]
@@ -263,20 +288,17 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn item_dir(archive_dir: &Path, category: &Category, at_uri: &str) -> PathBuf {
+fn item_dir(archive_dir: &Path, category: Category, at_uri: &str) -> PathBuf {
     let id = item_id(at_uri);
     let shard = &id[..2];
-    archive_dir
-        .join(category.as_dir().as_ref())
-        .join(shard)
-        .join(id)
+    archive_dir.join(category.as_dir()).join(shard).join(id)
 }
 
-fn record_path(archive_dir: &Path, category: &Category, at_uri: &str) -> PathBuf {
+fn record_path(archive_dir: &Path, category: Category, at_uri: &str) -> PathBuf {
     item_dir(archive_dir, category, at_uri).join("record.json")
 }
 
-fn media_dir(archive_dir: &Path, category: &Category, at_uri: &str) -> PathBuf {
+fn media_dir(archive_dir: &Path, category: Category, at_uri: &str) -> PathBuf {
     item_dir(archive_dir, category, at_uri).join("media")
 }
 
@@ -313,7 +335,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp_path, path)
 }
 
-const SCHEMA_VERSION: i64 = 1;
+/// Schema version 2 adds the `watched_sources` table (the UI-managed watch
+/// list); version 1 had only `posts`/`media`. Both statements are
+/// `CREATE TABLE IF NOT EXISTS`, so a version-1 database upgrades in place
+/// (the new table is created empty) with no data rows to move.
+const SCHEMA_VERSION: i64 = 2;
 
 fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -348,6 +374,15 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_media_indexed_at ON media(indexed_at, id);
         CREATE INDEX IF NOT EXISTS idx_media_category_indexed_at
             ON media(category, indexed_at, id);
+
+        CREATE TABLE IF NOT EXISTS watched_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_kind TEXT NOT NULL CHECK (source_kind IN ('account', 'feed')),
+            source_value TEXT NOT NULL,
+            did TEXT,
+            added_at TEXT NOT NULL,
+            UNIQUE(source_kind, source_value)
+        );
         ",
     )?;
 
@@ -424,7 +459,7 @@ impl ArchiveStore {
         let cid = cid.to_string();
 
         let result = tokio::task::spawn_blocking(move || -> Result<SaveOutcome, StorageError> {
-            let path = record_path(&archive_dir, &category, &at_uri);
+            let path = record_path(&archive_dir, category, &at_uri);
             if path.exists() {
                 return Ok(SaveOutcome::AlreadyArchived);
             }
@@ -446,7 +481,7 @@ impl ArchiveStore {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     at_uri,
-                    category.as_dir().as_ref(),
+                    category.as_dir(),
                     cid,
                     indexed_at,
                     relative_str(&archive_dir, &path)
@@ -457,6 +492,98 @@ impl ArchiveStore {
         })
         .await;
 
+        join_result(result)
+    }
+
+    /// Lists every watched source, oldest-added first, from the
+    /// `watched_sources` table that [`ArchiveStore::open`] bootstrapped.
+    /// This is the single source of truth the live roster
+    /// ([`crate::watchlist::Watchlist`]) and the producers read from.
+    pub async fn list_watched_sources(&self) -> Result<Vec<WatchedSource>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<WatchedSource>, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_kind, source_value, did, added_at
+                 FROM watched_sources
+                 ORDER BY added_at, id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    let kind: String = row.get(1)?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        kind,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                let mut sources = Vec::new();
+                for row in rows {
+                    let (id, kind, value, did, added_at) = row?;
+                    sources.push(WatchedSource {
+                        id,
+                        kind: kind.parse()?,
+                        value,
+                        did,
+                        added_at,
+                    });
+                }
+                Ok(sources)
+            })
+            .await;
+        join_result(result)
+    }
+
+    /// Adds (or re-adds) a watched source. Idempotent: adding a source that
+    /// already exists under the same `(kind, value)` is a no-op upsert that
+    /// refreshes the resolved `did` (in case the handle now resolves
+    /// differently) but never resets `added_at`. Returns the row's id in
+    /// both cases.
+    pub async fn add_watched_source(
+        &self,
+        kind: SourceKind,
+        value: &str,
+        did: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let db = Arc::clone(&self.db);
+        let kind = kind.as_str().to_string();
+        let value = value.to_string();
+        let did = did.map(str::to_string);
+        let added_at = now_rfc3339();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<i64, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT INTO watched_sources (source_kind, source_value, did, added_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(source_kind, source_value) DO UPDATE SET
+                     did = COALESCE(excluded.did, watched_sources.did)",
+                params![kind, value, did, added_at],
+            )?;
+            let id = conn.query_row(
+                "SELECT id FROM watched_sources WHERE source_kind = ?1 AND source_value = ?2",
+                params![kind, value],
+                |row| row.get(0),
+            )?;
+            Ok(id)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Removes a watched source by row id. Returns whether a row was
+    /// actually deleted (removing an already-absent id is a no-op `false`).
+    pub async fn remove_watched_source(&self, id: i64) -> Result<bool, StorageError> {
+        let db = Arc::clone(&self.db);
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let affected =
+                conn.execute("DELETE FROM watched_sources WHERE id = ?1", params![id])?;
+            Ok(affected > 0)
+        })
+        .await;
         join_result(result)
     }
 
@@ -477,12 +604,12 @@ impl ArchiveStore {
         let filename = filename.to_string();
 
         let result = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            let record_file = record_path(&archive_dir, &category, &at_uri);
+            let record_file = record_path(&archive_dir, category, &at_uri);
             if !record_file.exists() {
                 return Err(StorageError::NotFound(at_uri.clone()));
             }
 
-            let media_path = media_dir(&archive_dir, &category, &at_uri).join(&filename);
+            let media_path = media_dir(&archive_dir, category, &at_uri).join(&filename);
             let size_bytes = bytes.len() as u64;
             if !media_path.exists() {
                 atomic_write(&media_path, &bytes)?;
@@ -508,7 +635,7 @@ impl ArchiveStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     at_uri,
-                    category.as_dir().as_ref(),
+                    category.as_dir(),
                     filename,
                     content_type,
                     size_bytes as i64,
@@ -534,7 +661,7 @@ impl ArchiveStore {
         let archive_dir = self.archive_dir.clone();
         let at_uri = at_uri.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            Ok(record_path(&archive_dir, &category, &at_uri).exists())
+            Ok(record_path(&archive_dir, category, &at_uri).exists())
         })
         .await;
         join_result(result)
@@ -550,7 +677,7 @@ impl ArchiveStore {
         let archive_dir = self.archive_dir.clone();
         let at_uri = at_uri.to_string();
         let result = tokio::task::spawn_blocking(move || -> Result<_, StorageError> {
-            let path = record_path(&archive_dir, &category, &at_uri);
+            let path = record_path(&archive_dir, category, &at_uri);
             if !path.exists() {
                 return Ok(None);
             }
@@ -768,7 +895,7 @@ impl ArchiveStore {
             return Ok(None);
         }
 
-        let path = media_dir(&self.archive_dir, &category, at_uri).join(filename);
+        let path = media_dir(&self.archive_dir, category, at_uri).join(filename);
         match tokio::fs::File::open(&path).await {
             Ok(file) => Ok(Some(file)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -800,7 +927,7 @@ impl ArchiveStore {
         let filename = filename.to_string();
         let result =
             tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, StorageError> {
-                let path = media_dir(&archive_dir, &category, &at_uri).join(&filename);
+                let path = media_dir(&archive_dir, category, &at_uri).join(&filename);
                 if !path.is_file() {
                     return Ok(None);
                 }
@@ -823,13 +950,8 @@ impl ArchiveStore {
             let mut found_posts = Vec::new();
             let mut found_media = Vec::new();
 
-            // Discover every category directory on disk rather than iterating
-            // a hardcoded list: the three built-ins plus one directory per
-            // archived feed under `feeds/`. A feed no longer in
-            // `BSKY_WATCH_FEEDS` is still discovered here, so removing a feed
-            // from config never orphans or hides what it already archived.
-            for category in discover_categories(&archive_dir)? {
-                let category_dir = archive_dir.join(category.as_dir().as_ref());
+            for category in Category::ALL {
+                let category_dir = archive_dir.join(category.as_dir());
                 if !category_dir.is_dir() {
                     continue;
                 }
@@ -850,7 +972,7 @@ impl ArchiveStore {
                         for media in &archived.media {
                             found_media.push((
                                 archived.at_uri.clone(),
-                                category.clone(),
+                                category,
                                 media.filename.clone(),
                                 media.content_type.clone(),
                                 media.size_bytes,
@@ -860,7 +982,7 @@ impl ArchiveStore {
 
                         found_posts.push((
                             archived.at_uri.clone(),
-                            category.clone(),
+                            category,
                             archived.cid.clone(),
                             archived.indexed_at.clone(),
                             relative_str(&archive_dir, &record_file),
@@ -877,13 +999,7 @@ impl ArchiveStore {
                 tx.execute(
                     "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        at_uri,
-                        category.as_dir().as_ref(),
-                        cid,
-                        indexed_at,
-                        record_path
-                    ],
+                    params![at_uri, category.as_dir(), cid, indexed_at, record_path],
                 )?;
             }
             for (post_at_uri, category, filename, content_type, size_bytes, indexed_at) in
@@ -895,7 +1011,7 @@ impl ArchiveStore {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         post_at_uri,
-                        category.as_dir().as_ref(),
+                        category.as_dir(),
                         filename,
                         content_type,
                         size_bytes as i64,
@@ -911,81 +1027,6 @@ impl ArchiveStore {
 
         join_result(result)
     }
-
-    /// Total bytes of media archived under `category`, from
-    /// `SUM(media.size_bytes)` in the index. This is the quantity the
-    /// per-feed size cap is enforced against (JSON records are not counted).
-    pub async fn category_media_bytes(&self, category: &Category) -> Result<u64, StorageError> {
-        let db = Arc::clone(&self.db);
-        let category = category.as_dir().to_string();
-        let result = tokio::task::spawn_blocking(move || -> Result<u64, StorageError> {
-            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            let total: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM media WHERE category = ?1",
-                params![category],
-                |row| row.get(0),
-            )?;
-            Ok(total.max(0) as u64)
-        })
-        .await;
-        join_result(result)
-    }
-
-    /// Every category `at_uri` is archived under, according to the index
-    /// (an `at_uri` can appear under several — e.g. liked *and* surfaced by a
-    /// feed). Used by post detail to locate an item without knowing its
-    /// category up front, including feed categories no longer in config.
-    pub async fn find_categories(&self, at_uri: &str) -> Result<Vec<Category>, StorageError> {
-        let db = Arc::clone(&self.db);
-        let at_uri = at_uri.to_string();
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<Category>, StorageError> {
-            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            let mut stmt =
-                conn.prepare("SELECT category FROM posts WHERE at_uri = ?1 ORDER BY category")?;
-            let rows = stmt.query_map(params![at_uri], |row| row.get::<_, String>(0))?;
-            let mut categories = Vec::new();
-            for row in rows {
-                if let Ok(category) = row?.parse::<Category>() {
-                    categories.push(category);
-                }
-            }
-            Ok(categories)
-        })
-        .await;
-        join_result(result)
-    }
-}
-
-/// Every category directory present under `archive_dir`: the three built-ins
-/// (whether or not they exist yet) plus one [`Category::Feed`] per
-/// subdirectory of `feeds/`, so [`ArchiveStore::reindex`] rebuilds feed
-/// categories discovered from disk rather than from a hardcoded list.
-fn discover_categories(archive_dir: &Path) -> Result<Vec<Category>, StorageError> {
-    let mut categories = vec![Category::Post, Category::Like, Category::Bookmark];
-
-    let feeds_dir = archive_dir.join("feeds");
-    if feeds_dir.is_dir() {
-        for entry in std::fs::read_dir(&feeds_dir)? {
-            let entry = entry?;
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(slug) = name.to_str() else {
-                continue;
-            };
-            if is_safe_feed_slug(slug) {
-                categories.push(Category::Feed(slug.to_string()));
-            } else {
-                tracing::warn!(
-                    slug,
-                    "skipping feed directory with an unsafe slug during reindex"
-                );
-            }
-        }
-    }
-
-    Ok(categories)
 }
 
 fn relative_str(base: &Path, path: &Path) -> String {
@@ -1387,7 +1428,7 @@ mod tests {
         // Simulate index drift: delete the on-disk record directly,
         // bypassing the store, then reindex and confirm the stale row is
         // gone.
-        let path = record_path(&dir.path().join("archive"), &Category::Post, at_uri);
+        let path = record_path(&dir.path().join("archive"), Category::Post, at_uri);
         std::fs::remove_file(&path).unwrap();
 
         store.reindex().await.unwrap();
@@ -1398,10 +1439,10 @@ mod tests {
     /// Seeds one image under each category so category-filtered queries have
     /// something to isolate.
     async fn seed_one_image_per_category(store: &ArchiveStore) {
-        for category in [Category::Post, Category::Like, Category::Bookmark] {
+        for category in Category::ALL {
             let at_uri = format!("at://did:plc:alice/app.bsky.feed.post/{category}");
             store
-                .save_post(category.clone(), &at_uri, "cid", json!({}))
+                .save_post(category, &at_uri, "cid", json!({}))
                 .await
                 .unwrap();
             store
@@ -1434,123 +1475,225 @@ mod tests {
         assert!(likes.items.iter().all(|m| m.category == Category::Like));
     }
 
-    #[test]
-    fn feed_category_round_trips_through_dir_and_from_str() {
-        let feed = Category::Feed("cats-abc123".to_string());
-        assert_eq!(feed.as_dir(), "feeds/cats-abc123");
-        assert_eq!(feed.to_string(), "feeds/cats-abc123");
-        assert_eq!("feeds/cats-abc123".parse::<Category>().unwrap(), feed);
-
-        // Built-ins still round-trip.
-        for c in [Category::Post, Category::Like, Category::Bookmark] {
-            assert_eq!(c.as_dir().parse::<Category>().unwrap(), c);
-        }
-    }
-
-    #[test]
-    fn unsafe_feed_slugs_are_rejected() {
-        for bad in [
-            "feeds/",           // empty slug
-            "feeds/..",         // parent traversal
-            "feeds/.",          // current dir
-            "feeds/a/b",        // nested (would escape the single dir)
-            "feeds/../secrets", // traversal
-            "feeds/a b",        // space
-            "unknown",          // not a feed and not a built-in
-        ] {
-            assert!(
-                bad.parse::<Category>().is_err(),
-                "slug {bad:?} must be rejected"
-            );
-        }
-        // A legitimate slug is accepted.
-        assert!("feeds/goose-0a1b2c3d".parse::<Category>().is_ok());
-    }
-
     #[tokio::test]
-    async fn feed_media_is_isolated_and_bytes_are_summed() {
+    async fn watched_sources_round_trip_add_list_remove() {
         let (_dir, store) = open_store().await;
-        let feed = Category::Feed("goose-abc".to_string());
-        let at_uri = "at://did:plc:bob/app.bsky.feed.post/1";
-        store
-            .save_post(feed.clone(), at_uri, "cid-1", json!({}))
-            .await
-            .unwrap();
-        store
-            .save_media(
-                feed.clone(),
-                at_uri,
-                "000.jpg",
-                Some("image/jpeg".to_string()),
-                vec![0u8; 40],
+
+        assert!(store.list_watched_sources().await.unwrap().is_empty());
+
+        let account_id = store
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:alice"),
             )
             .await
             .unwrap();
+        let feed_id = store
+            .add_watched_source(
+                SourceKind::Feed,
+                "at://did:plc:alice/app.bsky.feed.generator/whats-hot",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(account_id, feed_id);
 
-        assert_eq!(store.category_media_bytes(&feed).await.unwrap(), 40);
-        // A different feed sees nothing.
+        let sources = store.list_watched_sources().await.unwrap();
+        assert_eq!(sources.len(), 2);
+        let account = sources
+            .iter()
+            .find(|s| s.kind == SourceKind::Account)
+            .unwrap();
+        assert_eq!(account.value, "alice.bsky.social");
+        assert_eq!(account.did.as_deref(), Some("did:plc:alice"));
+        let feed = sources.iter().find(|s| s.kind == SourceKind::Feed).unwrap();
         assert_eq!(
-            store
-                .category_media_bytes(&Category::Feed("other".to_string()))
-                .await
-                .unwrap(),
-            0
+            feed.value,
+            "at://did:plc:alice/app.bsky.feed.generator/whats-hot"
         );
+        assert_eq!(feed.did, None);
+        // Each row carries a parseable RFC3339 added_at.
+        assert!(!account.added_at.is_empty());
+        assert!(!feed.added_at.is_empty());
 
-        let listed = store.list_media(Some(feed.clone()), 1, 10).await.unwrap();
-        assert_eq!(listed.total_items, 1);
-        assert!(listed.items.iter().all(|m| m.category == feed));
-
-        let cats = store.find_categories(at_uri).await.unwrap();
-        assert_eq!(cats, vec![feed]);
+        assert!(store.remove_watched_source(account_id).await.unwrap());
+        assert!(
+            !store.remove_watched_source(account_id).await.unwrap(),
+            "second remove is a no-op"
+        );
+        let remaining = store.list_watched_sources().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, feed_id);
     }
 
     #[tokio::test]
-    async fn reindex_discovers_feed_directories_from_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive_dir = dir.path().join("archive");
-        let database_path = dir.path().join("index.sqlite3");
+    async fn adding_same_watched_source_twice_is_idempotent() {
+        let (_dir, store) = open_store().await;
 
-        let store = ArchiveStore::open(archive_dir.clone(), database_path.clone())
+        let first_id = store
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:alice"),
+            )
             .await
             .unwrap();
-        let feed = Category::Feed("cats-deadbeef".to_string());
-        let at_uri = "at://did:plc:bob/app.bsky.feed.post/1";
+        let second_id = store
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:new-did"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first_id, second_id,
+            "upsert must not create a duplicate row"
+        );
+
+        let sources = store.list_watched_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+
+        // Re-adding with a fresh did refresh is an in-place update, not a
+        // second row. The DID is updated to the new value.
+        assert_eq!(sources[0].did.as_deref(), Some("did:plc:new-did"));
+        let _ = store
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:newer"),
+            )
+            .await
+            .unwrap();
+        let after = store.list_watched_sources().await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].did.as_deref(), Some("did:plc:newer"));
+        assert_eq!(after[0].value, "alice.bsky.social");
+        assert_eq!(
+            after[0].added_at, sources[0].added_at,
+            "re-adding must not reset the original added_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_sources_with_feed_and_account_kinds_stay_distinct() {
+        let (_dir, store) = open_store().await;
+
+        // The same string can appear for both kinds without colliding, since
+        // uniqueness is on (kind, value).
         store
-            .save_post(feed.clone(), at_uri, "cid-1", json!({"text": "hi"}))
+            .add_watched_source(
+                SourceKind::Account,
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+                Some("did:plc:alice"),
+            )
             .await
             .unwrap();
         store
-            .save_media(
-                feed.clone(),
-                at_uri,
-                "000.jpg",
-                Some("image/jpeg".to_string()),
-                vec![7u8; 12],
+            .add_watched_source(
+                SourceKind::Feed,
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+                None,
             )
             .await
             .unwrap();
 
-        // A brand-new index over the same on-disk archive: reindex must
-        // rediscover the feed directory even though no config lists it.
-        let fresh_db = dir.path().join("index-fresh.sqlite3");
-        let fresh = ArchiveStore::open(archive_dir, fresh_db).await.unwrap();
-        assert_eq!(
-            fresh
-                .list_posts(Some(feed.clone()), 1, 10)
-                .await
-                .unwrap()
-                .total_items,
-            0
-        );
-        fresh.reindex().await.unwrap();
+        let sources = store.list_watched_sources().await.unwrap();
+        assert_eq!(sources.len(), 2);
+    }
 
-        let posts = fresh.list_posts(Some(feed.clone()), 1, 10).await.unwrap();
-        assert_eq!(posts.total_items, 1);
-        assert_eq!(posts.items[0].at_uri, at_uri);
-        let media = fresh.list_media(Some(feed.clone()), 1, 10).await.unwrap();
-        assert_eq!(media.total_items, 1);
-        assert_eq!(fresh.category_media_bytes(&feed).await.unwrap(), 12);
+    #[test]
+    fn source_kind_parses_and_displays() {
+        assert_eq!(
+            "account".parse::<SourceKind>().unwrap(),
+            SourceKind::Account
+        );
+        assert_eq!("feed".parse::<SourceKind>().unwrap(), SourceKind::Feed);
+        assert_eq!(SourceKind::Account.to_string(), "account");
+        assert_eq!(SourceKind::Feed.to_string(), "feed");
+        assert!(matches!(
+            "gallery".parse::<SourceKind>(),
+            Err(StorageError::InvalidSourceKind(_))
+        ));
+    }
+
+    async fn open_v1_database() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("index.sqlite3");
+        let conn = Connection::open(&database_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1');
+            CREATE TABLE posts (
+                category TEXT NOT NULL,
+                at_uri TEXT NOT NULL,
+                cid TEXT NOT NULL,
+                indexed_at TEXT NOT NULL,
+                record_path TEXT NOT NULL,
+                PRIMARY KEY (category, at_uri)
+            );
+            CREATE TABLE media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                post_at_uri TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                content_type TEXT,
+                size_bytes INTEGER NOT NULL,
+                indexed_at TEXT NOT NULL,
+                UNIQUE(category, post_at_uri, filename)
+            );
+            ",
+        )
+        .unwrap();
+        // A v1 archive row that must survive the upgrade untouched.
+        conn.execute(
+            "INSERT INTO posts (category, at_uri, cid, indexed_at, record_path)
+             VALUES ('posts', 'at://did:plc:v1/app.bsky.feed.post/1', 'cid', '2024-01-01', 'x')",
+            [],
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn opening_a_v1_database_upgrades_to_schema_v2_in_place() {
+        let dir = open_v1_database().await;
+        let store =
+            ArchiveStore::open(dir.path().join("archive"), dir.path().join("index.sqlite3"))
+                .await
+                .expect("open store upgrades v1");
+
+        // The v1 posts row is untouched...
+        let page = store.list_posts(None, 1, 10).await.unwrap();
+        assert_eq!(page.total_items, 1);
+        assert_eq!(page.items[0].at_uri, "at://did:plc:v1/app.bsky.feed.post/1");
+
+        // ...the schema version says 2...
+        let bytes = std::fs::read(dir.path().join("index.sqlite3")).unwrap();
+        drop(bytes);
+        let conn = rusqlite::Connection::open(dir.path().join("index.sqlite3")).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+
+        // ...and the new table is usable immediately (no data had to move).
+        assert!(store.list_watched_sources().await.unwrap().is_empty());
+        store
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:alice"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.list_watched_sources().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

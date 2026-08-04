@@ -8,7 +8,7 @@
 use askama::Template;
 
 use crate::health::{Status, SubsystemHealth};
-use crate::storage::{Category, MediaSummary, PostSummary};
+use crate::storage::{Category, MediaSummary, PostSummary, SourceKind, WatchedSource};
 
 /// The running build's package version, surfaced on `/healthz` and in the
 /// web UI footer so ops can tell which build is deployed.
@@ -81,35 +81,28 @@ pub fn build_pagination(
 // Shared formatting helpers
 // ---------------------------------------------------------------------
 
-pub fn category_label(category: &Category) -> &'static str {
+pub fn category_label(category: Category) -> &'static str {
     match category {
         Category::Post => "Post",
         Category::Like => "Like",
         Category::Bookmark => "Bookmark",
-        Category::Feed(_) => "Feed",
     }
 }
 
-pub fn category_badge_class(category: &Category) -> &'static str {
+pub fn category_badge_class(category: Category) -> &'static str {
     match category {
         Category::Post => "badge-post",
         Category::Like => "badge-like",
         Category::Bookmark => "badge-bookmark",
-        Category::Feed(_) => "badge-feed",
     }
 }
 
 /// The URL this app serves a stored media file's raw bytes at (see
-/// `crate::web`'s `/media/:category/:id/:filename` route). The category is
-/// percent-encoded so a feed category (`feeds/<slug>`, which contains a `/`)
-/// stays inside a single path segment; axum decodes it back before matching.
-pub fn media_url(category: &Category, post_at_uri: &str, filename: &str) -> String {
+/// `crate::web`'s `/media/:category/:id/:filename` route).
+pub fn media_url(category: Category, post_at_uri: &str, filename: &str) -> String {
     format!(
         "/media/{}/{}/{}",
-        percent_encoding::utf8_percent_encode(
-            &category.as_dir(),
-            percent_encoding::NON_ALPHANUMERIC
-        ),
+        category,
         crate::web::encode_post_id(post_at_uri),
         percent_encoding::utf8_percent_encode(filename, percent_encoding::NON_ALPHANUMERIC)
     )
@@ -168,20 +161,20 @@ pub fn bluesky_post_url(at_uri: &str) -> Option<String> {
 // ---------------------------------------------------------------------
 
 pub struct SubsystemRow {
-    pub name: String,
+    pub name: &'static str,
     pub status_class: &'static str,
     pub status_text: &'static str,
     pub detail: Option<String>,
 }
 
-pub fn subsystem_row(name: impl Into<String>, health: &SubsystemHealth) -> SubsystemRow {
+pub fn subsystem_row(name: &'static str, health: &SubsystemHealth) -> SubsystemRow {
     let (status_class, status_text) = match health.status {
         Status::Connected => ("status-connected", "Connected"),
         Status::Degraded => ("status-degraded", "Degraded"),
         Status::Error => ("status-error", "Error"),
     };
     SubsystemRow {
-        name: name.into(),
+        name,
         status_class,
         status_text,
         detail: health.detail.clone(),
@@ -225,8 +218,8 @@ pub struct PostRow {
 /// index deliberately doesn't store full record bodies).
 pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
     PostRow {
-        category_label: category_label(&summary.category),
-        category_badge_class: category_badge_class(&summary.category),
+        category_label: category_label(summary.category),
+        category_badge_class: category_badge_class(summary.category),
         author: author_did_from_at_uri(&summary.at_uri).to_string(),
         excerpt: text
             .map(|t| excerpt(t, MAX_EXCERPT_CHARS))
@@ -238,18 +231,18 @@ pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
             .thumbnail_filename
             .as_deref()
             .map(|filename| MediaThumb {
-                url: media_url(&summary.category, &summary.at_uri, filename),
+                url: media_url(summary.category, &summary.at_uri, filename),
                 is_video: is_video_content_type(summary.thumbnail_content_type.as_deref()),
                 alt: format!(
                     "Media attached to this {}",
-                    category_label(&summary.category)
+                    category_label(summary.category)
                 ),
             }),
     }
 }
 
 pub struct CategoryOption {
-    pub label: String,
+    pub label: &'static str,
     pub href: String,
     pub selected: bool,
 }
@@ -302,7 +295,7 @@ pub struct GalleryItem {
 }
 
 pub fn gallery_item(summary: &MediaSummary) -> GalleryItem {
-    let url = media_url(&summary.category, &summary.post_at_uri, &summary.filename);
+    let url = media_url(summary.category, &summary.post_at_uri, &summary.filename);
     GalleryItem {
         thumb_url: url.clone(),
         full_url: url,
@@ -313,7 +306,7 @@ pub fn gallery_item(summary: &MediaSummary) -> GalleryItem {
         ),
         alt: format!(
             "{} media from {}",
-            category_label(&summary.category),
+            category_label(summary.category),
             author_did_from_at_uri(&summary.post_at_uri)
         ),
     }
@@ -382,22 +375,67 @@ pub struct ConfigRow {
     pub redacted: bool,
 }
 
-/// One configured custom feed, as shown on `/config`: its resolved URI,
-/// display name, per-feed cap, and current bytes used.
-pub struct ConfigFeedRow {
-    pub name: String,
-    pub input: String,
-    pub uri: String,
-    pub cap: String,
-    pub used: String,
-}
-
 #[derive(Template)]
 #[template(path = "config.html")]
 pub struct ConfigTemplate {
     pub version: &'static str,
     pub rows: Vec<ConfigRow>,
-    pub feeds: Vec<ConfigFeedRow>,
+    pub sources: Vec<SourceRow>,
+    /// Inline error for the watched-sources panel (always `None` when the
+    /// page is first rendered; add/remove failures surface via htmx).
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// Sources (watch list)
+// ---------------------------------------------------------------------
+
+/// One row of the UI's watch-list table: a watched account or feed with a
+/// remove action. Mirrors [`crate::storage::WatchedSource`] plus
+/// presentation-only fields.
+pub struct SourceRow {
+    pub id: i64,
+    pub kind_label: &'static str,
+    pub kind_class: &'static str,
+    /// For accounts the handle or DID as entered; for feeds the `at://` URI.
+    pub value: String,
+    /// Resolved DID for account rows (the firehose subscribes by it); always
+    /// `None` for feeds, which aren't DID-scoped.
+    pub detail: Option<String>,
+    /// When the source was first added, RFC3339.
+    pub added_at: String,
+}
+
+/// Builds a [`SourceRow`] from a storage-layer [`WatchedSource`].
+pub fn source_row(source: &WatchedSource) -> SourceRow {
+    let (kind_label, kind_class) = match source.kind {
+        SourceKind::Account => ("Account", "badge-account"),
+        SourceKind::Feed => ("Feed", "badge-feed"),
+    };
+    SourceRow {
+        id: source.id,
+        kind_label,
+        kind_class,
+        value: source.value.clone(),
+        detail: source.did.clone(),
+        added_at: source.added_at.clone(),
+    }
+}
+
+/// The watcher panel fragment: the current sources with remove buttons, the
+/// add form, and an inline error slot. The `/sources` add and `/sources/:id`
+/// remove handlers both return this as an `outerHTML` swap of
+/// `#sources-panel`, so every change re-renders the panel from the database
+/// (with any failure shown in `#sources-error`) — the same markup the config
+/// page includes wholesale.
+#[derive(Template)]
+#[template(path = "sources_panel.html")]
+pub struct SourcesPanelTemplate {
+    pub sources: Vec<SourceRow>,
+    /// An inline error to show in the panel's `#sources-error` slot, e.g. an
+    /// unresolvable handle or an invalid feed URI. `None` renders the empty
+    /// slot.
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

@@ -1,0 +1,42 @@
+<section id="sources-panel">
+<div class="sources-header">
+<h2>Watched sources</h2>
+<p>What the archiver watches: accounts (handle or DID) and feeds (at:// URI). Changes apply immediately, no restart needed.</p>
+</div>
+<div id="sources-error" role="alert">{% if let Some(error) = error %}<p class="error-message">{{ error }}</p>{% endif %}</div>
+
+{% if sources.is_empty() %}
+<p class="source-empty">No watched sources yet. On a fresh install the authenticated account is added automatically.</p>
+{% else %}
+<table class="config-table">
+<thead><tr><th>Kind</th><th>Target</th><th>Added</th><th></th></tr></thead>
+<tbody>
+{% for source in sources %}
+<tr>
+<td data-label="Kind"><span class="badge {{ source.kind_class }}">{{ source.kind_label }}</span></td>
+<td data-label="Target"><code>{{ source.value }}</code>{% if let Some(detail) = source.detail %}<br><span class="item-meta">{{ detail }}</span>{% endif %}</td>
+<td data-label="Added">{{ source.added_at }}</td>
+<td data-label="Remove">
+<form method="post" action="/sources/{{ source.id }}" hx-post="/sources/{{ source.id }}" hx-target="#sources-panel" hx-swap="outerHTML">
+<button type="submit" class="secondary outline">Remove</button>
+</form>
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+<form method="post" action="/sources" class="source-add-form" hx-post="/sources" hx-target="#sources-panel" hx-swap="outerHTML">
+<label for="source-kind">Kind
+<select id="source-kind" name="kind">
+<option value="account">Account</option>
+<option value="feed">Feed</option>
+</select>
+</label>
+<label for="source-value">Target
+<input id="source-value" type="text" name="value" required placeholder="alice.bsky.social or at://did:.../app.bsky.feed.generator/..." autocomplete="off">
+</label>
+<button type="submit">Add source</button>
+</form>
+</section>

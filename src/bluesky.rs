@@ -130,19 +130,6 @@ pub struct AuthorFeedPage {
     pub cursor: Option<String>,
 }
 
-/// The subset of `app.bsky.feed.getFeedGenerator`'s response we use: the
-/// generator view's human-readable display name, for UI labelling only.
-#[derive(Debug, Clone, Deserialize)]
-pub struct FeedGeneratorView {
-    #[serde(rename = "displayName")]
-    pub display_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GetFeedGeneratorResponse {
-    view: FeedGeneratorView,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct CreateSessionResponse {
     #[serde(rename = "accessJwt")]
@@ -318,11 +305,11 @@ impl BlueskyClient {
             .await
     }
 
-    /// Fetches one page of a custom feed (`app.bsky.feed.getFeed`),
-    /// newest-first, optionally continuing from a previous page's `cursor`.
-    /// `feed` is the generator's `at://` URI. Returns the same hydrated
-    /// `feedViewPost` shape as `getAuthorFeed`, so the shared media-detection
-    /// and extraction paths apply unchanged.
+    /// Fetches one page of an algorithm/custom feed
+    /// (`app.bsky.feed.getFeed`), newest-first, optionally continuing from a
+    /// previous page's `cursor`. `feed` is the `at://` URI of the feed's
+    /// generator. The response shape is the same `feed`/`cursor` page the
+    /// other feed endpoints return.
     pub async fn get_feed(
         &self,
         feed: &str,
@@ -335,20 +322,6 @@ impl BlueskyClient {
         }
         self.get_authenticated("app.bsky.feed.getFeed", &query)
             .await
-    }
-
-    /// Fetches a feed generator's human-readable display name via
-    /// `app.bsky.feed.getFeedGenerator`. `None` if the generator returns no
-    /// display name. Used once at startup for UI labelling; a failure here is
-    /// non-fatal to the caller.
-    pub async fn get_feed_generator(&self, feed: &str) -> Result<Option<String>, BlueskyError> {
-        let response: GetFeedGeneratorResponse = self
-            .get_authenticated(
-                "app.bsky.feed.getFeedGenerator",
-                &[("feed", feed.to_string())],
-            )
-            .await?;
-        Ok(response.view.display_name)
     }
 
     /// Fetches one page of the watched account's likes, newest-first.
@@ -771,6 +744,79 @@ mod tests {
             .await
             .expect_err("should surface api error");
         assert_eq!(err.retry_after(), Some(Duration::from_secs(5)));
+    }
+
+    #[tokio::test]
+    async fn get_feed_authenticates_and_parses_a_page() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .and(query_param(
+                "feed",
+                "at://did:plc:alice/app.bsky.feed.generator/whats-hot",
+            ))
+            .and(header("authorization", "Bearer token-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [{
+                    "post": {
+                        "uri": "at://did:plc:carol/app.bsky.feed.post/1",
+                        "cid": "cid-1",
+                        "author": {"did": "did:plc:carol"},
+                        "record": {"text": "from the firehose-less feed"},
+                    }
+                }],
+                "cursor": "next-feed-cursor",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let page = client
+            .get_feed(
+                "at://did:plc:alice/app.bsky.feed.generator/whats-hot",
+                None,
+                50,
+            )
+            .await
+            .expect("get_feed should succeed");
+
+        assert_eq!(page.feed.len(), 1);
+        assert_eq!(
+            page.feed[0]["post"]["uri"],
+            json!("at://did:plc:carol/app.bsky.feed.post/1")
+        );
+        assert_eq!(page.cursor.as_deref(), Some("next-feed-cursor"));
+    }
+
+    #[tokio::test]
+    async fn get_feed_forwards_cursor_and_rides_the_request_limiter() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .and(query_param("cursor", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [],
+                "cursor": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server).with_request_limiter(std::sync::Arc::new(
+            crate::ratelimit::RequestLimiter::new(4),
+        ));
+        client
+            .get_feed(
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+                Some("page-2"),
+                50,
+            )
+            .await
+            .expect("get_feed with cursor");
     }
 
     #[tokio::test]

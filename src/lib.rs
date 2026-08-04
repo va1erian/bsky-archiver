@@ -47,4 +47,5 @@ pub mod ratelimit;
 pub mod state;
 pub mod storage;
 pub mod templates;
+pub mod watchlist;
 pub mod web;

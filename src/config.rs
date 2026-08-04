@@ -5,8 +5,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 /// Names of every environment variable this application reads, in the order
 /// they appear in the canonical schema. Used by tests to clear/restore
 /// process env state.
@@ -14,8 +12,6 @@ use sha2::{Digest, Sha256};
 const ALL_VARS: &[&str] = &[
     "BSKY_IDENTIFIER",
     "BSKY_APP_PASSWORD",
-    "BSKY_WATCH_HANDLES",
-    "BSKY_WATCH_FEEDS",
     "ARCHIVE_DIR",
     "DATABASE_PATH",
     "UI_PASSWORD",
@@ -25,7 +21,6 @@ const ALL_VARS: &[&str] = &[
     "JETSTREAM_URL",
     "MEDIA_MAX_CONCURRENT_DOWNLOADS",
     "MEDIA_MAX_BYTES",
-    "FEED_MAX_BYTES",
 ];
 
 mod defaults {
@@ -35,84 +30,6 @@ mod defaults {
     pub const JETSTREAM_URL: &str = "wss://jetstream1.us-east.bsky.network/subscribe";
     pub const MEDIA_MAX_CONCURRENT_DOWNLOADS: usize = 4;
     pub const MEDIA_MAX_BYTES: u64 = 104_857_600;
-    /// 2 GiB, applied per configured feed.
-    pub const FEED_MAX_BYTES: u64 = 2_147_483_648;
-}
-
-/// One configured custom feed, as parsed from a `BSKY_WATCH_FEEDS` entry but
-/// *before* its handle segment (if any) has been resolved to a DID. `actor`
-/// is the handle-or-DID taken verbatim from the URL/URI; resolution and
-/// canonical-URI/slug derivation happen at startup ([`crate::app::init`]),
-/// where a handle can be turned into the stable DID the feed is keyed by.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeedConfig {
-    /// The original entry, verbatim, for error messages and the `/config`
-    /// page.
-    pub input: String,
-    /// The feed generator's authority: a handle (to resolve) or a DID.
-    pub actor: String,
-    /// The feed generator record's rkey.
-    pub rkey: String,
-}
-
-/// A configured feed after startup resolution: its stable slug and canonical
-/// `at://` URI (both keyed on the generator's DID + rkey, never its display
-/// name), plus a best-effort human-readable name fetched once via
-/// `getFeedGenerator`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedFeed {
-    pub slug: String,
-    pub at_uri: String,
-    /// The original `BSKY_WATCH_FEEDS` entry this came from.
-    pub input: String,
-    /// The generator's display name, or `None` if `getFeedGenerator` failed
-    /// (non-fatal — the UI falls back to the slug).
-    pub display_name: Option<String>,
-}
-
-impl ResolvedFeed {
-    /// The name to show for this feed in the UI: its display name if known,
-    /// otherwise its slug.
-    pub fn label(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.slug)
-    }
-}
-
-/// The canonical `at://` URI of a feed generator record, given its DID and
-/// rkey.
-pub fn feed_at_uri(did: &str, rkey: &str) -> String {
-    format!("at://{did}/app.bsky.feed.generator/{rkey}")
-}
-
-/// A stable, filesystem- and URL-safe slug for a feed generator, derived
-/// only from its DID + rkey (so it survives a display-name change and a
-/// handle change). A short readable prefix from the rkey aids recognition; a
-/// hash suffix guarantees uniqueness and keeps the result safe by
-/// construction (`[a-z0-9-]` only) even for exotic DIDs/rkeys.
-pub fn feed_slug(did: &str, rkey: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(did.as_bytes());
-    hasher.update(b"/");
-    hasher.update(rkey.as_bytes());
-    let digest = hasher.finalize();
-    let mut hash = String::with_capacity(16);
-    for byte in &digest[..8] {
-        use std::fmt::Write as _;
-        let _ = write!(hash, "{byte:02x}");
-    }
-
-    let readable: String = rkey
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(24)
-        .collect::<String>()
-        .to_ascii_lowercase();
-
-    if readable.is_empty() {
-        format!("feed-{hash}")
-    } else {
-        format!("{readable}-{hash}")
-    }
 }
 
 /// A secret string value (app password, UI password, session signing key).
@@ -171,8 +88,6 @@ impl std::error::Error for ConfigError {}
 pub struct AppConfig {
     pub bsky_identifier: String,
     pub bsky_app_password: Secret,
-    pub bsky_watch_handles: Vec<String>,
-    pub watch_feeds: Vec<FeedConfig>,
     pub archive_dir: PathBuf,
     pub database_path: PathBuf,
     pub ui_password: Secret,
@@ -182,7 +97,6 @@ pub struct AppConfig {
     pub jetstream_url: url::Url,
     pub media_max_concurrent_downloads: usize,
     pub media_max_bytes: u64,
-    pub feed_max_bytes: u64,
 }
 
 impl AppConfig {
@@ -208,16 +122,6 @@ impl AppConfig {
         let bsky_app_password = Secret::from(require_var("BSKY_APP_PASSWORD")?);
         let ui_password = Secret::from(require_var("UI_PASSWORD")?);
         let ui_session_secret = Secret::from(require_var("UI_SESSION_SECRET")?);
-
-        let bsky_watch_handles = match optional_var("BSKY_WATCH_HANDLES") {
-            Some(raw) => parse_handles(&raw)?,
-            None => vec![bsky_identifier.clone()],
-        };
-
-        let watch_feeds = match optional_var("BSKY_WATCH_FEEDS") {
-            Some(raw) => parse_feeds(&raw)?,
-            None => Vec::new(),
-        };
 
         let archive_dir = optional_var("ARCHIVE_DIR")
             .map(PathBuf::from)
@@ -254,16 +158,9 @@ impl AppConfig {
             None => defaults::MEDIA_MAX_BYTES,
         };
 
-        let feed_max_bytes = match optional_var("FEED_MAX_BYTES") {
-            Some(raw) => parse_positive_u64("FEED_MAX_BYTES", &raw)?,
-            None => defaults::FEED_MAX_BYTES,
-        };
-
         Ok(AppConfig {
             bsky_identifier,
             bsky_app_password,
-            bsky_watch_handles,
-            watch_feeds,
             archive_dir,
             database_path,
             ui_password,
@@ -273,7 +170,6 @@ impl AppConfig {
             jetstream_url,
             media_max_concurrent_downloads,
             media_max_bytes,
-            feed_max_bytes,
         })
     }
 }
@@ -286,92 +182,6 @@ fn optional_var(name: &str) -> Option<String> {
 
 fn require_var(name: &'static str) -> Result<String, ConfigError> {
     optional_var(name).ok_or(ConfigError::MissingVar(name))
-}
-
-fn parse_handles(raw: &str) -> Result<Vec<String>, ConfigError> {
-    let handles: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if handles.is_empty() {
-        return Err(ConfigError::InvalidValue {
-            var: "BSKY_WATCH_HANDLES",
-            message: "must contain at least one comma-separated handle".to_string(),
-        });
-    }
-    Ok(handles)
-}
-
-/// Parses `BSKY_WATCH_FEEDS`: a comma-separated list of `bsky.app` feed URLs
-/// and/or `at://…/app.bsky.feed.generator/<rkey>` URIs. Empty entries are
-/// skipped; an unparseable entry fails with a message naming it. The list may
-/// legitimately be empty (feeds are opt-in), unlike watch handles.
-fn parse_feeds(raw: &str) -> Result<Vec<FeedConfig>, ConfigError> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(parse_feed_entry)
-        .collect()
-}
-
-/// Parses one `BSKY_WATCH_FEEDS` entry into a [`FeedConfig`]. Accepts either a
-/// `bsky.app` feed URL (`https://bsky.app/profile/<handle-or-did>/feed/<rkey>`)
-/// or an `at://<did>/app.bsky.feed.generator/<rkey>` URI.
-fn parse_feed_entry(entry: &str) -> Result<FeedConfig, ConfigError> {
-    let invalid = |message: String| ConfigError::InvalidValue {
-        var: "BSKY_WATCH_FEEDS",
-        message,
-    };
-
-    if let Some(rest) = entry.strip_prefix("at://") {
-        let mut parts = rest.splitn(3, '/');
-        let authority = parts.next().unwrap_or("");
-        let collection = parts.next().unwrap_or("");
-        let rkey = parts.next().unwrap_or("");
-        if authority.is_empty()
-            || collection != "app.bsky.feed.generator"
-            || rkey.is_empty()
-            || rkey.contains('/')
-        {
-            return Err(invalid(format!(
-                "{entry:?} is not a valid feed generator URI \
-                 (expected at://<did>/app.bsky.feed.generator/<rkey>)"
-            )));
-        }
-        return Ok(FeedConfig {
-            input: entry.to_string(),
-            actor: authority.to_string(),
-            rkey: rkey.to_string(),
-        });
-    }
-
-    let url = url::Url::parse(entry)
-        .map_err(|_| invalid(format!("{entry:?} is not a valid feed URL or at:// URI")))?;
-    let host = url.host_str().unwrap_or("");
-    if host != "bsky.app" && !host.ends_with(".bsky.app") {
-        return Err(invalid(format!(
-            "{entry:?} is not a bsky.app feed URL or an at:// generator URI"
-        )));
-    }
-    let segments: Vec<&str> = url
-        .path_segments()
-        .map(|s| s.filter(|seg| !seg.is_empty()).collect())
-        .unwrap_or_default();
-    match segments.as_slice() {
-        ["profile", actor, "feed", rkey] if !actor.is_empty() && !rkey.is_empty() => {
-            Ok(FeedConfig {
-                input: entry.to_string(),
-                actor: actor.to_string(),
-                rkey: rkey.to_string(),
-            })
-        }
-        _ => Err(invalid(format!(
-            "{entry:?} is not a valid bsky.app feed URL \
-             (expected https://bsky.app/profile/<handle>/feed/<rkey>)"
-        ))),
-    }
 }
 
 fn parse_port(raw: &str) -> Result<u16, ConfigError> {
@@ -530,7 +340,6 @@ mod tests {
         let config = AppConfig::from_env().expect("config should load with only required vars");
 
         assert_eq!(config.bsky_identifier, "alice.bsky.social");
-        assert_eq!(config.bsky_watch_handles, vec!["alice.bsky.social"]);
         assert_eq!(config.database_path, dir.join("index.sqlite3"));
         assert_eq!(config.ui_port, defaults::UI_PORT);
         assert_eq!(
@@ -695,24 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn blank_watch_handles_is_invalid() {
-        let dir = temp_dir("blank-watch-handles");
-        let required = required_vars(&dir);
-        let mut overrides: Vec<(&'static str, &str)> =
-            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        overrides.push(("BSKY_WATCH_HANDLES", " , , "));
-        let _guard = EnvGuard::new(&overrides);
-
-        let err = AppConfig::from_env().expect_err("blank handle list should fail");
-        match err {
-            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "BSKY_WATCH_HANDLES"),
-            other => panic!("expected InvalidValue, got {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn archive_dir_not_creatable_produces_specific_error() {
         // Create a plain file, then ask for an ARCHIVE_DIR *inside* that
         // file's path: `create_dir_all` cannot possibly succeed, since a
@@ -733,126 +524,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&blocking_file);
-    }
-
-    #[test]
-    fn custom_watch_handles_are_parsed_and_trimmed() {
-        let dir = temp_dir("custom-watch-handles");
-        let required = required_vars(&dir);
-        let mut overrides: Vec<(&'static str, &str)> =
-            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        overrides.push((
-            "BSKY_WATCH_HANDLES",
-            "alice.bsky.social, bob.bsky.social ,carol.bsky.social",
-        ));
-        let _guard = EnvGuard::new(&overrides);
-
-        let config = AppConfig::from_env().expect("config should load");
-        assert_eq!(
-            config.bsky_watch_handles,
-            vec!["alice.bsky.social", "bob.bsky.social", "carol.bsky.social"]
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn feed_urls_and_at_uris_parse() {
-        let url = parse_feed_entry("https://bsky.app/profile/goose.art/feed/aaaf2pqeodmpy")
-            .expect("bsky.app feed URL");
-        assert_eq!(url.actor, "goose.art");
-        assert_eq!(url.rkey, "aaaf2pqeodmpy");
-
-        let url_did = parse_feed_entry("https://bsky.app/profile/did:plc:abc123/feed/whats-hot")
-            .expect("bsky.app feed URL with a DID actor");
-        assert_eq!(url_did.actor, "did:plc:abc123");
-        assert_eq!(url_did.rkey, "whats-hot");
-
-        let at = parse_feed_entry("at://did:plc:xyz789/app.bsky.feed.generator/cats")
-            .expect("at:// generator URI");
-        assert_eq!(at.actor, "did:plc:xyz789");
-        assert_eq!(at.rkey, "cats");
-    }
-
-    #[test]
-    fn invalid_feed_entries_are_rejected_naming_the_entry() {
-        for bad in [
-            "not a url at all",
-            "https://example.com/profile/goose.art/feed/x", // wrong host
-            "https://bsky.app/profile/goose.art",           // missing feed/rkey
-            "https://bsky.app/profile/goose.art/feed/",     // empty rkey
-            "at://did:plc:xyz/app.bsky.feed.post/x",        // wrong collection
-            "at://did:plc:xyz/app.bsky.feed.generator/",    // empty rkey
-            "at:///app.bsky.feed.generator/x",              // empty authority
-        ] {
-            let err = parse_feed_entry(bad).expect_err(bad);
-            match err {
-                ConfigError::InvalidValue { var, message } => {
-                    assert_eq!(var, "BSKY_WATCH_FEEDS");
-                    assert!(
-                        message.contains(bad),
-                        "message should name the offending entry: {message}"
-                    );
-                }
-                other => panic!("expected InvalidValue, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn feed_slug_is_stable_and_unique_and_safe() {
-        let a = feed_slug("did:plc:abc", "aaaf2pqeodmpy");
-        // Stable across repeated derivation (a display-name change never
-        // touches the inputs, so the slug can't change).
-        assert_eq!(a, feed_slug("did:plc:abc", "aaaf2pqeodmpy"));
-        // A different DID or rkey yields a different slug.
-        assert_ne!(a, feed_slug("did:plc:def", "aaaf2pqeodmpy"));
-        assert_ne!(a, feed_slug("did:plc:abc", "different"));
-        // Safe by construction: only URL/path-safe characters.
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-
-        // An rkey with unsafe characters still produces a safe slug.
-        let weird = feed_slug("did:web:example.com:8443", "../../etc/passwd");
-        assert!(weird.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-        assert!(!weird.contains('/'));
-        assert!(!weird.contains('.'));
-    }
-
-    #[test]
-    fn feed_defaults_and_multiple_entries() {
-        let dir = temp_dir("feeds-config");
-        let required = required_vars(&dir);
-        let mut overrides: Vec<(&'static str, &str)> =
-            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        overrides.push((
-            "BSKY_WATCH_FEEDS",
-            "https://bsky.app/profile/goose.art/feed/aaaf2pqeodmpy, \
-             at://did:plc:xyz/app.bsky.feed.generator/cats",
-        ));
-        let _guard = EnvGuard::new(&overrides);
-
-        let config = AppConfig::from_env().expect("config loads with feeds");
-        assert_eq!(config.watch_feeds.len(), 2);
-        assert_eq!(config.watch_feeds[0].actor, "goose.art");
-        assert_eq!(config.watch_feeds[1].rkey, "cats");
-        // FEED_MAX_BYTES defaults to 2 GiB.
-        assert_eq!(config.feed_max_bytes, 2_147_483_648);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn no_feeds_configured_is_valid_and_empty() {
-        let dir = temp_dir("no-feeds");
-        let required = required_vars(&dir);
-        let overrides: Vec<(&'static str, &str)> =
-            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let _guard = EnvGuard::new(&overrides);
-
-        let config = AppConfig::from_env().expect("config loads without feeds");
-        assert!(config.watch_feeds.is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

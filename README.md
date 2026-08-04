@@ -1,60 +1,64 @@
 # bsky-archiver
 
-A self-hosted daemon + web UI that watches one Bluesky account and archives:
+A self-hosted daemon + web UI that watches a set of Bluesky sources and archives:
 
-1. That account's own posts which contain media (images or video).
-2. That account's likes.
-3. That account's bookmarks.
-4. Any custom feeds (`app.bsky.feed.generator`) listed in `BSKY_WATCH_FEEDS` —
-   each polled periodically and archived as its own browsable category, capped
-   per feed at `FEED_MAX_BYTES` (default 2 GiB).
+1. Watched accounts' posts which contain media (images or video).
+2. The authenticated account's likes.
+3. The authenticated account's bookmarks.
+4. Any watched custom feeds (`app.bsky.feed.generator`) — poll-only, since
+   Jetstream carries raw repo commits and there is no firehose path for an
+   algorithmic feed.
+
+What's watched — the **watch list** of accounts (handle or DID) and feeds — is
+managed from the web UI's `/config` page (the "Watched sources" panel) and
+persisted in the SQLite index. Changes apply immediately, no restart needed: the
+firehose re-filters and the account/feed pollers pick them up live, with an
+immediate backfill kickoff on add. On a fresh install the authenticated account
+is seeded automatically. Removing a source stops archiving it (a feed already
+archived remains browsable and exportable).
 
 For each archived item, the full post record is stored as JSON and any attached
 images/video are downloaded and stored alongside it. A small web UI lets a human
 browse the archive (post list + detail), view a gallery of archived media —
-filterable by category (posts / likes / bookmarks / each configured feed) and
-downloadable as a single zip of every image in the current selection — and see
-the active (non-secret) configuration.
+filterable by category (posts / likes / bookmarks) and downloadable as a single
+zip of every image in the current selection — and see the active (non-secret)
+configuration.
 
-Custom feeds are poll-only by necessity: Jetstream carries raw repo commits, so
-there is no firehose path for an algorithmic feed. A newly configured feed
-backfills newest-first until it hits its cap, then stops (it never evicts);
-removing a feed from `BSKY_WATCH_FEEDS` stops polling it but leaves everything
-already archived under it browsable and exportable.
-
-Real-time capture of the watched account's own posts uses a Jetstream firehose
+Real-time capture of the watched accounts' own posts uses a Jetstream firehose
 subscription; a REST-polling path fully substitutes for it whenever the firehose
 connection is unavailable. Likes and bookmarks aren't available on the firehose at
 all, so they're always fetched via periodic REST polling. The application ships as a
-single Docker image, fully configured by environment variables, and is intended to
-run under Cosmos Cloud (a Docker Compose-style host) or plain `docker compose`.
+single Docker image, configured by environment variables plus the UI-managed watch
+list, and is intended to run under Cosmos Cloud (a Docker Compose-style host) or
+plain `docker compose`.
 
 ## Architecture: module map
 
 | Module | Owns |
 | --- | --- |
 | `config` | Loading, defaulting, and validating every environment variable into one typed `AppConfig`. Startup fails fast (non-zero exit) on anything invalid. |
-| `bluesky` | The `com.atproto.*` / `app.bsky.*` REST (XRPC) client: session auth (with automatic re-login on a 401), `getAuthorFeed`, `getActorLikes`, `getBookmarks`, and handle resolution. |
-| `firehose` | The Jetstream websocket consumer: real-time capture of the watched account's authored posts with media, filtered by DID, with reconnect/backoff and a persisted cursor so a restart resumes roughly where it left off. |
-| `poller` | The REST-polling fallback for authored posts (active whenever the firehose is down) and the periodic likes/bookmarks poller. Both use adaptive intervals with jittered exponential backoff. |
-| `pipeline` | The shared `CandidatePost` channel and the `has_archivable_media` predicate connecting every producer (firehose, REST fallback, likes/bookmarks poller) to the one consumer (the media downloader). |
+| `bluesky` | The `com.atproto.*` / `app.bsky.*` REST (XRPC) client: session auth (with automatic re-login on a 401), `getAuthorFeed`, `getFeed`, `getActorLikes`, `getBookmarks`, and handle resolution. |
+| `firehose` | The Jetstream websocket consumer: real-time capture of the watched accounts' authored posts with media, filtered by DID from the live roster, with reconnect/backoff, a persisted cursor so a restart resumes roughly where it left off, and an immediate reconnect when the watched-account set changes. |
+| `poller` | The REST-polling fallback for authored posts (active whenever the firehose is down), the feed poller (algorithm/custom feeds, which are never on the firehose), and the periodic likes/bookmarks poller. All use adaptive intervals with jittered exponential backoff. |
+| `pipeline` | The shared `CandidatePost` channel and the `has_archivable_media` predicate connecting every producer (firehose, REST fallback, feed poller, likes/bookmarks poller) to the one consumer (the media downloader). |
 | `media` | Concurrency-limited, size-capped media downloading: streams each file, aborts if it exceeds `MEDIA_MAX_BYTES`, retries transient failures, and never leaves a partial file on disk. |
-| `storage` | The on-disk JSON archive (source of truth) plus the SQLite query index built on top of it. The index is fully rebuildable from disk (`reindex`) and is rebuilt automatically on startup if missing. |
+| `storage` | The on-disk JSON archive (source of truth) plus the SQLite query index built on top of it (including the UI-managed `watched_sources` watch list). The index is fully rebuildable from disk (`reindex`) and is rebuilt automatically on startup if missing. |
 | `ratelimit` | The shared backoff/circuit-breaker policy and the process-wide inflight-request cap used by the pollers, the Bluesky client, and the media downloader. |
 | `health` | Per-subsystem health tracking (`Connected` / `Degraded` / `Error`), read by `/healthz` and the dashboard. |
-| `state` | `AppState`, the shared handle (config + storage + health) passed to every request handler and background task. |
-| `web` | The `axum` HTTP server: routing, password-gated session auth, and the pages/JSON surface backing the UI. |
+| `watchlist` | The in-memory `Watchlist` roster: a live `watch`-channel mirror of the `watched_sources` table that every producer reads and that reloads (with a bump) after each UI add/remove. |
+| `state` | `AppState`, the shared handle (config + storage + health + live roster + Bluesky client + a weak handle on the producer channel) passed to every request handler and background task. |
+| `web` | The `axum` HTTP server: routing, password-gated session auth, the pages/JSON surface backing the UI, and the `/sources` add/remove endpoints that manage the live watch list. |
 | `templates` | `askama` templates and their view models (kept separate from `web` so that module stays about *what data* each route needs, not how it's marked up). |
-| `app` | Startup sequencing (open storage, authenticate, resolve watched handles — failing fast on any error) and supervised orchestration of every background task (firehose, REST fallback, likes/bookmarks poller, media downloader, web server) plus graceful shutdown. |
+| `app` | Startup sequencing (open storage, authenticate — failing fast on any error — and load the watch list, seeding it with the authenticated account on a fresh install) and supervised orchestration of every background task (firehose, REST fallback, feed poller, likes/bookmarks poller, media downloader, web server) plus graceful shutdown. |
 
 Every background task in `app::serve` is independently supervised: a panic or
-unexpected exit in the firehose consumer, REST fallback poller, likes/bookmarks
-poller, or media downloader is logged and restarted with exponential backoff, rather
-than taking down the rest of the service. The only failures that stop the process
-outright are genuine startup-validation failures (invalid config, bad Bluesky
-credentials, an unresolvable watched handle, an unwritable database path) — those are
-surfaced immediately, with a non-zero exit, so a misconfigured deployment fails
-visibly instead of running in a broken state.
+unexpected exit in the firehose consumer, REST fallback poller, feed poller,
+likes/bookmarks poller, or media downloader is logged and restarted with exponential
+backoff, rather than taking down the rest of the service. The only failures that stop
+the process outright are genuine startup-validation failures (invalid config, bad
+Bluesky credentials, an unwritable database path) — those are surfaced immediately,
+with a non-zero exit, so a misconfigured deployment fails visibly instead of running
+in a broken state.
 
 ## Local development
 
@@ -91,11 +95,12 @@ cargo test
 `cargo test` runs the full suite: unit tests in every module (using `wiremock` for
 anything that talks to the Bluesky REST API, and an in-process mock websocket server
 for anything that talks to Jetstream — the real Bluesky network is never contacted
-from a test) plus an end-to-end test (`tests/e2e.rs`) that drives a real `AppState`,
+from a test) plus end-to-end tests (`tests/e2e.rs`) that drive a real `AppState`,
 real on-disk storage, and a real `axum` router through the full pipeline: an authored
-post with media, a like, and a bookmark, each archived end to end and then verified
-through the actual web UI routes (list, detail, gallery, raw media bytes, and the
-gallery's zip export at `GET /gallery/export`).
+post with media, a like, a bookmark, and a feed's post, each archived end to end
+(including adding the feed via the `/sources` web route) and then verified through
+the actual web UI routes (list, detail, gallery, raw media bytes, and the gallery's
+zip export at `GET /gallery/export`).
 
 The crate is structured as a library (`src/lib.rs`) with a thin binary shim
 (`src/main.rs`) specifically so `tests/e2e.rs` can exercise real internal types
@@ -130,17 +135,23 @@ Docker Compose-style service definitions).
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `BSKY_WATCH_HANDLES` | `BSKY_IDENTIFIER` alone | Comma-separated list of handles/DIDs to watch for authored posts with media. |
-| `BSKY_WATCH_FEEDS` | *(none)* | Comma-separated list of custom feeds to archive, each browsable and exportable as its own category. Accepts `bsky.app` feed URLs (`https://bsky.app/profile/<handle-or-did>/feed/<rkey>`) and/or `at://<did>/app.bsky.feed.generator/<rkey>` URIs, mixed freely. Each feed is polled on `POLL_INTERVAL_SECONDS` and its media-bearing posts archived newest-first until it fills `FEED_MAX_BYTES`. Startup fails fast on an unparseable entry, an unresolvable handle, or two entries resolving to the same feed. |
-| `FEED_MAX_BYTES` | `2147483648` (2 GiB) | Per-feed hard cap on archived media bytes. Applies **per feed**, not globally. A feed at cap stops archiving (it never evicts) and reports `Degraded`; raising this is the lever to let it resume. |
 | `ARCHIVE_DIR` | `/data/archive` | Root directory for archived JSON records and media. **Must persist across restarts and upgrades** (mount a volume here). |
 | `DATABASE_PATH` | `<ARCHIVE_DIR>/index.sqlite3` | SQLite index file path. Safe to delete — it is rebuilt automatically from `ARCHIVE_DIR` on next startup — but persisting it avoids a slow reindex. |
 | `UI_PORT` | `8080` | Port the web UI listens on inside the container. |
-| `POLL_INTERVAL_SECONDS` | `120` | Baseline interval for likes/bookmarks polling and the REST fallback path (adaptive, with jittered exponential backoff on errors). |
+| `POLL_INTERVAL_SECONDS` | `120` | Baseline interval for likes/bookmarks polling, the REST fallback path, and the feed poller (adaptive, with jittered exponential backoff on errors). |
 | `JETSTREAM_URL` | `wss://jetstream1.us-east.bsky.network/subscribe` | Jetstream websocket endpoint for real-time firehose consumption. Override to point at a self-hosted Jetstream instance. |
 | `MEDIA_MAX_CONCURRENT_DOWNLOADS` | `4` | Cap on simultaneous media downloads. |
 | `MEDIA_MAX_BYTES` | `104857600` (100 MiB) | Per-file download size safety cap. |
 | `RUST_LOG` | `info` | Standard `tracing`/`tracing-subscriber` filter string. |
+
+What the archiver watches is **not** configured via environment variables: the watch
+list is a set of accounts (handle or DID) and feeds (`at://` feed URIs) you manage
+from the web UI's `/config` page (the "Watched sources" panel). It is persisted in
+the SQLite index (the `watched_sources` table, schema v2) and changes take effect
+live — no restart — the firehose and the account/feed pollers pick them up
+immediately, with an immediate backfill kickoff on add. On a fresh install with an
+empty list the authenticated account is seeded automatically, so a default setup
+archives your own posts with zero extra configuration.
 
 Every variable above is the single canonical source of a given setting: none of it is
 duplicated or re-declared elsewhere, and the active (non-secret) values can always be
@@ -163,11 +174,11 @@ image and recreating the container against the same volume.
 ### Health checks
 
 The image defines a `HEALTHCHECK` that polls `GET /healthz` (no auth required) and
-reports unhealthy if any background subsystem (firehose, REST fallback,
-likes/bookmarks poller, media downloader) is in an error state. The process also
-fails fast and exits non-zero on startup if configuration is invalid or Bluesky
-authentication fails, so a misconfigured deployment is immediately visible in
-container logs/exit status rather than hanging.
+reports unhealthy if any background subsystem (firehose, REST fallback, feed
+poller, likes/bookmarks poller, media downloader) is in an error state. The
+process also fails fast and exits non-zero on startup if configuration is invalid
+or Bluesky authentication fails, so a misconfigured deployment is immediately
+visible in container logs/exit status rather than hanging.
 
 ### First deploy, step by step
 

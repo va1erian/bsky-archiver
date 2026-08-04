@@ -21,7 +21,6 @@ services:
       UI_SESSION_SECRET: "change-me-to-a-long-random-string-at-least-32-chars"
 
       # --- optional (defaults shown) ---
-      # BSKY_WATCH_HANDLES: "your-handle.bsky.social"
       ARCHIVE_DIR: "/data/archive"
       DATABASE_PATH: "/data/archive/index.sqlite3"
       UI_PORT: "8080"

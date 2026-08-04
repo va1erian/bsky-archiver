@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, watch};
 /// archived; `Authored` here becomes `Post` there. Whichever later ticket
 /// wires a producer up to [`crate::storage::ArchiveStore`] owns that
 /// mapping.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PostCategory {
     /// A media post authored by the watched account, seen on the firehose
@@ -37,9 +37,6 @@ pub enum PostCategory {
     /// A post the watched account bookmarked, seen via the likes/bookmarks
     /// poller (AR-7).
     Bookmark,
-    /// A post surfaced by a configured custom feed, carrying that feed's
-    /// stable slug so the downloader archives it under `Category::Feed`.
-    Feed(String),
 }
 
 /// A reference to one piece of media (image or video) attached to a
@@ -88,9 +85,26 @@ pub struct CandidatePost {
 /// hold a clone of this and send each [`CandidatePost`] they discover.
 pub type CandidatePostSender = mpsc::Sender<CandidatePost>;
 
+/// A non-owning handle on the producer -> media-downloader channel. Unlike a
+/// strong [`CandidatePostSender`], a `WeakCandidatePostSender` does not keep
+/// the channel open: it can only be upgraded while at least one strong
+/// sender is still alive. [`crate::state::AppState`] holds one so the web
+/// UI's immediate backfill can send candidates without undermining the
+/// graceful-shutdown guarantee that the downloader drains once every
+/// producer has dropped its sender (see
+/// [`AppState::candidates`][crate::state::AppState::candidates]).
+pub type WeakCandidatePostSender = mpsc::WeakSender<CandidatePost>;
+
 /// The receiving half of the producer -> media-downloader channel. AR-8
 /// owns this and drains it to process candidates.
 pub type CandidatePostReceiver = mpsc::Receiver<CandidatePost>;
+
+/// Downgrades a strong sender into a non-owning [`WeakCandidatePostSender`]
+/// without giving the strong sender up (see [`WeakCandidatePostSender`] for
+/// why the state/UI holds the weak end rather than a strong one).
+pub fn weak_from_sender(sender: &CandidatePostSender) -> WeakCandidatePostSender {
+    sender.downgrade()
+}
 
 /// Creates the bounded channel producers (AR-5/6/7) send [`CandidatePost`]s
 /// into and the media downloader (AR-8) receives them from. `buffer` is the
