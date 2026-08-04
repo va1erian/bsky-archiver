@@ -66,6 +66,7 @@ pub fn router(app: SharedAppState) -> Router {
         .route("/gallery/export", get(gallery_export))
         .route("/config", get(config_view))
         .route("/media/:category/:id/:filename", get(media_file))
+        .route("/api/search", get(search))
         .route("/logout", axum::routing::post(logout))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
@@ -885,6 +886,37 @@ async fn config_view(State(state): State<WebState>) -> Result<Response, WebError
         rows,
         feeds,
     }))
+}
+
+// ---------------------------------------------------------------------
+// Search API
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+}
+
+async fn search(
+    State(state): State<WebState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Response, WebError> {
+    let query_str = match query.q {
+        Some(q) if !q.trim().is_empty() => q.trim().to_string(),
+        _ => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "Query parameter 'q' is required and must not be empty"
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    let results = state.app.store.search_posts(&query_str).await?;
+
+    Ok(axum::Json(results).into_response())
 }
 
 // ---------------------------------------------------------------------

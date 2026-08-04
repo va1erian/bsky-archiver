@@ -48,7 +48,7 @@ use time::format_description::well_known::Rfc3339;
 ///
 /// No longer `Copy`, because [`Category::Feed`] owns its slug; callers pass
 /// it by value (cloning cheap built-in variants) or by reference.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub enum Category {
     Post,
     Like,
@@ -313,7 +313,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp_path, path)
 }
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -348,6 +348,15 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_media_indexed_at ON media(indexed_at, id);
         CREATE INDEX IF NOT EXISTS idx_media_category_indexed_at
             ON media(category, indexed_at, id);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(
+            at_uri UNINDEXED,
+            category UNINDEXED,
+            post_text,
+            alt_text,
+            filenames,
+            tags
+        );
         ",
     )?;
 
@@ -361,6 +370,9 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         .and_then(|v| v.parse().ok());
 
     if current_version != Some(SCHEMA_VERSION) {
+        if current_version == Some(1) {
+            migrate_v1_to_v2(conn)?;
+        }
         conn.execute(
             "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -369,6 +381,91 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     }
 
     Ok(())
+}
+
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(
+        "
+        CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(
+            at_uri UNINDEXED,
+            category UNINDEXED,
+            post_text,
+            alt_text,
+            filenames,
+            tags
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+fn extract_post_text(record: &serde_json::Value) -> String {
+    record
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn extract_alt_text(record: &serde_json::Value) -> String {
+    let mut alt_texts = Vec::new();
+
+    if let Some(embed) = record.get("embed")
+        && let Some(images) = embed.get("images").and_then(|v| v.as_array())
+    {
+        for image in images {
+            if let Some(alt) = image.get("alt").and_then(|v| v.as_str())
+                && !alt.is_empty()
+            {
+                alt_texts.push(alt.to_string());
+            }
+        }
+    }
+
+    alt_texts.join(" ")
+}
+
+fn extract_filenames(record: &serde_json::Value) -> String {
+    let mut filenames = Vec::new();
+
+    if let Some(embed) = record.get("embed") {
+        if let Some(images) = embed.get("images").and_then(|v| v.as_array()) {
+            for image in images {
+                if let Some(filename) = image.get("filename").and_then(|v| v.as_str()) {
+                    filenames.push(filename.to_string());
+                }
+            }
+        }
+        if let Some(video) = embed.get("video")
+            && let Some(filename) = video.get("filename").and_then(|v| v.as_str())
+        {
+            filenames.push(filename.to_string());
+        }
+    }
+
+    filenames.join(" ")
+}
+
+fn extract_tags(record: &serde_json::Value) -> String {
+    let mut tags = Vec::new();
+
+    if let Some(tags_array) = record.get("tags").and_then(|v| v.as_array()) {
+        for tag in tags_array {
+            if let Some(tag_str) = tag.as_str() {
+                tags.push(tag_str.to_string());
+            }
+        }
+    }
+
+    if let Some(text) = record.get("text").and_then(|v| v.as_str()) {
+        for word in text.split_whitespace() {
+            if word.starts_with('#') && word.len() > 1 {
+                tags.push(word[1..].to_string());
+            }
+        }
+    }
+
+    tags.join(" ")
 }
 
 /// Owns the on-disk archive under `archive_dir` and the SQLite query
@@ -430,6 +527,11 @@ impl ArchiveStore {
             }
 
             let indexed_at = now_rfc3339();
+            let post_text = extract_post_text(&record);
+            let alt_text = extract_alt_text(&record);
+            let filenames = extract_filenames(&record);
+            let tags = extract_tags(&record);
+
             let archived = ArchivedRecord {
                 at_uri: at_uri.clone(),
                 cid: cid.clone(),
@@ -450,6 +552,19 @@ impl ArchiveStore {
                     cid,
                     indexed_at,
                     relative_str(&archive_dir, &path)
+                ],
+            )?;
+
+            conn.execute(
+                "INSERT INTO posts_fts (at_uri, category, post_text, alt_text, filenames, tags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    at_uri,
+                    category.as_dir().as_ref(),
+                    post_text,
+                    alt_text,
+                    filenames,
+                    tags
                 ],
             )?;
 
@@ -502,7 +617,7 @@ impl ArchiveStore {
 
             let indexed_at = now_rfc3339();
             let conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute(
+            let inserted = conn.execute(
                 "INSERT OR IGNORE INTO media
                     (post_at_uri, category, filename, content_type, size_bytes, indexed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -515,6 +630,24 @@ impl ArchiveStore {
                     indexed_at
                 ],
             )?;
+
+            if inserted > 0 {
+                let mut stmt = conn.prepare(
+                    "SELECT filename FROM media WHERE post_at_uri = ?1 AND category = ?2 ORDER BY id"
+                )?;
+                let filenames: String = stmt
+                    .query_map(params![at_uri, category.as_dir().as_ref()], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                conn.execute(
+                    "UPDATE posts_fts SET filenames = ?1 WHERE at_uri = ?2 AND category = ?3",
+                    params![filenames, at_uri, category.as_dir().as_ref()],
+                )?;
+            }
 
             Ok(())
         })
@@ -863,6 +996,7 @@ impl ArchiveStore {
                             category.clone(),
                             archived.cid.clone(),
                             archived.indexed_at.clone(),
+                            archived.record.clone(),
                             relative_str(&archive_dir, &record_file),
                         ));
                     }
@@ -873,7 +1007,8 @@ impl ArchiveStore {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM media", [])?;
             tx.execute("DELETE FROM posts", [])?;
-            for (at_uri, category, cid, indexed_at, record_path) in found_posts {
+            tx.execute("DELETE FROM posts_fts", [])?;
+            for (at_uri, category, cid, indexed_at, record, record_path) in found_posts {
                 tx.execute(
                     "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -883,6 +1018,24 @@ impl ArchiveStore {
                         cid,
                         indexed_at,
                         record_path
+                    ],
+                )?;
+
+                let post_text = extract_post_text(&record);
+                let alt_text = extract_alt_text(&record);
+                let filenames = extract_filenames(&record);
+                let tags = extract_tags(&record);
+
+                tx.execute(
+                    "INSERT INTO posts_fts (at_uri, category, post_text, alt_text, filenames, tags)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        at_uri,
+                        category.as_dir().as_ref(),
+                        post_text,
+                        alt_text,
+                        filenames,
+                        tags
                     ],
                 )?;
             }
@@ -954,6 +1107,136 @@ impl ArchiveStore {
         .await;
         join_result(result)
     }
+
+    pub async fn search_posts(&self, query: &str) -> Result<Vec<SearchResult>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let query = query.to_string();
+
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<SearchResult>, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+
+                let fts_query = format!("{}*", query);
+
+                let mut stmt = conn.prepare(
+                    "SELECT 
+                    f.at_uri,
+                    f.category,
+                    p.indexed_at,
+                    snippet(posts_fts, 2, '<mark>', '</mark>', '...', 32) as post_snippet,
+                    snippet(posts_fts, 3, '<mark>', '</mark>', '...', 32) as alt_snippet,
+                    snippet(posts_fts, 4, '<mark>', '</mark>', '...', 32) as filename_snippet,
+                    snippet(posts_fts, 5, '<mark>', '</mark>', '...', 32) as tag_snippet
+                FROM posts_fts f
+                JOIN posts p ON f.at_uri = p.at_uri AND f.category = p.category
+                WHERE posts_fts MATCH ?1
+                ORDER BY rank
+                LIMIT 100",
+                )?;
+
+                let rows = stmt.query_map(params![fts_query], |row| {
+                    Ok(SearchResult {
+                        at_uri: row.get(0)?,
+                        category: row.get::<_, String>(1)?.parse().unwrap_or(Category::Post),
+                        indexed_at: row.get(2)?,
+                        post_snippet: row.get(3)?,
+                        alt_snippet: row.get(4)?,
+                        filename_snippet: row.get(5)?,
+                        tag_snippet: row.get(6)?,
+                    })
+                })?;
+
+                let mut results = Vec::new();
+                for row in rows {
+                    results.push(row?);
+                }
+
+                Ok(results)
+            })
+            .await;
+
+        join_result(result)
+    }
+
+    pub async fn backfill_fts_index(&self) -> Result<(), StorageError> {
+        let db = Arc::clone(&self.db);
+
+        let result = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+
+            let fts_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM posts_fts",
+                [],
+                |row| row.get(0),
+            )?;
+
+            if fts_count > 0 {
+                return Ok(());
+            }
+
+            let posts_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM posts",
+                [],
+                |row| row.get(0),
+            )?;
+
+            if posts_count == 0 {
+                return Ok(());
+            }
+
+            tracing::info!("backfilling FTS index for {} posts", posts_count);
+
+            let rows: Vec<(String, String, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT p.at_uri, p.category, p.record_path FROM posts p"
+                )?;
+
+                stmt.query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?.collect::<Result<Vec<_>, _>>()?
+            };
+
+            let tx = conn.transaction()?;
+            for (at_uri, category_str, record_path) in rows {
+                let record_file = std::path::Path::new(&record_path);
+                if !record_file.exists() {
+                    continue;
+                }
+
+                let bytes = std::fs::read(record_file)?;
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    let post_text = extract_post_text(&record);
+                    let alt_text = extract_alt_text(&record);
+                    let filenames = extract_filenames(&record);
+                    let tags = extract_tags(&record);
+
+                    tx.execute(
+                        "INSERT INTO posts_fts (at_uri, category, post_text, alt_text, filenames, tags)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![at_uri, category_str, post_text, alt_text, filenames, tags],
+                    )?;
+                }
+            }
+            tx.commit()?;
+
+            tracing::info!("FTS backfill complete");
+            Ok(())
+        })
+        .await;
+
+        join_result(result)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResult {
+    pub at_uri: String,
+    pub category: Category,
+    pub indexed_at: String,
+    pub post_snippet: String,
+    pub alt_snippet: String,
+    pub filename_snippet: String,
+    pub tag_snippet: String,
 }
 
 /// Every category directory present under `archive_dir`: the three built-ins
@@ -1606,5 +1889,278 @@ mod tests {
         assert!(names.contains(&"001.png"));
         assert!(!names.contains(&"002.mp4"));
         assert!(!names.contains(&"003.bin"));
+    }
+
+    #[test]
+    fn extract_post_text_extracts_text_field() {
+        let record = json!({
+            "text": "Hello world",
+            "createdAt": "2024-01-01T00:00:00Z"
+        });
+        assert_eq!(extract_post_text(&record), "Hello world");
+    }
+
+    #[test]
+    fn extract_post_text_handles_missing_text() {
+        let record = json!({
+            "createdAt": "2024-01-01T00:00:00Z"
+        });
+        assert_eq!(extract_post_text(&record), "");
+    }
+
+    #[test]
+    fn extract_alt_text_extracts_image_alt() {
+        let record = json!({
+            "text": "Post with images",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [
+                    {
+                        "alt": "A cute cat",
+                        "image": {"$type": "blob", "ref": {"$link": "bafy..."}, "mimeType": "image/jpeg"}
+                    },
+                    {
+                        "alt": "A dog playing",
+                        "image": {"$type": "blob", "ref": {"$link": "bafy..."}, "mimeType": "image/jpeg"}
+                    }
+                ]
+            }
+        });
+        assert_eq!(extract_alt_text(&record), "A cute cat A dog playing");
+    }
+
+    #[test]
+    fn extract_alt_text_handles_empty_alt() {
+        let record = json!({
+            "embed": {
+                "images": [
+                    {"alt": "", "image": {}}
+                ]
+            }
+        });
+        assert_eq!(extract_alt_text(&record), "");
+    }
+
+    #[test]
+    fn extract_filenames_extracts_image_filenames() {
+        let record = json!({
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [
+                    {"filename": "cat.jpg", "image": {}},
+                    {"filename": "dog.png", "image": {}}
+                ]
+            }
+        });
+        assert_eq!(extract_filenames(&record), "cat.jpg dog.png");
+    }
+
+    #[test]
+    fn extract_filenames_extracts_video_filename() {
+        let record = json!({
+            "embed": {
+                "$type": "app.bsky.embed.video",
+                "video": {"filename": "video.mp4"}
+            }
+        });
+        assert_eq!(extract_filenames(&record), "video.mp4");
+    }
+
+    #[test]
+    fn extract_tags_extracts_hashtags() {
+        let record = json!({
+            "text": "Check out #rust and #programming",
+            "tags": ["opensource", "coding"]
+        });
+        let tags = extract_tags(&record);
+        assert!(tags.contains("rust"));
+        assert!(tags.contains("programming"));
+        assert!(tags.contains("opensource"));
+        assert!(tags.contains("coding"));
+    }
+
+    #[test]
+    fn extract_tags_handles_no_tags() {
+        let record = json!({
+            "text": "No hashtags here"
+        });
+        assert_eq!(extract_tags(&record), "");
+    }
+
+    #[tokio::test]
+    async fn search_finds_posts_by_text() {
+        let (_dir, store) = open_store().await;
+
+        store
+            .save_post(
+                Category::Post,
+                "at://did:plc:alice/app.bsky.feed.post/1",
+                "cid-1",
+                json!({"text": "Hello world from Rust"}),
+            )
+            .await
+            .unwrap();
+
+        store
+            .save_post(
+                Category::Post,
+                "at://did:plc:alice/app.bsky.feed.post/2",
+                "cid-2",
+                json!({"text": "Python is great too"}),
+            )
+            .await
+            .unwrap();
+
+        let results = store.search_posts("Rust").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].at_uri, "at://did:plc:alice/app.bsky.feed.post/1");
+    }
+
+    #[tokio::test]
+    async fn search_finds_posts_by_alt_text() {
+        let (_dir, store) = open_store().await;
+
+        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
+        store
+            .save_post(
+                Category::Post,
+                at_uri,
+                "cid-1",
+                json!({
+                    "text": "Post with image",
+                    "embed": {
+                        "$type": "app.bsky.embed.images",
+                        "images": [
+                            {
+                                "alt": "A beautiful sunset over the ocean",
+                                "image": {"$type": "blob", "ref": {"$link": "bafy..."}, "mimeType": "image/jpeg"}
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        store
+            .save_media(
+                Category::Post,
+                at_uri,
+                "000.jpg",
+                Some("image/jpeg".to_string()),
+                vec![0u8; 100],
+            )
+            .await
+            .unwrap();
+
+        let results = store.search_posts("sunset").await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_is_case_insensitive() {
+        let (_dir, store) = open_store().await;
+
+        store
+            .save_post(
+                Category::Post,
+                "at://did:plc:alice/app.bsky.feed.post/1",
+                "cid-1",
+                json!({"text": "Hello WORLD"}),
+            )
+            .await
+            .unwrap();
+
+        let results = store.search_posts("world").await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results = store.search_posts("WORLD").await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_for_no_matches() {
+        let (_dir, store) = open_store().await;
+
+        store
+            .save_post(
+                Category::Post,
+                "at://did:plc:alice/app.bsky.feed.post/1",
+                "cid-1",
+                json!({"text": "Hello world"}),
+            )
+            .await
+            .unwrap();
+
+        let results = store.search_posts("nonexistent").await.unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn backfill_populates_fts_index() {
+        let (_dir, store) = open_store().await;
+
+        store
+            .save_post(
+                Category::Post,
+                "at://did:plc:alice/app.bsky.feed.post/1",
+                "cid-1",
+                json!({"text": "First post"}),
+            )
+            .await
+            .unwrap();
+
+        store
+            .save_post(
+                Category::Post,
+                "at://did:plc:alice/app.bsky.feed.post/2",
+                "cid-2",
+                json!({"text": "Second post"}),
+            )
+            .await
+            .unwrap();
+
+        let db = Arc::clone(&store.db);
+        let fts_count: i64 = tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.query_row("SELECT COUNT(*) FROM posts_fts", [], |row| row.get(0))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(fts_count, 2);
+    }
+
+    #[tokio::test]
+    async fn search_includes_category_in_results() {
+        let (_dir, store) = open_store().await;
+
+        store
+            .save_post(
+                Category::Post,
+                "at://did:plc:alice/app.bsky.feed.post/1",
+                "cid-1",
+                json!({"text": "Original post"}),
+            )
+            .await
+            .unwrap();
+
+        store
+            .save_post(
+                Category::Like,
+                "at://did:plc:bob/app.bsky.feed.post/2",
+                "cid-2",
+                json!({"text": "Liked post"}),
+            )
+            .await
+            .unwrap();
+
+        let results = store.search_posts("post").await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        let categories: Vec<_> = results.iter().map(|r| &r.category).collect();
+        assert!(categories.contains(&&Category::Post));
+        assert!(categories.contains(&&Category::Like));
     }
 }
