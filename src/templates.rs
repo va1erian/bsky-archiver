@@ -422,11 +422,12 @@ pub fn source_row(source: &WatchedSource) -> SourceRow {
     }
 }
 
-/// The watcher panel fragment: the current sources with remove buttons and
-/// the add form. The `/sources` add and `/sources/:id` remove handlers both
-/// return this as an `outerHTML` swap of `#sources-panel`, so every change
-/// re-renders the panel from the database — the same markup the config page
-/// includes wholesale.
+/// The watcher panel fragment: the current sources with remove buttons, the
+/// add form, and an inline error slot. The `/sources` add and `/sources/:id`
+/// remove handlers both return this as an `outerHTML` swap of
+/// `#sources-panel`, so every change re-renders the panel from the database
+/// (with any failure shown in `#sources-error`) — the same markup the config
+/// page includes wholesale.
 #[derive(Template)]
 #[template(path = "sources_panel.html")]
 pub struct SourcesPanelTemplate {
@@ -435,15 +436,6 @@ pub struct SourcesPanelTemplate {
     /// unresolvable handle or an invalid feed URI. `None` renders the empty
     /// slot.
     pub error: Option<String>,
-}
-
-/// The inline error fragment shown for a failed add/remove:
-/// `HX-Retarget`+`HX-Reswap` route it into the panel's `#sources-error` slot
-/// so the forms stay put and the page isn't navigated.
-#[derive(Template)]
-#[template(path = "sources_error.html")]
-pub struct SourcesErrorTemplate {
-    pub message: String,
 }
 
 #[cfg(test)]

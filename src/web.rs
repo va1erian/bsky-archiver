@@ -1729,6 +1729,16 @@ mod tests {
         assert!(body.matches("&lt;redacted&gt;").count() >= 3);
         assert!(body.contains("alice.bsky.social"));
         assert!(body.contains("class=\"redacted\""));
+        // The watched-sources panel is part of /config so htmx has a
+        // `#sources-panel` target to swap add/remove responses into.
+        assert!(
+            body.contains("id=\"sources-panel\""),
+            "watched-sources panel must render on /config"
+        );
+        assert!(
+            !body.contains("BSKY_WATCH_HANDLES"),
+            "BSKY_WATCH_HANDLES must be gone from the config page"
+        );
         assert!(
             body.contains(&format!("Version {}", env!("CARGO_PKG_VERSION"))),
             "version footer missing"

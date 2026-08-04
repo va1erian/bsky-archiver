@@ -1,10 +1,9 @@
-{% if let Some(error) = error %}<p class="error-message" role="alert">{{ error }}</p>{% endif %}
-
 <section id="sources-panel">
 <div class="sources-header">
 <h2>Watched sources</h2>
 <p>What the archiver watches: accounts (handle or DID) and feeds (at:// URI). Changes apply immediately, no restart needed.</p>
 </div>
+<div id="sources-error" role="alert">{% if let Some(error) = error %}<p class="error-message">{{ error }}</p>{% endif %}</div>
 
 {% if sources.is_empty() %}
 <p class="source-empty">No watched sources yet. On a fresh install the authenticated account is added automatically.</p>
