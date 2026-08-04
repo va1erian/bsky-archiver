@@ -2,7 +2,7 @@
 {% block title %}Gallery – bsky-archiver{% endblock %}
 {% block content %}
 <h1>Gallery</h1>
-<nav aria-label="Category filter">
+<nav class="category-filter" aria-label="Category filter">
 {% for opt in category_options %}
 {% if opt.selected %}
 <span class="current">{{ opt.label }}</span>

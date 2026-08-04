@@ -221,3 +221,174 @@ nav form {
 .error-message {
   color: #dc2626;
 }
+
+/* The raw record JSON on the post-detail page is long-lined; give it its own
+   horizontal scroll container so only the block scrolls, never the whole page
+   on a phone. */
+.json-scroll {
+  overflow-x: auto;
+}
+
+/* ---------------------------------------------------------------------------
+   Responsive layout.
+
+   Everything above is width-agnostic and everything below is additive: the
+   tablet/desktop rendering (>= 768px) is preserved exactly as it was, while the
+   phone layout (< 768px) collapses the header nav, reflows the two data tables
+   into stacked key-value blocks, and grows touch targets. 768px is Pico's own
+   tablet breakpoint, so the two stylesheets change over at the same width. No
+   colours, typography, or the badge/status vocabulary are touched, so Pico's
+   prefers-color-scheme dark/light handling is left entirely intact.
+   --------------------------------------------------------------------------- */
+
+/* Tablet and up: the collapsible menu renders as the plain horizontal nav row
+   it always was, with the links always shown regardless of the <details>
+   open/closed state. Browsers gate a closed <details>'s content two different
+   ways, so both are neutralised here: older engines hide it via the element's
+   own box (removed with display:contents, which also hoists the <ul> back to a
+   direct flex child of <nav>, matching the pre-disclosure layout), while
+   current engines hide it behind the ::details-content pseudo (revealed with
+   content-visibility). */
+@media (min-width: 768px) {
+  .nav-menu {
+    display: contents;
+  }
+
+  .nav-menu > summary {
+    display: none;
+  }
+
+  .nav-menu::details-content {
+    content-visibility: visible;
+  }
+}
+
+@media (max-width: 767.98px) {
+  /* --- Mobile nav: the four links + Logout collapse behind a <details>
+     disclosure (no JS, inherits Pico's summary styling); the brand stays on the
+     row above. Letting the nav wrap drops the full-width toggle below the
+     brand. --- */
+  .main-nav {
+    flex-wrap: wrap;
+  }
+
+  .nav-menu {
+    width: 100%;
+  }
+
+  .nav-menu > summary {
+    display: block;
+    min-height: 44px;
+    padding: 0.5rem 0;
+    cursor: pointer;
+  }
+
+  .nav-menu > ul {
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+    padding: 0;
+  }
+
+  .nav-menu > ul > li {
+    width: 100%;
+  }
+
+  /* Logout stays full-width and tappable in the collapsed panel; the earlier
+     `nav form { margin: 0 }` rule still applies to it here. */
+  .nav-menu form,
+  .nav-menu form button {
+    width: 100%;
+  }
+
+  /* --- Table reflow: both data tables become stacked key-value blocks. The
+     <thead> is hidden and each <td> is labelled from its data-label via
+     ::before, so no horizontal table scroll on a phone. --- */
+  .config-table thead,
+  .health-table thead {
+    display: none;
+  }
+
+  .config-table tr,
+  .health-table tr {
+    display: block;
+    margin-bottom: 0.75rem;
+    padding: 0.25rem 0.75rem;
+    border: 1px solid var(--pico-muted-border-color, #ccc);
+    border-radius: var(--pico-border-radius, 0.25rem);
+  }
+
+  .config-table td,
+  .health-table td {
+    display: block;
+    padding: 0.35rem 0;
+    border: none;
+  }
+
+  .config-table td::before,
+  .health-table td::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--pico-muted-color);
+  }
+
+  /* The monospace nowrap on the config keys is what forces the document wide
+     today; once the cells are stacked it has to give way or the page scrolls. */
+  .config-table td:first-child {
+    white-space: normal;
+  }
+
+  /* Detail holds free-text error strings of unbounded length; wrap them like
+     .excerpt rather than letting them widen the page. */
+  .health-table td[data-label="Detail"] {
+    overflow-wrap: anywhere;
+  }
+
+  /* --- Touch targets: pagination, the category filters, and the lightbox close
+     button all reach the ~44px minimum with visible separation. --- */
+  .pagination {
+    gap: 0.6rem;
+  }
+
+  .pagination a,
+  .pagination span.current {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0.6rem 0.9rem;
+  }
+
+  .category-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .category-filter a,
+  .category-filter span.current {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0.5rem 0.9rem;
+    border: 1px solid var(--pico-muted-border-color, #ccc);
+    border-radius: var(--pico-border-radius, 0.25rem);
+    text-decoration: none;
+  }
+
+  .category-filter span.current {
+    background: var(--pico-primary, #2563eb);
+    color: var(--pico-contrast-inverse, #fff);
+    border-color: transparent;
+  }
+
+  .close-lightbox {
+    width: 44px;
+    height: 44px;
+  }
+}
