@@ -396,3 +396,55 @@ nav form {
     height: 44px;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Accent color palette. The default (blue) is Pico's own and needs no override.
+   Each [data-accent] block remaps the three Pico primary variables so links,
+   buttons, pagination, and category-filter highlights follow the user's choice.
+   Category badges keep their own semantic colours — they don't use --pico-primary.
+   --------------------------------------------------------------------------- */
+
+[data-accent="purple"] {
+  --pico-primary: #7c3aed;
+  --pico-primary-hover: #6d28d9;
+  --pico-primary-background: #7c3aed;
+}
+
+[data-accent="green"] {
+  --pico-primary: #059669;
+  --pico-primary-hover: #047857;
+  --pico-primary-background: #059669;
+}
+
+[data-accent="orange"] {
+  --pico-primary: #ea580c;
+  --pico-primary-hover: #c2410c;
+  --pico-primary-background: #ea580c;
+}
+
+[data-accent="pink"] {
+  --pico-primary: #db2777;
+  --pico-primary-hover: #be185d;
+  --pico-primary-background: #db2777;
+}
+
+.accent-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.accent-picker label {
+  margin: 0;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.accent-picker select {
+  margin: 0;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+  min-height: 0;
+  width: auto;
+}
