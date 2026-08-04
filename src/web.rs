@@ -754,21 +754,41 @@ async fn media_file(
     Path((category, id, filename)): Path<(String, String, String)>,
 ) -> Result<Response, WebError> {
     let category: Category = category.parse().map_err(|_| WebError::NotFound)?;
-    let bytes = state
+    let file = state
         .app
         .store
-        .read_media(category, &id, &filename)
+        .open_media(category, &id, &filename)
         .await?
         .ok_or(WebError::NotFound)?;
+
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| WebError::Storage(e.into()))?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let etag = format!("\"{}-{}\"", mtime.unwrap_or(0), metadata.len());
 
     let mime = mime_guess::from_path(&filename).first_or_octet_stream();
     let content_type = header::HeaderValue::from_str(mime.as_ref())
         .unwrap_or_else(|_| header::HeaderValue::from_static("application/octet-stream"));
 
-    let mut response = bytes.into_response();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, content_type);
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, content_type);
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    if let Ok(etag_value) = header::HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, etag_value);
+    }
     Ok(response)
 }
 
@@ -1569,8 +1589,69 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/jpeg"
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        assert!(response.headers().get(header::ETAG).is_some());
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), [0xFFu8; 8]);
+    }
+
+    #[tokio::test]
+    async fn media_route_etag_is_consistent_across_requests() {
+        let (_dir, state) = test_state().await;
+        let (image_post, _) = seed_fixture_media(&state.store).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let url = format!(
+            "/media/{}/{}/img1.jpg",
+            StorageCategory::Post,
+            encode_post_id(&image_post)
+        );
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::get(&url)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = first
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let second = app
+            .oneshot(
+                Request::get(&url)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .headers()
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag
+        );
     }
 
     #[tokio::test]
