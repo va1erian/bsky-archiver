@@ -409,6 +409,7 @@ async fn post_detail(
                 bluesky_url: templates::bluesky_post_url(&at_uri),
                 text,
                 indexed_at: record.indexed_at.clone(),
+                deleted_at: record.deleted_at.clone(),
                 media,
                 raw_json,
             };

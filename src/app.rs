@@ -218,6 +218,7 @@ pub async fn serve(started: Started) {
         conn_health_tx,
         health_tx.clone(),
         shutdown_rx.clone(),
+        state.store.clone(),
     );
 
     let rest_fallback_handle = spawn_rest_fallback(
@@ -290,6 +291,7 @@ pub async fn serve(started: Started) {
     tracing::info!("shutdown complete");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_firehose(
     jetstream_url: Url,
     roster_rx: watch::Receiver<Vec<crate::storage::WatchedSource>>,
@@ -298,6 +300,7 @@ fn spawn_firehose(
     conn_health_tx: ConnectionHealthSender,
     health_tx: HealthSender,
     shutdown_rx: watch::Receiver<bool>,
+    store: ArchiveStore,
 ) -> tokio::task::JoinHandle<()> {
     // `FirehoseConsumer::run` needs its own clone of the shutdown receiver
     // on every (re)attempt; `supervise` below takes ownership of
@@ -316,6 +319,7 @@ fn spawn_firehose(
                 candidate_tx.clone(),
                 conn_health_tx.clone(),
                 roster_rx.clone(),
+                store.clone(),
             );
             let shutdown_rx = consumer_shutdown_rx.clone();
             async move { consumer.run(shutdown_rx).await }

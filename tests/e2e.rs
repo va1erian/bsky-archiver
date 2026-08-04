@@ -356,6 +356,7 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
         firehose_candidate_tx,
         firehose_health_tx,
         seen_roster(),
+        store.clone(),
     );
     let (firehose_shutdown_tx, firehose_shutdown_rx) = tokio::sync::watch::channel(false);
     let firehose_handle = tokio::spawn(async move {

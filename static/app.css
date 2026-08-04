@@ -34,6 +34,15 @@
   background: #0891b2;
 }
 
+.badge-deleted {
+  background: #dc2626;
+}
+
+.deleted-meta {
+  color: #dc2626;
+  font-weight: 500;
+}
+
 .sources-header {
   margin-top: 1rem;
 }

@@ -172,6 +172,8 @@ pub struct ArchivedRecord {
     #[serde(default)]
     pub media: Vec<MediaMeta>,
     pub record: serde_json::Value,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
 }
 
 /// Metadata about one media file attached to an archived record.
@@ -193,6 +195,7 @@ pub struct PostSummary {
     pub media_count: u32,
     pub thumbnail_filename: Option<String>,
     pub thumbnail_content_type: Option<String>,
+    pub deleted_at: Option<String>,
 }
 
 /// A row for the gallery view: one media file plus a pointer back to its
@@ -395,6 +398,12 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         .optional()?
         .and_then(|v| v.parse().ok());
 
+    let previous_version = current_version.unwrap_or(0);
+
+    if previous_version < 2 {
+        migrate_v1_to_v2(conn)?;
+    }
+
     if current_version != Some(SCHEMA_VERSION) {
         conn.execute(
             "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
@@ -403,6 +412,23 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    Ok(())
+}
+
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
+    let has_column: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('posts') WHERE name = 'deleted_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?;
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE posts ADD COLUMN deleted_at TEXT;
+             CREATE INDEX IF NOT EXISTS idx_posts_deleted_at ON posts(deleted_at);",
+        )?;
+    }
     Ok(())
 }
 
@@ -471,6 +497,7 @@ impl ArchiveStore {
                 indexed_at: indexed_at.clone(),
                 media: Vec::new(),
                 record,
+                deleted_at: None,
             };
             let bytes = serde_json::to_vec_pretty(&archived)?;
             atomic_write(&path, &bytes)?;
@@ -668,13 +695,15 @@ impl ArchiveStore {
     }
 
     /// Fetches a single archived record by category + `at_uri`, reading
-    /// straight from disk.
+    /// straight from disk. Enriches the result with `deleted_at` from the
+    /// index, since that status is index-only metadata.
     pub async fn get_post(
         &self,
         category: Category,
         at_uri: &str,
     ) -> Result<Option<ArchivedRecord>, StorageError> {
         let archive_dir = self.archive_dir.clone();
+        let db = Arc::clone(&self.db);
         let at_uri = at_uri.to_string();
         let result = tokio::task::spawn_blocking(move || -> Result<_, StorageError> {
             let path = record_path(&archive_dir, category, &at_uri);
@@ -682,7 +711,19 @@ impl ArchiveStore {
                 return Ok(None);
             }
             let bytes = std::fs::read(&path)?;
-            let record: ArchivedRecord = serde_json::from_slice(&bytes)?;
+            let mut record: ArchivedRecord = serde_json::from_slice(&bytes)?;
+
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let deleted_at: Option<String> = conn
+                .query_row(
+                    "SELECT deleted_at FROM posts WHERE category = ?1 AND at_uri = ?2",
+                    params![category.as_dir().as_ref(), &at_uri],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            record.deleted_at = deleted_at;
+
             Ok(Some(record))
         })
         .await;
@@ -719,7 +760,8 @@ impl ArchiveStore {
                         (SELECT m.filename FROM media m WHERE m.post_at_uri = p.at_uri
                             ORDER BY m.id ASC LIMIT 1),
                         (SELECT m.content_type FROM media m WHERE m.post_at_uri = p.at_uri
-                            ORDER BY m.id ASC LIMIT 1)
+                            ORDER BY m.id ASC LIMIT 1),
+                        p.deleted_at
                  FROM posts p
                  WHERE ?1 IS NULL OR p.category = ?1
                  ORDER BY p.indexed_at DESC, p.at_uri DESC
@@ -736,6 +778,7 @@ impl ArchiveStore {
                             media_count: row.get::<_, i64>(4)? as u32,
                             thumbnail_filename: row.get(5)?,
                             thumbnail_content_type: row.get(6)?,
+                            deleted_at: row.get(7)?,
                         })
                     })?;
                 let items = rows.collect::<Result<Vec<_>, _>>()?;
@@ -992,14 +1035,38 @@ impl ArchiveStore {
             }
 
             let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Preserve deleted_at status before rebuilding the index.
+            let mut deleted_uris = std::collections::HashSet::new();
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT at_uri FROM posts WHERE deleted_at IS NOT NULL")
+            {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                for uri in rows.flatten() {
+                    deleted_uris.insert(uri);
+                }
+            }
+
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM media", [])?;
             tx.execute("DELETE FROM posts", [])?;
             for (at_uri, category, cid, indexed_at, record_path) in found_posts {
+                let deleted_at = if deleted_uris.contains(&at_uri) {
+                    Some(indexed_at.clone())
+                } else {
+                    None
+                };
                 tx.execute(
-                    "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![at_uri, category.as_dir(), cid, indexed_at, record_path],
+                    "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path, deleted_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        at_uri,
+                        category.as_dir().as_ref(),
+                        cid,
+                        indexed_at,
+                        record_path,
+                        deleted_at
+                    ],
                 )?;
             }
             for (post_at_uri, category, filename, content_type, size_bytes, indexed_at) in
@@ -1027,6 +1094,101 @@ impl ArchiveStore {
 
         join_result(result)
     }
+
+    /// Total bytes of media archived under `category`, from
+    /// `SUM(media.size_bytes)` in the index. This is the quantity the
+    /// per-feed size cap is enforced against (JSON records are not counted).
+    pub async fn category_media_bytes(&self, category: &Category) -> Result<u64, StorageError> {
+        let db = Arc::clone(&self.db);
+        let category = category.as_dir().to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<u64, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let total: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM media WHERE category = ?1",
+                params![category],
+                |row| row.get(0),
+            )?;
+            Ok(total.max(0) as u64)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Every category `at_uri` is archived under, according to the index
+    /// (an `at_uri` can appear under several — e.g. liked *and* surfaced by a
+    /// feed). Used by post detail to locate an item without knowing its
+    /// category up front, including feed categories no longer in config.
+    pub async fn find_categories(&self, at_uri: &str) -> Result<Vec<Category>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let at_uri = at_uri.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<Category>, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt =
+                conn.prepare("SELECT category FROM posts WHERE at_uri = ?1 ORDER BY category")?;
+            let rows = stmt.query_map(params![at_uri], |row| row.get::<_, String>(0))?;
+            let mut categories = Vec::new();
+            for row in rows {
+                if let Ok(category) = row?.parse::<Category>() {
+                    categories.push(category);
+                }
+            }
+            Ok(categories)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Marks a post as deleted in the index. Idempotent: if already marked,
+    /// the earlier timestamp is preserved. Only affects the index; the
+    /// on-disk record.json remains untouched.
+    pub async fn mark_post_deleted(&self, at_uri: &str) -> Result<(), StorageError> {
+        let db = Arc::clone(&self.db);
+        let at_uri = at_uri.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let deleted_at = now_rfc3339();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "UPDATE posts SET deleted_at = ?1
+                 WHERE at_uri = ?2 AND deleted_at IS NULL",
+                params![deleted_at, at_uri],
+            )?;
+            Ok(())
+        })
+        .await;
+        join_result(result)
+    }
+}
+
+/// Every category directory present under `archive_dir`: the three built-ins
+/// (whether or not they exist yet) plus one [`Category::Feed`] per
+/// subdirectory of `feeds/`, so [`ArchiveStore::reindex`] rebuilds feed
+/// categories discovered from disk rather than from a hardcoded list.
+fn discover_categories(archive_dir: &Path) -> Result<Vec<Category>, StorageError> {
+    let mut categories = vec![Category::Post, Category::Like, Category::Bookmark];
+
+    let feeds_dir = archive_dir.join("feeds");
+    if feeds_dir.is_dir() {
+        for entry in std::fs::read_dir(&feeds_dir)? {
+            let entry = entry?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(slug) = name.to_str() else {
+                continue;
+            };
+            if is_safe_feed_slug(slug) {
+                categories.push(Category::Feed(slug.to_string()));
+            } else {
+                tracing::warn!(
+                    slug,
+                    "skipping feed directory with an unsafe slug during reindex"
+                );
+            }
+        }
+    }
+
+    Ok(categories)
 }
 
 fn relative_str(base: &Path, path: &Path) -> String {
@@ -1749,5 +1911,67 @@ mod tests {
         assert!(names.contains(&"001.png"));
         assert!(!names.contains(&"002.mp4"));
         assert!(!names.contains(&"003.bin"));
+    }
+
+    #[tokio::test]
+    async fn mark_post_deleted_is_idempotent() {
+        let (_dir, store) = open_store().await;
+        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
+
+        store
+            .save_post(Category::Post, at_uri, "cid-1", json!({"text": "test"}))
+            .await
+            .unwrap();
+
+        let first_deleted_at = "2024-01-01T00:00:00Z";
+        {
+            let db = Arc::clone(&store.db);
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE posts SET deleted_at = ?1 WHERE at_uri = ?2",
+                params![first_deleted_at, at_uri],
+            )
+            .unwrap();
+        }
+
+        store.mark_post_deleted(at_uri).await.unwrap();
+
+        let record = store
+            .get_post(Category::Post, at_uri)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.deleted_at.as_deref(),
+            Some(first_deleted_at),
+            "mark_post_deleted should not overwrite earlier timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_posts_includes_deleted_at() {
+        let (_dir, store) = open_store().await;
+        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
+
+        store
+            .save_post(Category::Post, at_uri, "cid-1", json!({"text": "test"}))
+            .await
+            .unwrap();
+
+        let page = store.list_posts(None, 1, 10).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(
+            page.items[0].deleted_at.is_none(),
+            "newly archived post should not be deleted"
+        );
+
+        store.mark_post_deleted(at_uri).await.unwrap();
+
+        let page = store.list_posts(None, 1, 10).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(
+            page.items[0].deleted_at.is_some(),
+            "deleted post should have deleted_at set"
+        );
     }
 }

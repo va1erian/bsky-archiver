@@ -34,7 +34,7 @@ use crate::pipeline::{
     CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthSender, MediaRef,
     PostCategory, has_archivable_media,
 };
-use crate::storage::{SourceKind, WatchedSource};
+use crate::storage::{ArchiveStore, SourceKind, WatchedSource};
 
 /// Errors that can end one connection attempt/session. Every variant is
 /// recoverable by reconnecting; there is no fatal variant because a
@@ -189,6 +189,7 @@ pub struct FirehoseConsumer {
     cursor_store: CursorStore,
     candidate_tx: CandidatePostSender,
     health_tx: ConnectionHealthSender,
+    store: ArchiveStore,
     backoff: BackoffConfig,
 }
 
@@ -201,6 +202,7 @@ impl FirehoseConsumer {
         candidate_tx: CandidatePostSender,
         health_tx: ConnectionHealthSender,
         roster_rx: watch::Receiver<Vec<WatchedSource>>,
+        store: ArchiveStore,
     ) -> Self {
         FirehoseConsumer {
             jetstream_url,
@@ -210,6 +212,7 @@ impl FirehoseConsumer {
             cursor_store: CursorStore::new(cursor_path),
             candidate_tx,
             health_tx,
+            store,
             backoff: BackoffConfig::default(),
         }
     }
@@ -384,6 +387,22 @@ impl FirehoseConsumer {
         let Some(commit) = event.commit else {
             return;
         };
+
+        // Handle delete operations for app.bsky.feed.post
+        if commit.operation == "delete" && commit.collection == WANTED_COLLECTION {
+            let at_uri = format!("at://{}/{}/{}", event.did, commit.collection, commit.rkey);
+            if let Err(err) = self.store.mark_post_deleted(&at_uri).await {
+                tracing::warn!(error = %err, at_uri = %at_uri, "failed to mark post as deleted");
+            } else {
+                tracing::info!(at_uri = %at_uri, "marked post as deleted");
+            }
+
+            if let Err(err) = self.cursor_store.save(event.time_us) {
+                tracing::warn!(error = %err, "failed to persist jetstream cursor");
+            }
+            return;
+        }
+
         if commit.operation != "create" || commit.collection != WANTED_COLLECTION {
             return;
         }
@@ -511,6 +530,15 @@ mod tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
+
+    async fn test_store() -> ArchiveStore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive_dir = dir.path().join("archive");
+        let database_path = dir.path().join("index.sqlite3");
+        ArchiveStore::open(archive_dir, database_path)
+            .await
+            .expect("open store")
+    }
 
     fn image_post(did: &str) -> Value {
         json!({
@@ -701,6 +729,7 @@ mod tests {
         let (candidate_tx, mut candidate_rx) = candidate_post_channel(8);
         let (health_tx, _health_rx) = connection_health_channel(ConnectionHealth::Disabled);
         let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
+        let store = test_store().await;
 
         let mut consumer = FirehoseConsumer::new(
             url,
@@ -708,6 +737,7 @@ mod tests {
             candidate_tx,
             health_tx,
             account_roster(&[did]),
+            store,
         )
         .with_backoff(test_backoff());
 
@@ -739,6 +769,7 @@ mod tests {
         let (candidate_tx, mut candidate_rx) = candidate_post_channel(8);
         let (health_tx, _health_rx) = connection_health_channel(ConnectionHealth::Disabled);
         let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
+        let store = test_store().await;
 
         let mut consumer = FirehoseConsumer::new(
             url,
@@ -746,6 +777,7 @@ mod tests {
             candidate_tx,
             health_tx,
             account_roster(&[did]),
+            store,
         )
         .with_backoff(test_backoff());
 
@@ -781,6 +813,7 @@ mod tests {
         let (candidate_tx, mut candidate_rx) = candidate_post_channel(8);
         let (health_tx, _health_rx) = connection_health_channel(ConnectionHealth::Disabled);
         let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
+        let store = test_store().await;
 
         let mut consumer = FirehoseConsumer::new(
             url,
@@ -788,6 +821,7 @@ mod tests {
             candidate_tx,
             health_tx,
             account_roster(&[did]),
+            store,
         )
         .with_backoff(test_backoff());
 
@@ -825,6 +859,7 @@ mod tests {
         let (candidate_tx, mut candidate_rx) = candidate_post_channel(8);
         let (health_tx, mut health_rx) = connection_health_channel(ConnectionHealth::Disabled);
         let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
+        let store = test_store().await;
 
         let mut consumer = FirehoseConsumer::new(
             url,
@@ -832,6 +867,7 @@ mod tests {
             candidate_tx,
             health_tx,
             account_roster(&[did]),
+            store,
         )
         .with_backoff(test_backoff());
 
@@ -962,8 +998,9 @@ mod tests {
         let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
 
         let (roster_tx, roster_rx) = watch::channel(vec![watched_source(1, did)]);
+        let store = test_store().await;
         let mut consumer =
-            FirehoseConsumer::new(url, cursor_path.clone(), candidate_tx, health_tx, roster_rx)
+            FirehoseConsumer::new(url, cursor_path.clone(), candidate_tx, health_tx, roster_rx, store)
                 .with_backoff(test_backoff());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1015,6 +1052,73 @@ mod tests {
         store.save(1_700_000_000_000_000).unwrap();
         assert_eq!(store.load(), Some(1_700_000_000_000_000));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn delete_operation_marks_post_as_deleted() {
+        let did = "did:plc:alice";
+        let delete_event = json!({
+            "did": did,
+            "time_us": 1_700_000_000_000_000i64,
+            "kind": "commit",
+            "commit": {
+                "rev": "rev1",
+                "operation": "delete",
+                "collection": "app.bsky.feed.post",
+                "rkey": "abc123"
+            }
+        });
+
+        let (_server, _seen) = spawn_mock_server(vec![vec![delete_event]]).await;
+        let addr = _server.addr;
+
+        let url = Url::parse(&format!("ws://{addr}/subscribe")).unwrap();
+        let (candidate_tx, _candidate_rx) = candidate_post_channel(8);
+        let (health_tx, _health_rx) = connection_health_channel(ConnectionHealth::Disabled);
+        let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
+        let store = test_store().await;
+
+        let at_uri = format!("at://{}/app.bsky.feed.post/abc123", did);
+        store
+            .save_post(
+                crate::storage::Category::Post,
+                &at_uri,
+                "cid-1",
+                json!({"text": "test"}),
+            )
+            .await
+            .unwrap();
+
+        let mut consumer = FirehoseConsumer::new(
+            url,
+            cursor_path.clone(),
+            candidate_tx,
+            health_tx,
+            account_roster(&[did]),
+            store.clone(),
+        )
+        .with_backoff(test_backoff());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            consumer.run(shutdown_rx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let record = store
+            .get_post(crate::storage::Category::Post, &at_uri)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            record.deleted_at.is_some(),
+            "post should be marked as deleted"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = std::fs::remove_file(&cursor_path);
     }
 
     #[test]

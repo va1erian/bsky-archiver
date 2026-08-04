@@ -211,6 +211,7 @@ pub struct PostRow {
     pub indexed_at: String,
     pub media_count: u32,
     pub thumbnail: Option<MediaThumb>,
+    pub deleted_at: Option<String>,
 }
 
 /// Builds a [`PostRow`] from an index-layer [`PostSummary`] plus the
@@ -238,6 +239,7 @@ pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
                     category_label(summary.category)
                 ),
             }),
+        deleted_at: summary.deleted_at.clone(),
     }
 }
 
@@ -278,6 +280,7 @@ pub struct PostDetailTemplate {
     pub bluesky_url: Option<String>,
     pub text: Option<String>,
     pub indexed_at: String,
+    pub deleted_at: Option<String>,
     pub media: Vec<PostMedia>,
     pub raw_json: String,
 }
