@@ -112,6 +112,10 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
         tracing::info!("sqlite index missing; rebuilding it from the on-disk archive");
         store.reindex().await.map_err(StartupError::from)?;
     }
+    store
+        .backfill_fts_index()
+        .await
+        .map_err(StartupError::from)?;
 
     let request_limiter = Arc::new(RequestLimiter::new(GLOBAL_INFLIGHT_REQUEST_CAP));
     let bluesky_client = Arc::new(
