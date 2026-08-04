@@ -5,7 +5,9 @@
 <article>
 <header>
 <span class="badge {{ category_badge_class }}">{{ category_label }}</span>
+{% if let Some(deleted) = deleted_at %}<span class="badge badge-deleted">Deleted</span>{% endif %}
 <p class="item-meta">{{ author }} · {{ indexed_at }}</p>
+{% if let Some(deleted) = deleted_at %}<p class="item-meta deleted-meta">Deleted on {{ deleted }}</p>{% endif %}
 </header>
 
 {% if let Some(text) = text %}

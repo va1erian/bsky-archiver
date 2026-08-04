@@ -10,6 +10,7 @@
 {% endif %}
 {% endif %}
 <span class="badge {{ row.category_badge_class }}">{{ row.category_label }}</span>
+{% if let Some(deleted) = row.deleted_at %}<span class="badge badge-deleted">Deleted</span>{% endif %}
 <p class="excerpt">{{ row.excerpt }}</p>
 <p class="item-meta">{{ row.author }} · {{ row.indexed_at }} · {{ row.media_count }} media</p>
 <a href="{{ row.detail_href }}">View post</a>
