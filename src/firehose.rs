@@ -938,9 +938,16 @@ mod tests {
         let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
 
         let (roster_tx, roster_rx) = watch::channel(vec![watched_source(1, did)]);
-        let mut consumer =
-            FirehoseConsumer::new(url, cursor_path.clone(), candidate_tx, health_tx, roster_rx)
-                .with_backoff(test_backoff());
+        let store = test_store().await;
+        let mut consumer = FirehoseConsumer::new(
+            url,
+            cursor_path.clone(),
+            candidate_tx,
+            health_tx,
+            roster_rx,
+            store,
+        )
+        .with_backoff(test_backoff());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
@@ -999,9 +1006,15 @@ mod tests {
 
         let (roster_tx, roster_rx) = watch::channel(vec![watched_source(1, did)]);
         let store = test_store().await;
-        let mut consumer =
-            FirehoseConsumer::new(url, cursor_path.clone(), candidate_tx, health_tx, roster_rx, store)
-                .with_backoff(test_backoff());
+        let mut consumer = FirehoseConsumer::new(
+            url,
+            cursor_path.clone(),
+            candidate_tx,
+            health_tx,
+            roster_rx,
+            store,
+        )
+        .with_backoff(test_backoff());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {

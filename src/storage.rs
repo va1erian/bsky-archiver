@@ -717,7 +717,7 @@ impl ArchiveStore {
             let deleted_at: Option<String> = conn
                 .query_row(
                     "SELECT deleted_at FROM posts WHERE category = ?1 AND at_uri = ?2",
-                    params![category.as_dir().as_ref(), &at_uri],
+                    params![category.as_dir(), &at_uri],
                     |row| row.get(0),
                 )
                 .optional()?
@@ -1061,7 +1061,7 @@ impl ArchiveStore {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         at_uri,
-                        category.as_dir().as_ref(),
+                        category.as_dir(),
                         cid,
                         indexed_at,
                         record_path,
@@ -1157,38 +1157,6 @@ impl ArchiveStore {
         .await;
         join_result(result)
     }
-}
-
-/// Every category directory present under `archive_dir`: the three built-ins
-/// (whether or not they exist yet) plus one [`Category::Feed`] per
-/// subdirectory of `feeds/`, so [`ArchiveStore::reindex`] rebuilds feed
-/// categories discovered from disk rather than from a hardcoded list.
-fn discover_categories(archive_dir: &Path) -> Result<Vec<Category>, StorageError> {
-    let mut categories = vec![Category::Post, Category::Like, Category::Bookmark];
-
-    let feeds_dir = archive_dir.join("feeds");
-    if feeds_dir.is_dir() {
-        for entry in std::fs::read_dir(&feeds_dir)? {
-            let entry = entry?;
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(slug) = name.to_str() else {
-                continue;
-            };
-            if is_safe_feed_slug(slug) {
-                categories.push(Category::Feed(slug.to_string()));
-            } else {
-                tracing::warn!(
-                    slug,
-                    "skipping feed directory with an unsafe slug during reindex"
-                );
-            }
-        }
-    }
-
-    Ok(categories)
 }
 
 fn relative_str(base: &Path, path: &Path) -> String {
