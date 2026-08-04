@@ -6,8 +6,28 @@
 <title>Log in – bsky-archiver</title>
 <link rel="stylesheet" href="/static/pico.min.css">
 <link rel="stylesheet" href="/static/app.css">
+<script>
+(function(){
+  var a = localStorage.getItem('accent');
+  if (a && a !== 'blue') document.documentElement.dataset.accent = a;
+})();
+</script>
 </head>
 <body>
+<header class="container">
+<nav class="main-nav">
+<div class="accent-picker">
+<label for="accent-select">Accent</label>
+<select id="accent-select">
+<option value="blue">Blue</option>
+<option value="purple">Purple</option>
+<option value="green">Green</option>
+<option value="orange">Orange</option>
+<option value="pink">Pink</option>
+</select>
+</div>
+</nav>
+</header>
 <main class="container login-container">
 <article>
 <hgroup>
@@ -25,5 +45,21 @@
 </form>
 </article>
 </main>
+<script>
+(function(){
+  var select = document.getElementById('accent-select');
+  var stored = localStorage.getItem('accent') || 'blue';
+  select.value = stored;
+  select.addEventListener('change', function(e){
+    var val = e.target.value;
+    localStorage.setItem('accent', val);
+    if (val === 'blue') {
+      delete document.documentElement.dataset.accent;
+    } else {
+      document.documentElement.dataset.accent = val;
+    }
+  });
+})();
+</script>
 </body>
 </html>

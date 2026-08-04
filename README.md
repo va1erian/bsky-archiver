@@ -1,10 +1,21 @@
 # bsky-archiver
 
-A self-hosted daemon + web UI that watches one Bluesky account and archives:
+A self-hosted daemon + web UI that watches a set of Bluesky sources and archives:
 
-1. That account's own posts which contain media (images or video).
-2. That account's likes.
-3. That account's bookmarks.
+1. Watched accounts' posts which contain media (images or video).
+2. The authenticated account's likes.
+3. The authenticated account's bookmarks.
+4. Any watched custom feeds (`app.bsky.feed.generator`) — poll-only, since
+   Jetstream carries raw repo commits and there is no firehose path for an
+   algorithmic feed.
+
+What's watched — the **watch list** of accounts (handle or DID) and feeds — is
+managed from the web UI's `/config` page (the "Watched sources" panel) and
+persisted in the SQLite index. Changes apply immediately, no restart needed: the
+firehose re-filters and the account/feed pollers pick them up live, with an
+immediate backfill kickoff on add. On a fresh install the authenticated account
+is seeded automatically. Removing a source stops archiving it (a feed already
+archived remains browsable and exportable).
 
 For each archived item, the full post record is stored as JSON and any attached
 images/video are downloaded and stored alongside it. A small web UI lets a human
@@ -13,12 +24,13 @@ filterable by category (posts / likes / bookmarks) and downloadable as a single
 zip of every image in the current selection — and see the active (non-secret)
 configuration.
 
-Real-time capture of the watched account's own posts uses a Jetstream firehose
+Real-time capture of the watched accounts' own posts uses a Jetstream firehose
 subscription; a REST-polling path fully substitutes for it whenever the firehose
 connection is unavailable. Likes and bookmarks aren't available on the firehose at
 all, so they're always fetched via periodic REST polling. The application ships as a
-single Docker image, fully configured by environment variables, and is intended to
-run under Cosmos Cloud (a Docker Compose-style host) or plain `docker compose`.
+single Docker image, configured by environment variables plus the UI-managed watch
+list, and is intended to run under Cosmos Cloud (a Docker Compose-style host) or
+plain `docker compose`.
 
 ## Architecture: module map
 
