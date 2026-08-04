@@ -234,6 +234,137 @@ nav form {
 }
 
 /* ---------------------------------------------------------------------------
+   Subtle motion.
+
+   Purely decorative, gated behind prefers-reduced-motion: no-preference so a
+   "reduce motion" preference leaves every page exactly as static as it always
+   was (no JS, no template changes). Only transform and opacity are animated --
+   never layout-affecting properties -- so the big grids never reflow and
+   content already occupies its final position while the animation plays.
+
+   The load-in animation lives on the card nodes themselves, so when htmx swaps
+   the list/grid partials on pagination the freshly-inserted cards replay it.
+   The stagger tops out at three tiers so dense grids settle fast.
+   --------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes card-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .card-grid > .item-card,
+  .gallery-grid > .item-card > .gallery-item {
+    animation: card-in 250ms ease-out backwards;
+  }
+
+  .card-grid > .item-card:nth-child(3n + 2),
+  .gallery-grid > .item-card:nth-child(3n + 2) > .gallery-item {
+    animation-delay: 30ms;
+  }
+
+  .card-grid > .item-card:nth-child(3n + 3),
+  .gallery-grid > .item-card:nth-child(3n + 3) > .gallery-item {
+    animation-delay: 60ms;
+  }
+
+  /* Hover/focus affordance: cards and their thumbs lift a hair with a soft,
+     theme-agnostic glow (Pico's own primary colour/focus, nothing hardcoded). */
+  .item-card,
+  .gallery-item {
+    transition: transform 160ms ease-out, border-color 160ms ease-out,
+      box-shadow 160ms ease-out;
+  }
+
+  .item-card .thumb,
+  .gallery-item img,
+  .gallery-item video {
+    transition: transform 160ms ease-out;
+  }
+
+  .item-card:hover,
+  .item-card:focus-visible,
+  .gallery-item:hover,
+  .gallery-item:focus-visible {
+    border-color: var(--pico-primary, #2563eb);
+    box-shadow: 0 0 0 3px var(--pico-primary-focus, rgba(0, 0, 0, 0.15)),
+      0 4px 12px -2px var(--pico-primary-focus, rgba(0, 0, 0, 0.4));
+    transform: translateY(-2px);
+  }
+
+  .item-card:hover .thumb,
+  .item-card:focus-visible .thumb,
+  .gallery-item:hover img,
+  .gallery-item:hover video,
+  .gallery-item:focus-visible img,
+  .gallery-item:focus-visible video {
+    transform: translateY(-2px);
+  }
+
+  /* Active-state transitions: badges and category filters ease their state
+     changes with the same timing as the card hovers. */
+  .badge,
+  .category-filter a,
+  .category-filter span.current {
+    transition: background-color 160ms ease-out, border-color 160ms ease-out,
+      color 160ms ease-out;
+  }
+
+  /* The single repeating animation: the "connected" status dot breathing
+     quietly reads as listening, unlike an alarm. Degraded/error stay static. */
+  @keyframes status-live {
+    0%,
+    100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.4;
+      transform: scale(0.8);
+    }
+  }
+
+  .status-connected {
+    animation: status-live 2.5s ease-in-out infinite;
+  }
+
+  /* Lightbox: dialog scales/fades in and its backdrop fades in as it opens. */
+  @keyframes lightbox-in {
+    from {
+      opacity: 0;
+      transform: scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes backdrop-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  #lightbox[open] {
+    animation: lightbox-in 200ms ease-out;
+  }
+
+  #lightbox::backdrop {
+    animation: backdrop-in 150ms ease-out;
+  }
+}
+
+/* ---------------------------------------------------------------------------
    Responsive layout.
 
    Everything above is width-agnostic and everything below is additive: the
