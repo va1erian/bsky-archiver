@@ -708,7 +708,10 @@ async fn full_pipeline_archives_a_custom_feed_post_and_renders_in_web_ui() {
             .expect("feed media bytes on disk"),
         b"feed-image-bytes"
     );
-    assert_eq!(store.category_media_bytes(&feed_category).await.unwrap(), 16);
+    assert_eq!(
+        store.category_media_bytes(&feed_category).await.unwrap(),
+        16
+    );
 
     // --- Web UI, driven through a real router with the feed configured.
     let mut config = test_config(archive_dir, database_path);
