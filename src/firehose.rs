@@ -339,17 +339,24 @@ impl FirehoseConsumer {
                     }
                 }
                 changed = self.roster_rx.changed(), if self.roster_alive => {
-                    if changed.is_err() || self.roster_rx.borrow_and_update().is_err() {
-                        // The roster watchlist is gone; stop watching for
-                        // further changes rather than spinning on a closed
-                        // channel.
-                        self.roster_alive = false;
-                        continue;
-                    }
-                    if self.dids_changed() {
-                        tracing::info!("watched accounts changed; reconnecting with the new wantedDids");
-                        let _ = ws_stream.close(None).await;
-                        return Ok(());
+                    match changed {
+                        Err(_) => {
+                            // The roster watchlist is gone; stop watching for
+                            // further changes rather than spinning on a closed
+                            // channel.
+                            self.roster_alive = false;
+                            continue;
+                        }
+                        Ok(()) => {
+                            // Mark the change as seen so `changed()` only
+                            // fires for genuinely new reloads.
+                            let _ = self.roster_rx.borrow_and_update();
+                            if self.dids_changed() {
+                                tracing::info!("watched accounts changed; reconnecting with the new wantedDids");
+                                let _ = ws_stream.close(None).await;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }

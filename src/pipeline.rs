@@ -91,31 +91,19 @@ pub type CandidatePostSender = mpsc::Sender<CandidatePost>;
 /// sender is still alive. [`crate::state::AppState`] holds one so the web
 /// UI's immediate backfill can send candidates without undermining the
 /// graceful-shutdown guarantee that the downloader drains once every
-/// producer has dropped its sender.
+/// producer has dropped its sender (see
+/// [`AppState::candidates`][crate::state::AppState::candidates]).
 pub type WeakCandidatePostSender = mpsc::WeakSender<CandidatePost>;
 
 /// The receiving half of the producer -> media-downloader channel. AR-8
 /// owns this and drains it to process candidates.
 pub type CandidatePostReceiver = mpsc::Receiver<CandidatePost>;
 
-/// A non-owning handle on the producer -> downloader channel.
-///
-/// Held by [`crate::state::AppState`] so the web UI's immediate-backfill
-/// tasks can hand candidates to the media downloader via
-/// [`AppState::candidates`][crate::state::AppState::candidates] without
-/// keeping the channel open forever: a strong sender cloned into `AppState`
-/// would prevent the channel from ever closing once every producer has
-/// stopped, breaking the graceful-shutdown drain. Upgrading to a strong
-/// sender succeeds only while some producer still holds one, which is always
-/// the case during normal operation and never the case while shutting down.
-pub type WeakCandidatePostSender = mpsc::WeakSender<CandidatePost>;
-
-impl CandidatePostSender {
-    /// Downgrades this sender into a non-owning handle. See
-    /// [`WeakCandidatePostSender`].
-    pub fn downgrade(&self) -> WeakCandidatePostSender {
-        mpsc::Sender::downgrade(self)
-    }
+/// Downgrades a strong sender into a non-owning [`WeakCandidatePostSender`]
+/// without giving the strong sender up (see [`WeakCandidatePostSender`] for
+/// why the state/UI holds the weak end rather than a strong one).
+pub fn weak_from_sender(sender: &CandidatePostSender) -> WeakCandidatePostSender {
+    sender.downgrade()
 }
 
 /// Creates the bounded channel producers (AR-5/6/7) send [`CandidatePost`]s

@@ -39,12 +39,13 @@ use crate::health::{self, HealthSender, HealthSnapshot, SubsystemHealth};
 use crate::media::MediaDownloader;
 use crate::pipeline::{
     CandidatePostReceiver, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver,
-    ConnectionHealthSender, candidate_post_channel, connection_health_channel,
+    ConnectionHealthSender, candidate_post_channel, connection_health_channel, weak_from_sender,
 };
-use crate::poller::{LikesBookmarksPoller, PollerConfig, RestFallbackPoller};
+use crate::poller::{FeedPoller, LikesBookmarksPoller, PollerConfig, RestFallbackPoller};
 use crate::ratelimit::RequestLimiter;
 use crate::state::{AppState, SharedAppState};
-use crate::storage::{ArchiveStore, StorageError};
+use crate::storage::{ArchiveStore, SourceKind, StorageError};
+use crate::watchlist::Watchlist;
 
 /// The production Bluesky XRPC entryway. Not part of the canonical env var
 /// schema (there is no `BSKY_BASE_URL`); overridable only for tests, which
@@ -76,7 +77,6 @@ pub struct Started {
     health_tx: HealthSender,
     bluesky_client: Arc<BlueskyClient>,
     self_did: String,
-    watched_dids: Vec<String>,
     candidate_tx: CandidatePostSender,
     candidate_rx: CandidatePostReceiver,
     conn_health_tx: ConnectionHealthSender,
@@ -97,8 +97,9 @@ pub async fn run() -> Result<(), StartupError> {
 
 /// The startup sequence: open storage (self-healing the SQLite index if
 /// it's missing), authenticate to Bluesky (failing fast on bad
-/// credentials), and resolve every watched handle to a DID. Returns
-/// everything [`serve`] needs to spawn the background tasks.
+/// credentials), and load/seed the `watched_sources` watch list into the
+/// in-memory roster. Returns everything [`serve`] needs to spawn the
+/// background tasks.
 pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, StartupError> {
     tracing::info!(config = ?config, "starting up");
 
@@ -126,15 +127,12 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
         .map_err(StartupError::from)?;
     tracing::info!(did = %self_did, "authenticated with bluesky");
 
-    let mut watched_dids = Vec::with_capacity(config.bsky_watch_handles.len());
-    for handle in &config.bsky_watch_handles {
-        let did =
-            resolve_watched_handle(&bluesky_client, &config.bsky_identifier, &self_did, handle)
-                .await
-                .map_err(StartupError::from)?;
-        watched_dids.push(did);
-    }
-    tracing::info!(watched_dids = ?watched_dids, "resolved watched handles");
+    seed_empty_watchlist(&config, &store, &self_did).await?;
+    let watchlist = Watchlist::new(store.list_watched_sources().await?);
+    tracing::info!(
+        sources = ?watchlist.snapshot(),
+        "loaded watch list"
+    );
 
     let (health_tx, health_rx) = health::health_channel();
     let (conn_health_tx, conn_health_rx) = connection_health_channel(ConnectionHealth::Disabled);
@@ -144,6 +142,9 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
         config,
         store,
         health: health_rx,
+        watchlist: watchlist.clone(),
+        bluesky: Arc::clone(&bluesky_client),
+        candidate_weak: weak_from_sender(&candidate_tx),
     });
 
     Ok(Started {
@@ -151,7 +152,6 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
         health_tx,
         bluesky_client,
         self_did,
-        watched_dids,
         candidate_tx,
         candidate_rx,
         conn_health_tx,
@@ -160,22 +160,27 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
     })
 }
 
-/// Resolves one watched handle to a DID: reuses `self_did` when the handle
-/// is the identity we just authenticated as, passes an already-DID value
-/// straight through, and otherwise resolves it via the Bluesky API.
-async fn resolve_watched_handle(
-    client: &BlueskyClient,
-    identifier: &str,
+/// Guarantees a fresh install (an empty `watched_sources` table) watches the
+/// authenticated account by default, preserving the pre-v2 behavior where
+/// `BSKY_IDENTIFIER` alone meant "archive your own posts". Only seeds when
+/// the table is entirely empty; a non-empty list is left untouched.
+async fn seed_empty_watchlist(
+    config: &AppConfig,
+    store: &ArchiveStore,
     self_did: &str,
-    handle: &str,
-) -> Result<String, BlueskyError> {
-    if handle == identifier {
-        Ok(self_did.to_string())
-    } else if handle.starts_with("did:") {
-        Ok(handle.to_string())
-    } else {
-        client.resolve_handle(handle).await
+) -> Result<(), StorageError> {
+    if !store.list_watched_sources().await?.is_empty() {
+        return Ok(());
     }
+    store
+        .add_watched_source(SourceKind::Account, &config.bsky_identifier, Some(self_did))
+        .await?;
+    tracing::info!(
+        identifier = %config.bsky_identifier,
+        did = %self_did,
+        "watch list was empty; seeded with the authenticated account"
+    );
+    Ok(())
 }
 
 /// Spawns the supervised background tasks and runs until SIGINT/SIGTERM
@@ -191,7 +196,6 @@ pub async fn serve(started: Started) {
         health_tx,
         bluesky_client,
         self_did,
-        watched_dids,
         candidate_tx,
         candidate_rx,
         conn_health_tx,
@@ -202,10 +206,13 @@ pub async fn serve(started: Started) {
     let config = &state.config;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let cursor_path = config.archive_dir.join("jetstream_cursor");
+    // One shared roster subscription drives every producer, so a UI add or
+    // remove (reload) is observed by all of them.
+    let roster_rx = state.watchlist.subscribe();
 
     let firehose_handle = spawn_firehose(
         config.jetstream_url.clone(),
-        watched_dids,
+        roster_rx.clone(),
         cursor_path,
         candidate_tx.clone(),
         conn_health_tx,
@@ -218,7 +225,17 @@ pub async fn serve(started: Started) {
         state.store.clone(),
         candidate_tx.clone(),
         conn_health_rx,
-        config.bsky_watch_handles.clone(),
+        roster_rx.clone(),
+        PollerConfig::new(Duration::from_secs(config.poll_interval_seconds)),
+        health_tx.clone(),
+        shutdown_rx.clone(),
+    );
+
+    let feed_poller_handle = spawn_feed_poller(
+        Arc::clone(&bluesky_client),
+        state.store.clone(),
+        candidate_tx.clone(),
+        roster_rx,
         PollerConfig::new(Duration::from_secs(config.poll_interval_seconds)),
         health_tx.clone(),
         shutdown_rx.clone(),
@@ -236,7 +253,7 @@ pub async fn serve(started: Started) {
 
     // Every producer above holds its own clone of `candidate_tx`; dropping
     // this one is what lets the channel close (and the media downloader
-    // drain and stop) once all three producer tasks have actually ended.
+    // drain and stop) once all the producer tasks have actually ended.
     drop(candidate_tx);
 
     let media_handle = tokio::spawn(run_media_downloader_supervised(
@@ -258,6 +275,7 @@ pub async fn serve(started: Started) {
     let _ = tokio::join!(
         firehose_handle,
         rest_fallback_handle,
+        feed_poller_handle,
         likes_bookmarks_handle,
         web_handle
     );
@@ -274,7 +292,7 @@ pub async fn serve(started: Started) {
 
 fn spawn_firehose(
     jetstream_url: Url,
-    watched_dids: Vec<String>,
+    roster_rx: watch::Receiver<Vec<crate::storage::WatchedSource>>,
     cursor_path: PathBuf,
     candidate_tx: CandidatePostSender,
     conn_health_tx: ConnectionHealthSender,
@@ -294,10 +312,10 @@ fn spawn_firehose(
         move || {
             let mut consumer = FirehoseConsumer::new(
                 jetstream_url.clone(),
-                watched_dids.clone(),
                 cursor_path.clone(),
                 candidate_tx.clone(),
                 conn_health_tx.clone(),
+                roster_rx.clone(),
             );
             let shutdown_rx = consumer_shutdown_rx.clone();
             async move { consumer.run(shutdown_rx).await }
@@ -311,7 +329,7 @@ fn spawn_rest_fallback(
     store: ArchiveStore,
     candidate_tx: CandidatePostSender,
     conn_health_rx: ConnectionHealthReceiver,
-    watch_handles: Vec<String>,
+    roster_rx: watch::Receiver<Vec<crate::storage::WatchedSource>>,
     poller_config: PollerConfig,
     health_tx: HealthSender,
     shutdown_rx: watch::Receiver<bool>,
@@ -327,7 +345,35 @@ fn spawn_rest_fallback(
                 store.clone(),
                 candidate_tx.clone(),
                 conn_health_rx.clone(),
-                watch_handles.clone(),
+                roster_rx.clone(),
+                poller_config.clone(),
+            );
+            async move { poller.run().await }
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_feed_poller(
+    client: Arc<BlueskyClient>,
+    store: ArchiveStore,
+    candidate_tx: CandidatePostSender,
+    roster_rx: watch::Receiver<Vec<crate::storage::WatchedSource>>,
+    poller_config: PollerConfig,
+    health_tx: HealthSender,
+    shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(supervise(
+        "feed_poller",
+        shutdown_rx,
+        health_tx,
+        |snapshot, health| snapshot.feed_poller = health,
+        move || {
+            let poller = FeedPoller::new(
+                Arc::clone(&client),
+                store.clone(),
+                candidate_tx.clone(),
+                roster_rx.clone(),
                 poller_config.clone(),
             );
             async move { poller.run().await }
@@ -570,7 +616,6 @@ mod tests {
         AppConfig {
             bsky_identifier: "alice.bsky.social".to_string(),
             bsky_app_password: Secret::from("app-password".to_string()),
-            bsky_watch_handles: vec!["alice.bsky.social".to_string()],
             archive_dir,
             database_path,
             ui_password: Secret::from("ui-password".to_string()),
@@ -638,34 +683,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_fails_fast_when_watch_handle_cannot_be_resolved() {
-        let server = MockServer::start().await;
-        mount_login(&server, "did:plc:alice").await;
-        Mock::given(method("GET"))
-            .and(path("/xrpc/com.atproto.identity.resolveHandle"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": "InvalidRequest",
-                "message": "unable to resolve handle",
-            })))
-            .mount(&server)
-            .await;
-
-        let archive_dir = tempfile::tempdir().expect("tempdir");
-        let database_path = archive_dir.path().join("index.sqlite3");
-        let mut config = test_config(archive_dir.path().to_path_buf(), database_path);
-        config
-            .bsky_watch_handles
-            .push("bob.bsky.social".to_string());
-        let base_url = Url::parse(&server.uri()).unwrap();
-
-        let err = match init(config, base_url).await {
-            Err(err) => err,
-            Ok(_) => panic!("unresolvable watch handle should fail startup"),
-        };
-        assert!(matches!(err, StartupError::Bluesky(_)));
-    }
-
-    #[tokio::test]
     async fn init_reindexes_from_disk_when_database_is_missing() {
         let server = MockServer::start().await;
         mount_login(&server, "did:plc:alice").await;
@@ -708,13 +725,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_reuses_self_did_for_default_watch_handle() {
+    async fn init_seeds_the_watchlist_with_the_authenticated_account_when_empty() {
         let server = MockServer::start().await;
         mount_login(&server, "did:plc:alice").await;
-        // No `resolveHandle` mock is registered: if `init` tried to resolve
-        // `alice.bsky.social` (the default watch handle, equal to the
-        // identifier) via the API instead of reusing the DID it already
-        // has from login, this test would fail with a 404 from wiremock.
+        // No `resolveHandle` mock is registered: seeding must reuse the DID
+        // from login rather than resolving the identifier over the API.
 
         let archive_dir = tempfile::tempdir().expect("tempdir");
         let database_path = archive_dir.path().join("index.sqlite3");
@@ -722,8 +737,50 @@ mod tests {
         let base_url = Url::parse(&server.uri()).unwrap();
 
         let started = init(config, base_url).await.expect("init should succeed");
-        assert_eq!(started.watched_dids, vec!["did:plc:alice".to_string()]);
         assert_eq!(started.self_did, "did:plc:alice");
+
+        let sources = started.state.watchlist.snapshot();
+        assert_eq!(sources.len(), 1, "fresh install seeds exactly one account");
+        assert_eq!(sources[0].kind, SourceKind::Account);
+        assert_eq!(sources[0].value, "alice.bsky.social");
+        assert_eq!(sources[0].did.as_deref(), Some("did:plc:alice"));
+
+        // The seed is durable, in the same table the web UI manages.
+        let from_db = started
+            .state
+            .store
+            .list_watched_sources()
+            .await
+            .expect("list watched sources");
+        assert_eq!(from_db, sources);
+    }
+
+    #[tokio::test]
+    async fn init_reloads_an_existing_watchlist_without_reseeding() {
+        let server = MockServer::start().await;
+        mount_login(&server, "did:plc:alice").await;
+
+        let archive_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = archive_dir.path().join("index.sqlite3");
+        let config = test_config(archive_dir.path().to_path_buf(), database_path);
+
+        // Pre-populate the watch list (as a previous run would have, via the
+        // web UI): an account that isn't the authenticated identity.
+        let store = ArchiveStore::open(config.archive_dir.clone(), config.database_path.clone())
+            .await
+            .expect("open store");
+        store
+            .add_watched_source(SourceKind::Account, "bob.bsky.social", Some("did:plc:bob"))
+            .await
+            .expect("add source");
+        drop(store);
+
+        let base_url = Url::parse(&server.uri()).unwrap();
+        let started = init(config, base_url).await.expect("init should succeed");
+        let sources = started.state.watchlist.snapshot();
+        assert_eq!(sources.len(), 1, "existing list must not be reseeded");
+        assert_eq!(sources[0].value, "bob.bsky.social");
+        assert_eq!(sources[0].did.as_deref(), Some("did:plc:bob"));
     }
 
     fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
