@@ -1,17 +1,20 @@
-//! Jetstream websocket consumer: real-time capture of the watched account's
+//! Jetstream websocket consumer: real-time capture of the watched accounts'
 //! authored posts with media, filtered by DID.
 //!
 //! [`FirehoseConsumer`] connects to a Jetstream endpoint (filtered AT
-//! Protocol firehose), subscribed to `app.bsky.feed.post` commits for a set
-//! of watched DIDs, and turns qualifying create-commits into
+//! Protocol firehose), subscribed to `app.bsky.feed.post` commits for the
+//! watched accounts' DIDs, and turns qualifying create-commits into
 //! [`crate::pipeline::CandidatePost`]s handed off through
 //! [`crate::pipeline::candidate_post_channel`]. It is the sole producer of
 //! [`ConnectionHealth`], which [`crate::poller`] (AR-6) reads to decide
 //! whether the REST-polling fallback needs to be active.
 //!
-//! Resolving `BSKY_WATCH_HANDLES` to DIDs (via the AR-3 `BskyClient`) is the
-//! caller's responsibility: this module takes already-resolved DIDs so it
-//! can be built and tested independently of that client.
+//! The watched-DID set comes from the live roster
+//! ([`crate::watchlist::Watchlist`]) rather than a startup snapshot: the
+//! consumer holds a `watch::Receiver` over the roster and, when a change
+//! alters the watched accounts, closes its session and reconnects with the
+//! new `wantedDids` set (cursor continuity across the reconnect is
+//! acceptable). Feeds are never subscribed on the firehose.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -31,6 +34,7 @@ use crate::pipeline::{
     CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthSender, MediaRef,
     PostCategory, has_archivable_media,
 };
+use crate::storage::{SourceKind, WatchedSource};
 
 /// Errors that can end one connection attempt/session. Every variant is
 /// recoverable by reconnecting; there is no fatal variant because a
@@ -169,7 +173,19 @@ fn build_subscribe_url(base: &Url, watched_dids: &[String], cursor: Option<i64>)
 /// producer of the [`ConnectionHealth`] signal AR-6 reads.
 pub struct FirehoseConsumer {
     jetstream_url: Url,
-    watched_dids: HashSet<String>,
+    /// Live view of the watch-list roster, from which the account DIDs are
+    /// (re)computed. The consumer holds a `watch::Receiver` so a roster
+    /// reload both updates the wanted-DID set and wakes the read loop.
+    roster_rx: watch::Receiver<Vec<WatchedSource>>,
+    /// The account DID set the most recent session subscribed to, so a
+    /// roster change that doesn't actually alter the watched accounts (e.g.
+    /// a feed being added) can be ignored instead of forcing a pointless
+    /// reconnect.
+    connected_dids: Option<HashSet<String>>,
+    /// Whether `roster_rx` can still deliver changes. Guarded separately so
+    /// a closed channel (the watchlist is gone) can't spin read_loop's
+    /// select into an infinite immediate-reconnect loop.
+    roster_alive: bool,
     cursor_store: CursorStore,
     candidate_tx: CandidatePostSender,
     health_tx: ConnectionHealthSender,
@@ -177,16 +193,20 @@ pub struct FirehoseConsumer {
 }
 
 impl FirehoseConsumer {
+    /// Builds a consumer whose wanted-DID set is derived live from
+    /// `roster_rx` (see [`crate::watchlist::Watchlist::subscribe`]).
     pub fn new(
         jetstream_url: Url,
-        watched_dids: Vec<String>,
         cursor_path: PathBuf,
         candidate_tx: CandidatePostSender,
         health_tx: ConnectionHealthSender,
+        roster_rx: watch::Receiver<Vec<WatchedSource>>,
     ) -> Self {
         FirehoseConsumer {
             jetstream_url,
-            watched_dids: watched_dids.into_iter().collect(),
+            roster_rx,
+            connected_dids: None,
+            roster_alive: true,
             cursor_store: CursorStore::new(cursor_path),
             candidate_tx,
             health_tx,
@@ -249,9 +269,10 @@ impl FirehoseConsumer {
         &mut self,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), FirehoseError> {
+        let watched_dids = self.watched_dids();
+        self.connected_dids = Some(watched_dids.iter().cloned().collect());
         let cursor = self.cursor_store.load();
-        let subscribe_url =
-            build_subscribe_url(&self.jetstream_url, &self.watched_dids_vec(), cursor);
+        let subscribe_url = build_subscribe_url(&self.jetstream_url, &watched_dids, cursor);
 
         tracing::info!(url = %subscribe_url, cursor = ?cursor, "connecting to jetstream");
         let (ws_stream, _response) = connect_async(subscribe_url.as_str()).await?;
@@ -261,8 +282,27 @@ impl FirehoseConsumer {
         self.read_loop(ws_stream, shutdown).await
     }
 
-    fn watched_dids_vec(&self) -> Vec<String> {
-        self.watched_dids.iter().cloned().collect()
+    /// The currently watched account DIDs, derived live from the roster.
+    /// Feeds are deliberately excluded: the firehose only subscribes to
+    /// accounts.
+    fn watched_dids(&self) -> Vec<String> {
+        self.roster_rx
+            .borrow()
+            .iter()
+            .filter(|source| source.kind == SourceKind::Account)
+            .map(|source| source.did.clone().unwrap_or_else(|| source.value.clone()))
+            .collect()
+    }
+
+    /// Whether the current roster's account DID set differs from the set the
+    /// last session subscribed to (i.e. a live reload actually changed the
+    /// firehose filter).
+    fn dids_changed(&self) -> bool {
+        let current: HashSet<String> = self.watched_dids().into_iter().collect();
+        match &self.connected_dids {
+            Some(connected) => connected != &current,
+            None => !current.is_empty(),
+        }
     }
 
     async fn read_loop(
@@ -298,6 +338,20 @@ impl FirehoseConsumer {
                         return Ok(());
                     }
                 }
+                changed = self.roster_rx.changed(), if self.roster_alive => {
+                    if changed.is_err() || self.roster_rx.borrow_and_update().is_err() {
+                        // The roster watchlist is gone; stop watching for
+                        // further changes rather than spinning on a closed
+                        // channel.
+                        self.roster_alive = false;
+                        continue;
+                    }
+                    if self.dids_changed() {
+                        tracing::info!("watched accounts changed; reconnecting with the new wantedDids");
+                        let _ = ws_stream.close(None).await;
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -314,7 +368,10 @@ impl FirehoseConsumer {
         if event.kind != "commit" {
             return;
         }
-        if !self.watched_dids.contains(&event.did) {
+        let Some(connected_dids) = &self.connected_dids else {
+            return;
+        };
+        if !connected_dids.contains(&event.did) {
             return;
         }
         let Some(commit) = event.commit else {
@@ -580,6 +637,13 @@ mod tests {
         seen_urls.lock().await.push(request_path);
 
         let (mut write, _read) = ws_stream.split();
+        // An empty script means "connect and stay idle": used to hold a
+        // session open across an externally-triggered roster change/reconnect
+        // without any event traffic.
+        if script.is_empty() {
+            std::future::pending::<()>().await;
+            return;
+        }
         for event in script {
             let text = serde_json::to_string(&event).expect("serialize event");
             if write.send(Message::Text(text)).await.is_err() {
@@ -588,6 +652,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let _ = write.close().await;
+    }
+
+    fn watched_source(id: i64, did: &str) -> WatchedSource {
+        WatchedSource {
+            id,
+            kind: SourceKind::Account,
+            value: did.to_string(),
+            did: Some(did.to_string()),
+            added_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// A live roster receiver seeded with one account per DID; the matching
+    /// `watch::Sender` is dropped, which is exactly what tests that never
+    /// change the roster want (the closed channel is handled gracefully).
+    fn account_roster(dids: &[&str]) -> watch::Receiver<Vec<WatchedSource>> {
+        let sources = dids
+            .iter()
+            .enumerate()
+            .map(|(i, did)| watched_source(i as i64 + 1, did))
+            .collect();
+        let (_tx, rx) = watch::channel(sources);
+        rx
     }
 
     fn test_backoff() -> BackoffConfig {
@@ -610,10 +697,10 @@ mod tests {
 
         let mut consumer = FirehoseConsumer::new(
             url,
-            vec![did.to_string()],
             cursor_path.clone(),
             candidate_tx,
             health_tx,
+            account_roster(&[did]),
         )
         .with_backoff(test_backoff());
 
@@ -648,10 +735,10 @@ mod tests {
 
         let mut consumer = FirehoseConsumer::new(
             url,
-            vec![did.to_string()],
             cursor_path.clone(),
             candidate_tx,
             health_tx,
+            account_roster(&[did]),
         )
         .with_backoff(test_backoff());
 
@@ -690,10 +777,10 @@ mod tests {
 
         let mut consumer = FirehoseConsumer::new(
             url,
-            vec![did.to_string()],
             cursor_path.clone(),
             candidate_tx,
             health_tx,
+            account_roster(&[did]),
         )
         .with_backoff(test_backoff());
 
@@ -734,10 +821,10 @@ mod tests {
 
         let mut consumer = FirehoseConsumer::new(
             url,
-            vec![did.to_string()],
             cursor_path.clone(),
             candidate_tx,
             health_tx,
+            account_roster(&[did]),
         )
         .with_backoff(test_backoff());
 
@@ -792,6 +879,131 @@ mod tests {
             urls[1]
         );
 
+        let _ = std::fs::remove_file(&cursor_path);
+    }
+
+    #[tokio::test]
+    async fn roster_change_that_alters_watched_dids_reconnects_with_the_new_set() {
+        let did = "did:plc:alice";
+        let added_did = "did:plc:bob";
+        let (_server, seen_urls) = spawn_mock_server(vec![vec![], vec![]]).await;
+        let addr = _server.addr;
+
+        let url = Url::parse(&format!("ws://{addr}/subscribe")).unwrap();
+        let (candidate_tx, _candidate_rx) = candidate_post_channel(8);
+        let (health_tx, _health_rx) = connection_health_channel(ConnectionHealth::Disabled);
+        let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
+
+        let (roster_tx, roster_rx) = watch::channel(vec![watched_source(1, did)]);
+        let mut consumer = FirehoseConsumer::new(
+            url,
+            cursor_path.clone(),
+            candidate_tx,
+            health_tx,
+            roster_rx,
+        )
+        .with_backoff(test_backoff());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            consumer.run(shutdown_rx).await;
+        });
+
+        // First session: stays idle (empty script) until we act.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen_urls.lock().await.len() < 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first connection made");
+
+        // The UI adds an account: the roster reload must close the idle
+        // session and reconnect with both DIDs in wantedDids.
+        roster_tx
+            .send_replace(vec![
+                watched_source(1, did),
+                watched_source(2, added_did),
+            ])
+            .expect("roster reload");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen_urls.lock().await.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("second connection made");
+        let urls = seen_urls.lock().await.clone();
+        assert!(urls[1].contains("wantedDids=did%3Aplc%3Aalice"), "{}", urls[1]);
+        assert!(urls[1].contains("wantedDids=did%3Aplc%3Abob"), "{}", urls[1]);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = std::fs::remove_file(&cursor_path);
+    }
+
+    #[tokio::test]
+    async fn roster_change_that_leaves_watched_dids_unchanged_does_not_reconnect() {
+        let did = "did:plc:alice";
+        let (_server, seen_urls) = spawn_mock_server(vec![vec![]]).await;
+        let addr = _server.addr;
+
+        let url = Url::parse(&format!("ws://{addr}/subscribe")).unwrap();
+        let (candidate_tx, _candidate_rx) = candidate_post_channel(8);
+        let (health_tx, _health_rx) = connection_health_channel(ConnectionHealth::Disabled);
+        let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
+
+        let (roster_tx, roster_rx) = watch::channel(vec![watched_source(1, did)]);
+        let mut consumer = FirehoseConsumer::new(
+            url,
+            cursor_path.clone(),
+            candidate_tx,
+            health_tx,
+            roster_rx,
+        )
+        .with_backoff(test_backoff());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            consumer.run(shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen_urls.lock().await.len() < 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first connection made");
+
+        // Adding a *feed* reloads the roster but leaves the account DIDs
+        // untouched: the firehose must keep its session rather than
+        // reconnecting (note the mock has only one scripted connection).
+        roster_tx
+            .send_replace(vec![
+                watched_source(1, did),
+                WatchedSource {
+                    id: 2,
+                    kind: SourceKind::Feed,
+                    value: "at://did:plc:alice/app.bsky.feed.generator/whats-hot".to_string(),
+                    did: None,
+                    added_at: "2024-01-01T00:00:00Z".to_string(),
+                },
+            ])
+            .expect("roster reload");
+
+        // Give any (buggy) reconnect a real chance to happen; only one
+        // connection may ever be made.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            seen_urls.lock().await.len(),
+            1,
+            "feed-only roster change must not reconnect the firehose"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         let _ = std::fs::remove_file(&cursor_path);
     }
 

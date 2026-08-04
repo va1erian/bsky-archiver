@@ -64,6 +64,7 @@ pub struct HealthSnapshot {
     pub version: String,
     pub firehose: SubsystemHealth,
     pub rest_fallback: SubsystemHealth,
+    pub feed_poller: SubsystemHealth,
     pub likes_bookmarks: SubsystemHealth,
     pub media_downloader: SubsystemHealth,
 }
@@ -75,6 +76,7 @@ impl Default for HealthSnapshot {
             version: env!("CARGO_PKG_VERSION").to_string(),
             firehose: starting.clone(),
             rest_fallback: starting.clone(),
+            feed_poller: starting.clone(),
             likes_bookmarks: starting.clone(),
             media_downloader: starting,
         }
@@ -104,6 +106,7 @@ mod tests {
         assert_eq!(snapshot.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(snapshot.firehose.status, Status::Degraded);
         assert_eq!(snapshot.rest_fallback.status, Status::Degraded);
+        assert_eq!(snapshot.feed_poller.status, Status::Degraded);
         assert_eq!(snapshot.likes_bookmarks.status, Status::Degraded);
         assert_eq!(snapshot.media_downloader.status, Status::Degraded);
     }
@@ -116,5 +119,6 @@ mod tests {
         let snapshot = rx.borrow().clone();
         assert_eq!(snapshot.firehose.status, Status::Connected);
         assert_eq!(snapshot.rest_fallback.status, Status::Degraded);
+        assert_eq!(snapshot.feed_poller.status, Status::Degraded);
     }
 }

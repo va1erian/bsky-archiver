@@ -77,6 +77,60 @@ impl std::str::FromStr for Category {
     }
 }
 
+/// What kind of source a watched row points at: a single account (handle or
+/// DID) whose authored posts are archived, or an algorithm/custom feed (an
+/// `at://` `app.bsky.feed.generator` URI) whose posts are archived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Account,
+    Feed,
+}
+
+impl SourceKind {
+    /// The canonical string form stored in `watched_sources.source_kind`.
+    fn as_str(self) -> &'static str {
+        match self {
+            SourceKind::Account => "account",
+            SourceKind::Feed => "feed",
+        }
+    }
+}
+
+impl std::fmt::Display for SourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SourceKind {
+    type Err = StorageError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "account" => Ok(SourceKind::Account),
+            "feed" => Ok(SourceKind::Feed),
+            other => Err(StorageError::InvalidSourceKind(other.to_string())),
+        }
+    }
+}
+
+/// One row of the `watched_sources` table: a UI-managed, live-reloadable
+/// account or feed the archiver watches. This table is the single source of
+/// truth for what the daemon watches; the in-memory roster
+/// ([`crate::watchlist::Watchlist`]) is a live cache of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchedSource {
+    pub id: i64,
+    pub kind: SourceKind,
+    /// For accounts: the handle or DID the user entered. For feeds: the
+    /// `at://` feed URI.
+    pub value: String,
+    /// Resolved DID for accounts (always `Some` once resolution has
+    /// happened); `None` for feeds, which aren't DID-scoped.
+    pub did: Option<String>,
+    pub added_at: String,
+}
+
 /// Errors produced by the storage layer.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -88,6 +142,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("unknown category on disk: {0:?}")]
     InvalidCategory(String),
+    #[error("unknown watched source kind on disk: {0:?}")]
+    InvalidSourceKind(String),
     #[error("post not archived: {0}")]
     NotFound(String),
     #[error("background storage task panicked")]
@@ -279,7 +335,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp_path, path)
 }
 
-const SCHEMA_VERSION: i64 = 1;
+/// Schema version 2 adds the `watched_sources` table (the UI-managed watch
+/// list); version 1 had only `posts`/`media`. Both statements are
+/// `CREATE TABLE IF NOT EXISTS`, so a version-1 database upgrades in place
+/// (the new table is created empty) with no data rows to move.
+const SCHEMA_VERSION: i64 = 2;
 
 fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -314,6 +374,15 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_media_indexed_at ON media(indexed_at, id);
         CREATE INDEX IF NOT EXISTS idx_media_category_indexed_at
             ON media(category, indexed_at, id);
+
+        CREATE TABLE IF NOT EXISTS watched_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_kind TEXT NOT NULL CHECK (source_kind IN ('account', 'feed')),
+            source_value TEXT NOT NULL,
+            did TEXT,
+            added_at TEXT NOT NULL,
+            UNIQUE(source_kind, source_value)
+        );
         ",
     )?;
 
@@ -423,6 +492,96 @@ impl ArchiveStore {
         })
         .await;
 
+        join_result(result)
+    }
+
+    /// Lists every watched source, oldest-added first, from the
+    /// `watched_sources` table that [`ArchiveStore::open`] bootstrapped.
+    /// This is the single source of truth the live roster
+    /// ([`crate::watchlist::Watchlist`]) and the producers read from.
+    pub async fn list_watched_sources(&self) -> Result<Vec<WatchedSource>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<WatchedSource>, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = conn.prepare(
+                "SELECT id, source_kind, source_value, did, added_at
+                 FROM watched_sources
+                 ORDER BY added_at, id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let kind: String = row.get(1)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    kind,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let mut sources = Vec::new();
+            for row in rows {
+                let (id, kind, value, did, added_at) = row?;
+                sources.push(WatchedSource {
+                    id,
+                    kind: kind.parse()?,
+                    value,
+                    did,
+                    added_at,
+                });
+            }
+            Ok(sources)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Adds (or re-adds) a watched source. Idempotent: adding a source that
+    /// already exists under the same `(kind, value)` is a no-op upsert that
+    /// refreshes the resolved `did` (in case the handle now resolves
+    /// differently) but never resets `added_at`. Returns the row's id in
+    /// both cases.
+    pub async fn add_watched_source(
+        &self,
+        kind: SourceKind,
+        value: &str,
+        did: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let db = Arc::clone(&self.db);
+        let kind = kind.as_str().to_string();
+        let value = value.to_string();
+        let did = did.map(str::to_string);
+        let added_at = now_rfc3339();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<i64, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT INTO watched_sources (source_kind, source_value, did, added_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(source_kind, source_value) DO UPDATE SET
+                     did = COALESCE(excluded.did, watched_sources.did)",
+                params![kind, value, did, added_at],
+            )?;
+            let id = conn.query_row(
+                "SELECT id FROM watched_sources WHERE source_kind = ?1 AND source_value = ?2",
+                params![kind, value],
+                |row| row.get(0),
+            )?;
+            Ok(id)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Removes a watched source by row id. Returns whether a row was
+    /// actually deleted (removing an already-absent id is a no-op `false`).
+    pub async fn remove_watched_source(&self, id: i64) -> Result<bool, StorageError> {
+        let db = Arc::clone(&self.db);
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let affected = conn.execute("DELETE FROM watched_sources WHERE id = ?1", params![id])?;
+            Ok(affected > 0)
+        })
+        .await;
         join_result(result)
     }
 
@@ -1312,6 +1471,195 @@ mod tests {
         assert_eq!(likes.total_items, 1);
         assert_eq!(likes.items.len(), 1);
         assert!(likes.items.iter().all(|m| m.category == Category::Like));
+    }
+
+    #[tokio::test]
+    async fn watched_sources_round_trip_add_list_remove() {
+        let (_dir, store) = open_store().await;
+
+        assert!(store.list_watched_sources().await.unwrap().is_empty());
+
+        let account_id = store
+            .add_watched_source(SourceKind::Account, "alice.bsky.social", Some("did:plc:alice"))
+            .await
+            .unwrap();
+        let feed_id = store
+            .add_watched_source(
+                SourceKind::Feed,
+                "at://did:plc:alice/app.bsky.feed.generator/whats-hot",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(account_id, feed_id);
+
+        let sources = store.list_watched_sources().await.unwrap();
+        assert_eq!(sources.len(), 2);
+        let account = sources.iter().find(|s| s.kind == SourceKind::Account).unwrap();
+        assert_eq!(account.value, "alice.bsky.social");
+        assert_eq!(account.did.as_deref(), Some("did:plc:alice"));
+        let feed = sources.iter().find(|s| s.kind == SourceKind::Feed).unwrap();
+        assert_eq!(feed.value, "at://did:plc:alice/app.bsky.feed.generator/whats-hot");
+        assert_eq!(feed.did, None);
+        // Each row carries a parseable RFC3339 added_at.
+        assert!(!account.added_at.is_empty());
+        assert!(!feed.added_at.is_empty());
+
+        assert!(store.remove_watched_source(account_id).await.unwrap());
+        assert!(!store.remove_watched_source(account_id).await.unwrap(), "second remove is a no-op");
+        let remaining = store.list_watched_sources().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, feed_id);
+    }
+
+    #[tokio::test]
+    async fn adding_same_watched_source_twice_is_idempotent() {
+        let (_dir, store) = open_store().await;
+
+        let first_id = store
+            .add_watched_source(SourceKind::Account, "alice.bsky.social", Some("did:plc:alice"))
+            .await
+            .unwrap();
+        let second_id = store
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:new-did"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_id, second_id, "upsert must not create a duplicate row");
+
+        let sources = store.list_watched_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+
+        // Re-adding with a fresh did refresh is an in-place update, not a
+        // second row.
+        assert_eq!(sources[0].did.as_deref(), Some("did:plc:alice"));
+        let _ = store
+            .add_watched_source(SourceKind::Account, "alice.bsky.social", Some("did:plc:newer"))
+            .await
+            .unwrap();
+        let after = store.list_watched_sources().await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].did.as_deref(), Some("did:plc:newer"));
+        assert_eq!(after[0].value, "alice.bsky.social");
+        assert_eq!(
+            after[0].added_at, sources[0].added_at,
+            "re-adding must not reset the original added_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_sources_with_feed_and_account_kinds_stay_distinct() {
+        let (_dir, store) = open_store().await;
+
+        // The same string can appear for both kinds without colliding, since
+        // uniqueness is on (kind, value).
+        store
+            .add_watched_source(
+                SourceKind::Account,
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+                Some("did:plc:alice"),
+            )
+            .await
+            .unwrap();
+        store
+            .add_watched_source(
+                SourceKind::Feed,
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let sources = store.list_watched_sources().await.unwrap();
+        assert_eq!(sources.len(), 2);
+    }
+
+    #[test]
+    fn source_kind_parses_and_displays() {
+        assert_eq!("account".parse::<SourceKind>().unwrap(), SourceKind::Account);
+        assert_eq!("feed".parse::<SourceKind>().unwrap(), SourceKind::Feed);
+        assert_eq!(SourceKind::Account.to_string(), "account");
+        assert_eq!(SourceKind::Feed.to_string(), "feed");
+        assert!(matches!(
+            "gallery".parse::<SourceKind>(),
+            Err(StorageError::InvalidSourceKind(_))
+        ));
+    }
+
+    async fn open_v1_database() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("index.sqlite3");
+        let conn = Connection::open(&database_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1');
+            CREATE TABLE posts (
+                category TEXT NOT NULL,
+                at_uri TEXT NOT NULL,
+                cid TEXT NOT NULL,
+                indexed_at TEXT NOT NULL,
+                record_path TEXT NOT NULL,
+                PRIMARY KEY (category, at_uri)
+            );
+            CREATE TABLE media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                post_at_uri TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                content_type TEXT,
+                size_bytes INTEGER NOT NULL,
+                indexed_at TEXT NOT NULL,
+                UNIQUE(category, post_at_uri, filename)
+            );
+            ",
+        )
+        .unwrap();
+        // A v1 archive row that must survive the upgrade untouched.
+        conn.execute(
+            "INSERT INTO posts (category, at_uri, cid, indexed_at, record_path)
+             VALUES ('posts', 'at://did:plc:v1/app.bsky.feed.post/1', 'cid', '2024-01-01', 'x')",
+            [],
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn opening_a_v1_database_upgrades_to_schema_v2_in_place() {
+        let dir = open_v1_database().await;
+        let store = ArchiveStore::open(dir.path().join("archive"), dir.path().join("index.sqlite3"))
+            .await
+            .expect("open store upgrades v1");
+
+        // The v1 posts row is untouched...
+        let page = store.list_posts(None, 1, 10).await.unwrap();
+        assert_eq!(page.total_items, 1);
+        assert_eq!(page.items[0].at_uri, "at://did:plc:v1/app.bsky.feed.post/1");
+
+        // ...the schema version says 2...
+        let bytes = std::fs::read(dir.path().join("index.sqlite3")).unwrap();
+        drop(bytes);
+        let conn = rusqlite::Connection::open(dir.path().join("index.sqlite3")).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+
+        // ...and the new table is usable immediately (no data had to move).
+        assert!(store.list_watched_sources().await.unwrap().is_empty());
+        store
+            .add_watched_source(SourceKind::Account, "alice.bsky.social", Some("did:plc:alice"))
+            .await
+            .unwrap();
+        assert_eq!(store.list_watched_sources().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

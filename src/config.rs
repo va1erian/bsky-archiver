@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 const ALL_VARS: &[&str] = &[
     "BSKY_IDENTIFIER",
     "BSKY_APP_PASSWORD",
-    "BSKY_WATCH_HANDLES",
     "ARCHIVE_DIR",
     "DATABASE_PATH",
     "UI_PASSWORD",
@@ -89,7 +88,6 @@ impl std::error::Error for ConfigError {}
 pub struct AppConfig {
     pub bsky_identifier: String,
     pub bsky_app_password: Secret,
-    pub bsky_watch_handles: Vec<String>,
     pub archive_dir: PathBuf,
     pub database_path: PathBuf,
     pub ui_password: Secret,
@@ -124,11 +122,6 @@ impl AppConfig {
         let bsky_app_password = Secret::from(require_var("BSKY_APP_PASSWORD")?);
         let ui_password = Secret::from(require_var("UI_PASSWORD")?);
         let ui_session_secret = Secret::from(require_var("UI_SESSION_SECRET")?);
-
-        let bsky_watch_handles = match optional_var("BSKY_WATCH_HANDLES") {
-            Some(raw) => parse_handles(&raw)?,
-            None => vec![bsky_identifier.clone()],
-        };
 
         let archive_dir = optional_var("ARCHIVE_DIR")
             .map(PathBuf::from)
@@ -168,7 +161,6 @@ impl AppConfig {
         Ok(AppConfig {
             bsky_identifier,
             bsky_app_password,
-            bsky_watch_handles,
             archive_dir,
             database_path,
             ui_password,
@@ -190,22 +182,6 @@ fn optional_var(name: &str) -> Option<String> {
 
 fn require_var(name: &'static str) -> Result<String, ConfigError> {
     optional_var(name).ok_or(ConfigError::MissingVar(name))
-}
-
-fn parse_handles(raw: &str) -> Result<Vec<String>, ConfigError> {
-    let handles: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if handles.is_empty() {
-        return Err(ConfigError::InvalidValue {
-            var: "BSKY_WATCH_HANDLES",
-            message: "must contain at least one comma-separated handle".to_string(),
-        });
-    }
-    Ok(handles)
 }
 
 fn parse_port(raw: &str) -> Result<u16, ConfigError> {
@@ -364,7 +340,6 @@ mod tests {
         let config = AppConfig::from_env().expect("config should load with only required vars");
 
         assert_eq!(config.bsky_identifier, "alice.bsky.social");
-        assert_eq!(config.bsky_watch_handles, vec!["alice.bsky.social"]);
         assert_eq!(config.database_path, dir.join("index.sqlite3"));
         assert_eq!(config.ui_port, defaults::UI_PORT);
         assert_eq!(
@@ -529,24 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn blank_watch_handles_is_invalid() {
-        let dir = temp_dir("blank-watch-handles");
-        let required = required_vars(&dir);
-        let mut overrides: Vec<(&'static str, &str)> =
-            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        overrides.push(("BSKY_WATCH_HANDLES", " , , "));
-        let _guard = EnvGuard::new(&overrides);
-
-        let err = AppConfig::from_env().expect_err("blank handle list should fail");
-        match err {
-            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "BSKY_WATCH_HANDLES"),
-            other => panic!("expected InvalidValue, got {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn archive_dir_not_creatable_produces_specific_error() {
         // Create a plain file, then ask for an ARCHIVE_DIR *inside* that
         // file's path: `create_dir_all` cannot possibly succeed, since a
@@ -567,27 +524,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&blocking_file);
-    }
-
-    #[test]
-    fn custom_watch_handles_are_parsed_and_trimmed() {
-        let dir = temp_dir("custom-watch-handles");
-        let required = required_vars(&dir);
-        let mut overrides: Vec<(&'static str, &str)> =
-            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        overrides.push((
-            "BSKY_WATCH_HANDLES",
-            "alice.bsky.social, bob.bsky.social ,carol.bsky.social",
-        ));
-        let _guard = EnvGuard::new(&overrides);
-
-        let config = AppConfig::from_env().expect("config should load");
-        assert_eq!(
-            config.bsky_watch_handles,
-            vec!["alice.bsky.social", "bob.bsky.social", "carol.bsky.social"]
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
