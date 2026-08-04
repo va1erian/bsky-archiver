@@ -7,6 +7,13 @@ FROM symphony-base:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config libssl-dev curl \
+        # Headless Chromium, for evidence collection (.symphony/WORKFLOW.md's
+        # `repo.evidence: true` -- see AGENTS.md "Evidence collection" in the symphony
+        # repo). The agent's own prompt drives it directly via
+        # `chromium --headless --disable-gpu --screenshot=<path> <url>`; nothing in
+        # Symphony itself launches a browser. Debian's `chromium` package runs
+        # headless without an X server, so no extra display plumbing is needed here.
+        chromium \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup \
