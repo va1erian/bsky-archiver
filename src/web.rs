@@ -325,6 +325,7 @@ async fn list_posts(
     } else {
         let category_options = build_category_options(query.category.as_deref());
         let template = templates::PostsTemplate {
+            version: templates::APP_VERSION,
             rows,
             pagination,
             category_options,
@@ -403,6 +404,7 @@ async fn post_detail(
                 .unwrap_or_else(|_| "<invalid json>".to_string());
 
             let template = templates::PostDetailTemplate {
+                version: templates::APP_VERSION,
                 category_label: templates::category_label(category),
                 category_badge_class: templates::category_badge_class(category),
                 author: templates::author_did_from_at_uri(&at_uri).to_string(),
@@ -517,6 +519,7 @@ async fn gallery(
         let export = build_gallery_export(category, estimate);
         let category_options = build_gallery_category_options(category);
         let template = templates::GalleryTemplate {
+            version: templates::APP_VERSION,
             items,
             pagination,
             category_options,
@@ -1545,7 +1548,7 @@ mod tests {
             "image thumbnail missing alt"
         );
         assert!(
-            body.contains(&format!("Version {}", env!("CARGO_PKG_VERSION"))),
+            body.contains(&format!("bsky-archiver v{}", env!("CARGO_PKG_VERSION"))),
             "version footer missing"
         );
     }
@@ -1822,7 +1825,7 @@ mod tests {
             "BSKY_WATCH_HANDLES must be gone from the config page"
         );
         assert!(
-            body.contains(&format!("Version {}", env!("CARGO_PKG_VERSION"))),
+            body.contains(&format!("bsky-archiver v{}", env!("CARGO_PKG_VERSION"))),
             "version footer missing"
         );
     }
