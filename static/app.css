@@ -274,12 +274,10 @@ nav form {
     animation-delay: 60ms;
   }
 
-  /* Hover/focus affordance: cards and their thumbs lift a hair with a soft,
-     theme-agnostic glow (Pico's own primary colour/focus, nothing hardcoded). */
+  /* Hover/focus affordance: cards and their thumbs lift a hair. */
   .item-card,
   .gallery-item {
-    transition: transform 160ms ease-out, border-color 160ms ease-out,
-      box-shadow 160ms ease-out;
+    transition: transform 160ms ease-out;
   }
 
   .item-card .thumb,
@@ -292,9 +290,6 @@ nav form {
   .item-card:focus-visible,
   .gallery-item:hover,
   .gallery-item:focus-visible {
-    border-color: var(--pico-primary, #2563eb);
-    box-shadow: 0 0 0 3px var(--pico-primary-focus, rgba(0, 0, 0, 0.15)),
-      0 4px 12px -2px var(--pico-primary-focus, rgba(0, 0, 0, 0.4));
     transform: translateY(-2px);
   }
 
@@ -307,13 +302,15 @@ nav form {
     transform: translateY(-2px);
   }
 
-  /* Active-state transitions: badges and category filters ease their state
-     changes with the same timing as the card hovers. */
   .badge,
   .category-filter a,
   .category-filter span.current {
-    transition: background-color 160ms ease-out, border-color 160ms ease-out,
-      color 160ms ease-out;
+    transition: transform 160ms ease-out;
+  }
+
+  .category-filter a:hover,
+  .category-filter a:focus-visible {
+    transform: scale(1.03);
   }
 
   /* The single repeating animation: the "connected" status dot breathing
