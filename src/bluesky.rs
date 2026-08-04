@@ -320,7 +320,8 @@ impl BlueskyClient {
         if let Some(cursor) = cursor {
             query.push(("cursor", cursor.to_string()));
         }
-        self.get_authenticated("app.bsky.feed.getFeed", &query).await
+        self.get_authenticated("app.bsky.feed.getFeed", &query)
+            .await
     }
 
     /// Fetches one page of the watched account's likes, newest-first.
@@ -752,7 +753,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/xrpc/app.bsky.feed.getFeed"))
-            .and(query_param("feed", "at://did:plc:alice/app.bsky.feed.generator/whats-hot"))
+            .and(query_param(
+                "feed",
+                "at://did:plc:alice/app.bsky.feed.generator/whats-hot",
+            ))
             .and(header("authorization", "Bearer token-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "feed": [{
@@ -806,7 +810,11 @@ mod tests {
             crate::ratelimit::RequestLimiter::new(4),
         ));
         client
-            .get_feed("at://did:plc:alice/app.bsky.feed.generator/x", Some("page-2"), 50)
+            .get_feed(
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+                Some("page-2"),
+                50,
+            )
             .await
             .expect("get_feed with cursor");
     }

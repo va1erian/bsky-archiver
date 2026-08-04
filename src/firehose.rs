@@ -902,14 +902,9 @@ mod tests {
         let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
 
         let (roster_tx, roster_rx) = watch::channel(vec![watched_source(1, did)]);
-        let mut consumer = FirehoseConsumer::new(
-            url,
-            cursor_path.clone(),
-            candidate_tx,
-            health_tx,
-            roster_rx,
-        )
-        .with_backoff(test_backoff());
+        let mut consumer =
+            FirehoseConsumer::new(url, cursor_path.clone(), candidate_tx, health_tx, roster_rx)
+                .with_backoff(test_backoff());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
@@ -918,7 +913,7 @@ mod tests {
 
         // First session: stays idle (empty script) until we act.
         tokio::time::timeout(Duration::from_secs(2), async {
-            while seen_urls.lock().await.len() < 1 {
+            while seen_urls.lock().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -927,12 +922,9 @@ mod tests {
 
         // The UI adds an account: the roster reload must close the idle
         // session and reconnect with both DIDs in wantedDids.
-        roster_tx
-            .send_replace(vec![
-                watched_source(1, did),
-                watched_source(2, added_did),
-            ])
-            .expect("roster reload");
+        // `send_replace` returns the previous value; the replacement is the
+        // only thing that matters here.
+        roster_tx.send_replace(vec![watched_source(1, did), watched_source(2, added_did)]);
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while seen_urls.lock().await.len() < 2 {
@@ -942,8 +934,16 @@ mod tests {
         .await
         .expect("second connection made");
         let urls = seen_urls.lock().await.clone();
-        assert!(urls[1].contains("wantedDids=did%3Aplc%3Aalice"), "{}", urls[1]);
-        assert!(urls[1].contains("wantedDids=did%3Aplc%3Abob"), "{}", urls[1]);
+        assert!(
+            urls[1].contains("wantedDids=did%3Aplc%3Aalice"),
+            "{}",
+            urls[1]
+        );
+        assert!(
+            urls[1].contains("wantedDids=did%3Aplc%3Abob"),
+            "{}",
+            urls[1]
+        );
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -962,14 +962,9 @@ mod tests {
         let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
 
         let (roster_tx, roster_rx) = watch::channel(vec![watched_source(1, did)]);
-        let mut consumer = FirehoseConsumer::new(
-            url,
-            cursor_path.clone(),
-            candidate_tx,
-            health_tx,
-            roster_rx,
-        )
-        .with_backoff(test_backoff());
+        let mut consumer =
+            FirehoseConsumer::new(url, cursor_path.clone(), candidate_tx, health_tx, roster_rx)
+                .with_backoff(test_backoff());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
@@ -977,7 +972,7 @@ mod tests {
         });
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while seen_urls.lock().await.len() < 1 {
+            while seen_urls.lock().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -987,18 +982,16 @@ mod tests {
         // Adding a *feed* reloads the roster but leaves the account DIDs
         // untouched: the firehose must keep its session rather than
         // reconnecting (note the mock has only one scripted connection).
-        roster_tx
-            .send_replace(vec![
-                watched_source(1, did),
-                WatchedSource {
-                    id: 2,
-                    kind: SourceKind::Feed,
-                    value: "at://did:plc:alice/app.bsky.feed.generator/whats-hot".to_string(),
-                    did: None,
-                    added_at: "2024-01-01T00:00:00Z".to_string(),
-                },
-            ])
-            .expect("roster reload");
+        roster_tx.send_replace(vec![
+            watched_source(1, did),
+            WatchedSource {
+                id: 2,
+                kind: SourceKind::Feed,
+                value: "at://did:plc:alice/app.bsky.feed.generator/whats-hot".to_string(),
+                did: None,
+                added_at: "2024-01-01T00:00:00Z".to_string(),
+            },
+        ]);
 
         // Give any (buggy) reconnect a real chance to happen; only one
         // connection may ever be made.

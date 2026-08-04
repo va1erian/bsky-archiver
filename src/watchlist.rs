@@ -105,7 +105,11 @@ mod tests {
 
         watchlist.reload(vec![
             source(1, Kind::Account, "alice.bsky.social"),
-            source(2, Kind::Feed, "at://did:plc:alice/app.bsky.feed.generator/x"),
+            source(
+                2,
+                Kind::Feed,
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+            ),
         ]);
         rx.changed().await.expect("roster channel is alive");
         assert_eq!(rx.borrow().len(), 2);
@@ -116,7 +120,11 @@ mod tests {
     fn account_and_feed_values_are_filtered() {
         let watchlist = Watchlist::new(vec![
             source(1, Kind::Account, "alice.bsky.social"),
-            source(2, Kind::Feed, "at://did:plc:alice/app.bsky.feed.generator/x"),
+            source(
+                2,
+                Kind::Feed,
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+            ),
             source(3, Kind::Account, "did:plc:bob"),
         ]);
 
@@ -133,9 +141,10 @@ mod tests {
     #[tokio::test]
     async fn reload_from_store_mirrors_the_database() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ArchiveStore::open(dir.path().join("archive"), dir.path().join("index.sqlite3"))
-            .await
-            .unwrap();
+        let store =
+            ArchiveStore::open(dir.path().join("archive"), dir.path().join("index.sqlite3"))
+                .await
+                .unwrap();
         store
             .add_watched_source(Kind::Account, "alice.bsky.social", Some("did:plc:alice"))
             .await

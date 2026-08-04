@@ -8,7 +8,7 @@
 use askama::Template;
 
 use crate::health::{Status, SubsystemHealth};
-use crate::storage::{Category, MediaSummary, PostSummary};
+use crate::storage::{Category, MediaSummary, PostSummary, SourceKind, WatchedSource};
 
 /// The running build's package version, surfaced on `/healthz` and in the
 /// web UI footer so ops can tell which build is deployed.
@@ -380,6 +380,70 @@ pub struct ConfigRow {
 pub struct ConfigTemplate {
     pub version: &'static str,
     pub rows: Vec<ConfigRow>,
+    pub sources: Vec<SourceRow>,
+    /// Inline error for the watched-sources panel (always `None` when the
+    /// page is first rendered; add/remove failures surface via htmx).
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// Sources (watch list)
+// ---------------------------------------------------------------------
+
+/// One row of the UI's watch-list table: a watched account or feed with a
+/// remove action. Mirrors [`crate::storage::WatchedSource`] plus
+/// presentation-only fields.
+pub struct SourceRow {
+    pub id: i64,
+    pub kind_label: &'static str,
+    pub kind_class: &'static str,
+    /// For accounts the handle or DID as entered; for feeds the `at://` URI.
+    pub value: String,
+    /// Resolved DID for account rows (the firehose subscribes by it); always
+    /// `None` for feeds, which aren't DID-scoped.
+    pub detail: Option<String>,
+    /// When the source was first added, RFC3339.
+    pub added_at: String,
+}
+
+/// Builds a [`SourceRow`] from a storage-layer [`WatchedSource`].
+pub fn source_row(source: &WatchedSource) -> SourceRow {
+    let (kind_label, kind_class) = match source.kind {
+        SourceKind::Account => ("Account", "badge-account"),
+        SourceKind::Feed => ("Feed", "badge-feed"),
+    };
+    SourceRow {
+        id: source.id,
+        kind_label,
+        kind_class,
+        value: source.value.clone(),
+        detail: source.did.clone(),
+        added_at: source.added_at.clone(),
+    }
+}
+
+/// The watcher panel fragment: the current sources with remove buttons and
+/// the add form. The `/sources` add and `/sources/:id` remove handlers both
+/// return this as an `outerHTML` swap of `#sources-panel`, so every change
+/// re-renders the panel from the database — the same markup the config page
+/// includes wholesale.
+#[derive(Template)]
+#[template(path = "sources_panel.html")]
+pub struct SourcesPanelTemplate {
+    pub sources: Vec<SourceRow>,
+    /// An inline error to show in the panel's `#sources-error` slot, e.g. an
+    /// unresolvable handle or an invalid feed URI. `None` renders the empty
+    /// slot.
+    pub error: Option<String>,
+}
+
+/// The inline error fragment shown for a failed add/remove:
+/// `HX-Retarget`+`HX-Reswap` route it into the panel's `#sources-error` slot
+/// so the forms stay put and the page isn't navigated.
+#[derive(Template)]
+#[template(path = "sources_error.html")]
+pub struct SourcesErrorTemplate {
+    pub message: String,
 }
 
 #[cfg(test)]

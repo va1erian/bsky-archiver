@@ -20,8 +20,9 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
 use crate::health::{HealthSnapshot, Status};
+use crate::poller;
 use crate::state::SharedAppState;
-use crate::storage::{ArchiveStore, Category, MediaSummary, PostSummary, StorageError};
+use crate::storage::{ArchiveStore, Category, MediaSummary, PostSummary, SourceKind, StorageError};
 use crate::templates;
 
 /// Total export size (in bytes) over which the gallery shows a soft
@@ -66,6 +67,8 @@ pub fn router(app: SharedAppState) -> Router {
         .route("/gallery/export", get(gallery_export))
         .route("/config", get(config_view))
         .route("/media/:category/:id/:filename", get(media_file))
+        .route("/sources", axum::routing::post(add_source))
+        .route("/sources/:id", axum::routing::post(remove_source))
         .route("/logout", axum::routing::post(logout))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
@@ -186,6 +189,7 @@ async fn healthz(State(state): State<WebState>) -> Response {
     let any_error = [
         &snapshot.firehose,
         &snapshot.rest_fallback,
+        &snapshot.feed_poller,
         &snapshot.likes_bookmarks,
         &snapshot.media_downloader,
     ]
@@ -233,6 +237,7 @@ async fn dashboard(State(state): State<WebState>) -> Result<Response, WebError> 
     let health = vec![
         templates::subsystem_row("Firehose", &snapshot.firehose),
         templates::subsystem_row("REST fallback", &snapshot.rest_fallback),
+        templates::subsystem_row("Feed poller", &snapshot.feed_poller),
         templates::subsystem_row("Likes & bookmarks", &snapshot.likes_bookmarks),
         templates::subsystem_row("Media downloader", &snapshot.media_downloader),
     ];
@@ -715,11 +720,6 @@ async fn config_view(State(state): State<WebState>) -> Response {
             redacted: true,
         },
         templates::ConfigRow {
-            key: "BSKY_WATCH_HANDLES",
-            value: config.bsky_watch_handles.join(", "),
-            redacted: false,
-        },
-        templates::ConfigRow {
             key: "ARCHIVE_DIR",
             value: config.archive_dir.display().to_string(),
             redacted: false,
@@ -765,10 +765,228 @@ async fn config_view(State(state): State<WebState>) -> Response {
             redacted: false,
         },
     ];
+    let sources = match state.app.store.list_watched_sources().await {
+        Ok(list) => list.iter().map(templates::source_row).collect(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load watched sources");
+            Vec::new()
+        }
+    };
     askama_axum::into_response(&templates::ConfigTemplate {
         version: templates::APP_VERSION,
         rows,
+        sources,
+        error: None,
     })
+}
+
+// ---------------------------------------------------------------------
+// Watched sources (UI-managed accounts + feeds, live-reloadable)
+// ---------------------------------------------------------------------
+//
+// `POST /sources` adds an account (handle or DID — resolved via the shared
+// Bluesky client before persisting) or a feed (`at://` URI — validated with
+// a single `getFeed` page fetch), then reloads the shared roster so the
+// firehose, REST fallback, and feed poller all pick it up immediately.
+// `POST /sources/:id` removes a row the same way. Both handlers sit behind
+// the session gate (see [`router`]), and every outbound call rides the
+// process-wide [`crate::ratelimit::RequestLimiter`] via the shared client,
+// matching how the background pollers make requests.
+
+#[derive(Debug, Deserialize)]
+struct AddSourceForm {
+    kind: String,
+    value: String,
+}
+
+async fn add_source(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<AddSourceForm>,
+) -> Response {
+    let value = form.value.trim().to_string();
+    let outcome = match form.kind.trim().parse::<SourceKind>() {
+        Ok(SourceKind::Account) => add_account_source(&state, &value).await,
+        Ok(SourceKind::Feed) => add_feed_source(&state, &value).await,
+        Err(_) => Err("unknown source kind: expected 'account' or 'feed'".to_string()),
+    };
+    source_mutation_response(state, headers, outcome).await
+}
+
+async fn add_account_source(state: &WebState, value: &str) -> Result<(), String> {
+    // A value that's already a DID is used verbatim; anything else is a
+    // handle resolved via the shared (request-limiter-riding) Bluesky
+    // client. An unresolvable handle is an inline error and leaves the
+    // watch list unchanged.
+    let did = if value.starts_with("did:") {
+        value.to_string()
+    } else {
+        match state.app.bluesky.resolve_handle(value).await {
+            Ok(did) => did,
+            Err(err) => {
+                tracing::warn!(handle = %value, error = %err, "failed to resolve new watch handle");
+                return Err(format!(
+                    "could not resolve handle {value:?} — check it and try again"
+                ));
+            }
+        }
+    };
+    persist_added_source(state, SourceKind::Account, value, Some(&did)).await?;
+    backfill_account(state, value);
+    Ok(())
+}
+
+async fn add_feed_source(state: &WebState, value: &str) -> Result<(), String> {
+    if !value.starts_with("at://") {
+        return Err(format!("{value:?} is not an at:// feed URI"));
+    }
+    // One `getFeed` page fetch proves the URI resolves and is fetchable
+    // before persisting it, so a typo or a private feed surfaces an inline
+    // error instead of silently watching nothing.
+    match state.app.bluesky.get_feed(value, None, 1).await {
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(feed = %value, error = %err, "failed to validate new feed");
+            return Err(format!(
+                "could not fetch feed {value:?} — is the at:// URI correct?"
+            ));
+        }
+    }
+    persist_added_source(state, SourceKind::Feed, value, None).await?;
+    backfill_feed(state, value);
+    Ok(())
+}
+
+/// Persists a source and live-reloads the shared roster so every producer
+/// observes the change without a restart.
+async fn persist_added_source(
+    state: &WebState,
+    kind: SourceKind,
+    value: &str,
+    did: Option<&str>,
+) -> Result<(), String> {
+    let _id = state
+        .app
+        .store
+        .add_watched_source(kind, value, did)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to persist watched source");
+            "failed to save watch target".to_string()
+        })?;
+    state
+        .app
+        .watchlist
+        .reload_from_store(&state.app.store)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to reload watch list after change");
+            "failed to reload watch list".to_string()
+        })
+}
+
+async fn remove_source(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Response {
+    let outcome = match state.app.store.remove_watched_source(id).await {
+        Ok(_) => state
+            .app
+            .watchlist
+            .reload_from_store(&state.app.store)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to reload watch list after remove");
+                "failed to reload watch list".to_string()
+            }),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to remove watch source");
+            Err("failed to remove watch target".to_string())
+        }
+    };
+    source_mutation_response(state, headers, outcome).await
+}
+
+/// The shared response for a source mutation request: an htmx request gets
+/// the watcher panel (with any error rendered inline inside it) swapped over
+/// `#sources-panel` via outerHTML; a plain no-JS form post redirects back to
+/// the config page.
+async fn source_mutation_response(
+    state: WebState,
+    headers: HeaderMap,
+    outcome: Result<(), String>,
+) -> Response {
+    if is_htmx_request(&headers) {
+        sources_panel(state, outcome.err()).await
+    } else {
+        Redirect::to("/config").into_response()
+    }
+}
+
+/// Renders the watcher panel from the current database roster plus an
+/// optional inline error. This is the response body for both source
+/// mutations and the markup the config page embeds.
+async fn sources_panel(state: WebState, error: Option<String>) -> Response {
+    let sources = match state.app.store.list_watched_sources().await {
+        Ok(list) => list.iter().map(templates::source_row).collect::<Vec<_>>(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to list watched sources");
+            return askama_axum::into_response(&templates::SourcesPanelTemplate {
+                sources: Vec::new(),
+                error: Some("failed to load watched sources".to_string()),
+            });
+        }
+    };
+    askama_axum::into_response(&templates::SourcesPanelTemplate { sources, error })
+}
+
+/// Kicks off an immediate backfill poll of a newly added account, handing
+/// archive-worthy posts straight into the producer -> downloader channel
+/// rather than waiting up to a full `POLL_INTERVAL_SECONDS`. Runs on the
+/// shared candidate channel (upgraded from the state's weak handle, so it
+/// degrades to a no-op once every producer has stopped) and rides the same
+/// request limiter as the background pollers.
+fn backfill_account(state: &WebState, handle: &str) {
+    let Some(sender) = state.app.candidates() else {
+        tracing::warn!("candidate channel closed; skipping immediate account backfill");
+        return;
+    };
+    let client = std::sync::Arc::clone(&state.app.bluesky);
+    let archive = state.app.store.clone();
+    let handle = handle.to_string();
+    tokio::spawn(async move {
+        match poller::backfill_account_once(&client, &archive, &sender, &handle).await {
+            Ok(new_count) => {
+                tracing::info!(handle = %handle, new_count, "immediate account backfill completed")
+            }
+            Err(err) => {
+                tracing::warn!(handle = %handle, error = %err, "immediate account backfill failed")
+            }
+        }
+    });
+}
+
+/// Kicks off an immediate backfill poll of a newly added feed, mirroring
+/// [`backfill_account`] for feeds.
+fn backfill_feed(state: &WebState, feed_uri: &str) {
+    let Some(sender) = state.app.candidates() else {
+        tracing::warn!("candidate channel closed; skipping immediate feed backfill");
+        return;
+    };
+    let client = std::sync::Arc::clone(&state.app.bluesky);
+    let archive = state.app.store.clone();
+    let feed_uri = feed_uri.to_string();
+    tokio::spawn(async move {
+        match poller::backfill_feed_once(&client, &archive, &sender, &feed_uri).await {
+            Ok(new_count) => {
+                tracing::info!(feed = %feed_uri, new_count, "immediate feed backfill completed")
+            }
+            Err(err) => {
+                tracing::warn!(feed = %feed_uri, error = %err, "immediate feed backfill failed")
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -813,6 +1031,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::json;
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     async fn test_state() -> (tempfile::TempDir, SharedAppState) {
@@ -826,7 +1045,6 @@ mod tests {
         let config = AppConfig {
             bsky_identifier: "alice.bsky.social".to_string(),
             bsky_app_password: Secret::from("bsky-app-password-secret".to_string()),
-            bsky_watch_handles: vec!["alice.bsky.social".to_string()],
             archive_dir,
             database_path: dir.path().join("index.sqlite3"),
             ui_password: Secret::from("correct horse battery staple".to_string()),
@@ -839,10 +1057,20 @@ mod tests {
         };
 
         let (_health_tx, health_rx) = health_channel();
+        let bluesky = Arc::new(crate::bluesky::BlueskyClient::new(
+            url::Url::parse("https://bsky.social").unwrap(),
+            "alice.bsky.social".to_string(),
+            Secret::from("bsky-app-password-secret".to_string()),
+        ));
+        let (candidate_tx, _candidate_rx) = crate::pipeline::candidate_post_channel(16);
+        let watchlist = crate::watchlist::Watchlist::new(Vec::new());
         let state: SharedAppState = Arc::new(AppState {
             config,
             store,
             health: health_rx,
+            bluesky,
+            candidate_weak: candidate_tx.downgrade(),
+            watchlist,
         });
         (dir, state)
     }
@@ -1749,5 +1977,323 @@ mod tests {
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, vec![0xFFu8; 8]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Watched sources (UI-managed watch list)
+    // ---------------------------------------------------------------------
+
+    /// A test state whose shared Bluesky client points at `base_uri` (a
+    /// wiremock server), so the sources routes' outbound resolve_handle /
+    /// get_feed / backfill calls are fully mocked. Returns the strong
+    /// candidate sender too, so the add-handlers' immediate-backfill tasks
+    /// can actually upgrade the weak handle (dropping it would simulate
+    /// shutdown and silently skip backfill).
+    async fn test_state_with_bluesky(
+        base_uri: url::Url,
+    ) -> (
+        tempfile::TempDir,
+        SharedAppState,
+        crate::pipeline::CandidatePostSender,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive_dir = dir.path().join("archive");
+        let database_path = dir.path().join("index.sqlite3");
+        let store = ArchiveStore::open(archive_dir.clone(), database_path)
+            .await
+            .expect("open store");
+
+        let config = AppConfig {
+            bsky_identifier: "alice.bsky.social".to_string(),
+            bsky_app_password: Secret::from("bsky-app-password-secret".to_string()),
+            archive_dir,
+            database_path: dir.path().join("index.sqlite3"),
+            ui_password: Secret::from("correct horse battery staple".to_string()),
+            ui_session_secret: Secret::from("a".repeat(64)),
+            ui_port: 8080,
+            poll_interval_seconds: 120,
+            jetstream_url: url::Url::parse("wss://jetstream.example.com/subscribe").unwrap(),
+            media_max_concurrent_downloads: 4,
+            media_max_bytes: 104_857_600,
+        };
+
+        let (candidate_tx, _candidate_rx) = crate::pipeline::candidate_post_channel(8);
+        let state: SharedAppState = Arc::new(AppState {
+            config,
+            store,
+            health: health_channel().1,
+            watchlist: crate::watchlist::Watchlist::new(Vec::new()),
+            bluesky: Arc::new(crate::bluesky::BlueskyClient::new(
+                base_uri,
+                "alice.bsky.social".to_string(),
+                Secret::from("bsky-app-password-secret".to_string()),
+            )),
+            candidate_weak: crate::pipeline::weak_from_sender(&candidate_tx),
+        });
+        (dir, state, candidate_tx)
+    }
+
+    async fn mount_ui_session(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessJwt": "token",
+                "refreshJwt": "refresh",
+                "did": "did:plc:alice",
+                "handle": "alice.bsky.social",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn add_source_form(
+        app: &Router,
+        cookie: &str,
+        body: &str,
+        htmx: bool,
+    ) -> (StatusCode, String) {
+        let mut request_builder = Request::post("/sources")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if htmx {
+            request_builder = request_builder.header("HX-Request", "true");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request_builder
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn sources_routes_require_authentication() {
+        let (_dir, state) = test_state().await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(Request::post("/sources").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+
+    #[tokio::test]
+    async fn adding_an_account_via_htmx_persists_resolves_reloads_and_backfills() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        mount_ui_session(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+            .and(query_param("handle", "bob.bsky.social"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"did": "did:plc:bob"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"feed": [], "cursor": null})),
+            )
+            .mount(&server)
+            .await;
+
+        let (_dir, state, _candidate_tx) =
+            test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let (status, body) =
+            add_source_form(&app, &cookie, "kind=account&value=bob.bsky.social", true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("id=\"sources-panel\""),
+            "fragment is the panel: {body}"
+        );
+        assert!(
+            body.contains("bob.bsky.social"),
+            "added account must appear: {body}"
+        );
+
+        // The account is persisted and the live roster reloaded.
+        let sources = state.store.list_watched_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].value, "bob.bsky.social");
+        assert_eq!(sources[0].did.as_deref(), Some("did:plc:bob"));
+        assert_eq!(state.watchlist.snapshot(), sources);
+
+        // Adding an account kicks an immediate backfill (not waiting for the
+        // next poll interval).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path() == "/xrpc/app.bsky.feed.getAuthorFeed")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("immediate backfill after adding an account");
+    }
+
+    #[tokio::test]
+    async fn adding_an_unresolvable_handle_returns_an_inline_error_and_persists_nothing() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        mount_ui_session(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+            .and(query_param("handle", "nobody.bsky.social"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "InvalidRequest",
+                "message": "unable to resolve handle",
+            })))
+            .mount(&server)
+            .await;
+
+        let (_dir, state, _candidate_tx) =
+            test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let (status, body) =
+            add_source_form(&app, &cookie, "kind=account&value=nobody.bsky.social", true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("could not resolve handle"),
+            "error must be inline in the panel: {body}"
+        );
+        assert!(
+            state.store.list_watched_sources().await.unwrap().is_empty(),
+            "an unresolvable handle must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_feed_validates_with_get_feed_and_persists_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        mount_ui_session(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"feed": [], "cursor": null})),
+            )
+            .mount(&server)
+            .await;
+
+        let (_dir, state, _candidate_tx) =
+            test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let feed_uri = "at://did:plc:alice/app.bsky.feed.generator/whats-hot";
+        let body = format!("kind=feed&value={feed_uri}");
+        let (status, response_body) = add_source_form(&app, &cookie, &body, true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            response_body.contains(feed_uri),
+            "added feed must appear: {response_body}"
+        );
+
+        let sources = state.store.list_watched_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].kind, SourceKind::Feed);
+        assert_eq!(sources[0].value, feed_uri);
+        assert_eq!(sources[0].did, None);
+    }
+
+    #[tokio::test]
+    async fn adding_a_malformed_feed_uri_returns_an_inline_error() {
+        let (_dir, state) = test_state().await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let (status, body) = add_source_form(
+            &app,
+            &cookie,
+            "kind=feed&value=https%3A%2F%2Fexample.com",
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("is not an at:// feed URI"),
+            "malformed feed must be rejected inline: {body}"
+        );
+        assert!(state.store.list_watched_sources().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_a_source_stops_watching_it_live() {
+        let (_dir, state) = test_state().await;
+        let id = state
+            .store
+            .add_watched_source(
+                SourceKind::Account,
+                "carol.bsky.social",
+                Some("did:plc:carol"),
+            )
+            .await
+            .unwrap();
+
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/sources/{id}"))
+                    .header(header::COOKIE, cookie)
+                    .header("HX-Request", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(
+            !body.contains("carol.bsky.social"),
+            "removed source must vanish: {body}"
+        );
+        assert!(
+            state.store.list_watched_sources().await.unwrap().is_empty(),
+            "removed source must be gone from the database"
+        );
+    }
+
+    /// Non-htmx (no-JS) source mutation posts redirect back to the config
+    /// page rather than returning a bare fragment.
+    #[tokio::test]
+    async fn non_htmx_source_mutation_redirects_to_config() {
+        let (_dir, state) = test_state().await;
+        let app = router(Arc::clone(&state));
+        let cookie = login(&app).await;
+
+        let (status, body) =
+            add_source_form(&app, &cookie, "kind=account&value=bob.bsky.social", false).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(body, "");
     }
 }

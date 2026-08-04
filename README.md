@@ -121,7 +121,6 @@ Docker Compose-style service definitions).
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `BSKY_WATCH_HANDLES` | `BSKY_IDENTIFIER` alone | Comma-separated list of handles/DIDs to watch for authored posts with media. |
 | `ARCHIVE_DIR` | `/data/archive` | Root directory for archived JSON records and media. **Must persist across restarts and upgrades** (mount a volume here). |
 | `DATABASE_PATH` | `<ARCHIVE_DIR>/index.sqlite3` | SQLite index file path. Safe to delete — it is rebuilt automatically from `ARCHIVE_DIR` on next startup — but persisting it avoids a slow reindex. |
 | `UI_PORT` | `8080` | Port the web UI listens on inside the container. |

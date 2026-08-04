@@ -52,7 +52,7 @@ use bsky_archiver::pipeline::{
 use bsky_archiver::poller::LikesBookmarksPoller;
 use bsky_archiver::poller::{PollerConfig, RestFallbackPoller};
 use bsky_archiver::state::{AppState, SharedAppState};
-use bsky_archiver::storage::{ArchiveStore, Category};
+use bsky_archiver::storage::{ArchiveStore, Category, SourceKind, WatchedSource};
 use bsky_archiver::web;
 
 const WATCHED_HANDLE: &str = "e2e.bsky.social";
@@ -62,7 +62,6 @@ fn test_config(archive_dir: std::path::PathBuf, database_path: std::path::PathBu
     AppConfig {
         bsky_identifier: WATCHED_HANDLE.to_string(),
         bsky_app_password: Secret::from("e2e-app-password".to_string()),
-        bsky_watch_handles: vec![WATCHED_HANDLE.to_string()],
         archive_dir,
         database_path,
         ui_password: Secret::from("e2e-ui-password".to_string()),
@@ -73,6 +72,21 @@ fn test_config(archive_dir: std::path::PathBuf, database_path: std::path::PathBu
         media_max_concurrent_downloads: 4,
         media_max_bytes: 10_000_000,
     }
+}
+
+/// A `watch::Receiver<Vec<WatchedSource>>` seeded with the account the tests
+/// watch, matching what `Watchlist::subscribe()` yields in production.
+fn seen_roster() -> tokio::sync::watch::Receiver<Vec<WatchedSource>> {
+    let sources = vec![WatchedSource {
+        id: 1,
+        kind: SourceKind::Account,
+        value: WATCHED_HANDLE.to_string(),
+        did: Some(WATCHED_DID.to_string()),
+        added_at: "2024-06-01T00:00:00Z".to_string(),
+    }];
+    let (tx, rx) = tokio::sync::watch::channel(sources);
+    drop(tx);
+    rx
 }
 
 async fn mount_login(server: &MockServer) {
@@ -210,6 +224,34 @@ async fn body_string(response: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+/// Builds the shared app state the web router needs: a real `ArchiveStore`,
+/// a live `Watchlist` loaded from the store, the shared Bluesky client, and a
+/// weak handle on the candidate channel. The strong sender stays with the
+/// caller (or, where no backfill is expected, drops — see
+/// [`AppState::candidates`]).
+async fn app_state(
+    config: AppConfig,
+    store: ArchiveStore,
+    bluesky: std::sync::Arc<BlueskyClient>,
+) -> SharedAppState {
+    let (_health_tx, health_rx) = health_channel();
+    let watchlist = bsky_archiver::watchlist::Watchlist::new(
+        store
+            .list_watched_sources()
+            .await
+            .expect("list watched sources"),
+    );
+    let (candidate_tx, _candidate_rx) = candidate_post_channel(16);
+    std::sync::Arc::new(AppState {
+        config,
+        store,
+        health: health_rx,
+        watchlist,
+        bluesky,
+        candidate_weak: bsky_archiver::pipeline::weak_from_sender(&candidate_tx),
+    })
+}
+
 #[tokio::test]
 async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -310,10 +352,10 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
     let cursor_path = dir.path().join("jetstream_cursor");
     let mut firehose_consumer = FirehoseConsumer::new(
         jetstream_url,
-        vec![WATCHED_DID.to_string()],
         cursor_path,
         firehose_candidate_tx,
         firehose_health_tx,
+        seen_roster(),
     );
     let (firehose_shutdown_tx, firehose_shutdown_rx) = tokio::sync::watch::channel(false);
     let firehose_handle = tokio::spawn(async move {
@@ -354,7 +396,7 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
         store.clone(),
         candidate_tx.clone(),
         rest_health_rx,
-        vec![WATCHED_HANDLE.to_string()],
+        seen_roster(),
         poller_config,
     );
     // `RestFallbackPoller::run` loops forever (there is no single-pass
@@ -453,12 +495,7 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
     // --- Assert: visible and correctly rendered via the real web UI
     // routes (list, detail, gallery), through a real `axum::Router`.
     let config = test_config(archive_dir, database_path);
-    let (_health_tx, health_rx) = health_channel();
-    let state: SharedAppState = std::sync::Arc::new(AppState {
-        config,
-        store: store.clone(),
-        health: health_rx,
-    });
+    let state = app_state(config, store.clone(), std::sync::Arc::clone(&client)).await;
 
     let app = web::router(state);
     let login_response = app
@@ -627,12 +664,12 @@ async fn gallery_export_streams_a_zip_of_images_only() {
         .unwrap();
 
     let config = test_config(archive_dir, database_path);
-    let (_health_tx, health_rx) = health_channel();
-    let state: SharedAppState = std::sync::Arc::new(AppState {
-        config,
-        store: store.clone(),
-        health: health_rx,
-    });
+    let throwaway_client = std::sync::Arc::new(BlueskyClient::new(
+        url::Url::parse("https://bsky.social").unwrap(),
+        WATCHED_HANDLE.to_string(),
+        Secret::from("e2e-app-password".to_string()),
+    ));
+    let state = app_state(config, store.clone(), throwaway_client).await;
     let app = web::router(state);
 
     let login_response = app
@@ -736,4 +773,157 @@ async fn gallery_export_streams_a_zip_of_images_only() {
         Some(b"the-original-image-bytes".as_ref()),
         "entry bytes must round-trip to the original file contents"
     );
+}
+
+/// End-to-end proof of the UI-managed watch list: a feed added through the
+/// real `POST /sources` route (against mocked Bluesky) is validated with
+/// `getFeed`, persisted, reloaded into the live roster, and immediately
+/// backfilled — its media post flowing through the real candidate channel and
+/// media downloader onto disk and into the index, with no restart anywhere.
+#[tokio::test]
+async fn feed_added_via_web_ui_is_validated_persisted_and_archived_end_to_end() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_dir = dir.path().join("archive");
+    let database_path = dir.path().join("index.sqlite3");
+    let store = ArchiveStore::open(archive_dir.clone(), database_path.clone())
+        .await
+        .expect("open store");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.server.createSession"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accessJwt": "e2e-token",
+            "refreshJwt": "e2e-refresh",
+            "did": WATCHED_DID,
+            "handle": WATCHED_HANDLE,
+        })))
+        .mount(&server)
+        .await;
+
+    let feed_uri = "at://did:plc:alice/app.bsky.feed.generator/whats-hot";
+    let feed_post_uri = "at://did:plc:e2e-feed-author/app.bsky.feed.post/e2e-feed";
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getFeed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [{"post": media_post_view(
+                &server.uri(),
+                "did:plc:e2e-feed-author",
+                "e2e-feed",
+                "an e2e feed post with media",
+                "/cdn/feed-image.jpg",
+            )}],
+            "cursor": null,
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/cdn/feed-image.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/jpeg")
+                .set_body_bytes(b"feed-image-bytes".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let client = std::sync::Arc::new(BlueskyClient::new(
+        url::Url::parse(&server.uri()).unwrap(),
+        WATCHED_HANDLE.to_string(),
+        Secret::from("e2e-app-password".to_string()),
+    ));
+
+    let config = test_config(archive_dir, database_path);
+    let (_health_tx, health_rx) = health_channel();
+    let watchlist = bsky_archiver::watchlist::Watchlist::new(Vec::new());
+    let (candidate_tx, mut candidate_rx) = candidate_post_channel(16);
+    let state: SharedAppState = std::sync::Arc::new(AppState {
+        config,
+        store: store.clone(),
+        health: health_rx,
+        watchlist,
+        bluesky: std::sync::Arc::clone(&client),
+        candidate_weak: bsky_archiver::pipeline::weak_from_sender(&candidate_tx),
+    });
+    let app = web::router(state);
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            Request::post("/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("password=e2e-ui-password"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login_response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("login sets a session cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // The media downloader consumes whatever the add-handler's immediate
+    // backfill produces.
+    let downloader = bsky_archiver::media::MediaDownloader::new(store.clone(), 4, 10_000_000);
+    let downloader_handle = tokio::spawn(async move {
+        downloader.run(&mut candidate_rx).await;
+    });
+
+    let add_response = app
+        .clone()
+        .oneshot(
+            Request::post("/sources")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, cookie)
+                .header("HX-Request", "true")
+                .body(Body::from(format!("kind=feed&value={feed_uri}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add_response.status(), StatusCode::OK);
+
+    // The feed's media post lands on disk and in the index, end to end.
+    let archived = wait_until(
+        Duration::from_secs(5),
+        &format!("feed post {feed_post_uri} archived with media"),
+        || async {
+            let record = store
+                .get_post(Category::Post, feed_post_uri)
+                .await
+                .unwrap()?;
+            if record.media.is_empty() {
+                None
+            } else {
+                Some(record)
+            }
+        },
+    )
+    .await;
+    assert_eq!(archived.media.len(), 1);
+
+    let bytes = store
+        .read_media(Category::Post, feed_post_uri, &archived.media[0].filename)
+        .await
+        .unwrap()
+        .expect("media file on disk");
+    assert_eq!(bytes, b"feed-image-bytes");
+
+    // The watch list in the DB now holds the feed (single source of truth).
+    let sources = store.list_watched_sources().await.unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].kind, bsky_archiver::storage::SourceKind::Feed);
+    assert_eq!(sources[0].value, feed_uri);
+
+    drop(candidate_tx);
+    downloader_handle.abort();
+    let _ = downloader_handle.await;
 }

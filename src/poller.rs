@@ -27,10 +27,12 @@ use crate::pipeline::{
     PostCategory, has_archivable_media,
 };
 use crate::ratelimit::{Backoff, BackoffConfig};
-use crate::storage::{ArchiveStore, Category, SaveOutcome, SourceKind, StorageError, WatchedSource};
+use crate::storage::{
+    ArchiveStore, Category, SaveOutcome, SourceKind, StorageError, WatchedSource,
+};
 
-/// How many feed items to request per `getAuthorFeed` page.
-const DEFAULT_PAGE_LIMIT: u32 = 50;
+/// How many feed items to request per `getAuthorFeed`/`getFeed` page.
+pub(crate) const DEFAULT_PAGE_LIMIT: u32 = 50;
 
 /// Tunables for the adaptive polling interval and the firehose-health
 /// grace period. All fields have sane production defaults
@@ -147,7 +149,7 @@ fn is_active(health: ConnectionHealth, now: Instant, grace_period: Duration) -> 
     }
 }
 
-/// The outcome of polling all watched handles once.
+/// The outcome of polling all watched sources once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CycleOutcome {
     NewContent,
@@ -157,14 +159,20 @@ enum CycleOutcome {
 
 /// Runs the REST-polling fallback until `sender` is dropped/closed. Meant
 /// to be spawned as a long-lived background task (`tokio::spawn`).
+///
+/// The set of accounts it polls is read live from the roster
+/// ([`crate::watchlist::Watchlist`]) on every tick rather than captured at
+/// construction, so a UI add/remove takes effect without a restart; a roster
+/// reload also wakes the loop's sleep so a new account is backfilled (via
+/// the fallback) promptly.
 pub struct RestFallbackPoller {
     client: std::sync::Arc<BlueskyClient>,
     archive: ArchiveStore,
     sender: CandidatePostSender,
     health_rx: ConnectionHealthReceiver,
     /// Live view of the watched-sources roster; the watched account set is
-    /// re-derived from it on every poll cycle ([`crate::watchlist::Watchlist`]),
-    /// so UI add/remove operations take effect without a restart.
+    /// re-derived from it on every poll cycle, so UI add/remove operations
+    /// take effect without a restart.
     watchlist_rx: watch::Receiver<Vec<WatchedSource>>,
     /// Whether `watchlist_rx` can still deliver reloads; set `false` once the
     /// channel closes so a dead roster can't spin the loop's sleep select.
@@ -173,6 +181,9 @@ pub struct RestFallbackPoller {
 }
 
 impl RestFallbackPoller {
+    /// `watchlist_rx` is the live watch-list receiver (see
+    /// [`crate::watchlist::Watchlist::subscribe`]); the poller re-reads it
+    /// every tick.
     pub fn new(
         client: std::sync::Arc<BlueskyClient>,
         archive: ArchiveStore,
@@ -261,11 +272,14 @@ impl RestFallbackPoller {
                     }
                 }
                 changed = self.watchlist_rx.changed(), if self.roster_alive => {
-                    // A live watch-list reload: re-read the roster and poll
-                    // again on the next loop iteration instead of sleeping
-                    // out the rest of the interval.
-                    if changed.is_err() || self.watchlist_rx.borrow_and_update().is_err() {
-                        self.roster_alive = false;
+                    // A live watch-list reload: falling through to the next
+                    // loop iteration re-reads the roster (and polls it) right
+                    // away instead of sleeping out the rest of the interval.
+                    match changed {
+                        Err(_) => self.roster_alive = false,
+                        Ok(()) => {
+                            let _ = self.watchlist_rx.borrow_and_update();
+                        }
                     }
                 }
             }
@@ -295,6 +309,8 @@ impl RestFallbackPoller {
         }
     }
 
+    /// Polls every account in the current roster once, snapshotting the
+    /// values up front so the roster guard is never held across an await.
     async fn poll_all_handles(&self) -> CycleOutcome {
         let mut any_new = false;
         let mut any_error = false;
@@ -332,11 +348,16 @@ impl RestFallbackPoller {
     }
 }
 
-/// Runs the feed poller until the candidate channel closes: pulls every
-/// watched feed via `app.bsky.feed.getFeed` on an adaptive interval,
-/// independent of firehose health (feeds are never subscribed on the
-/// firehose). The watched feeds are re-derived from the live roster each
-/// tick, so a UI add/remove takes effect without a restart.
+/// Polls every watched feed (`app.bsky.feed.getFeed`) on an adaptive
+/// interval, in addition to — and completely independent of — the
+/// firehose/REST-fallback account path. Feeds have no connection-health
+/// gating: they're fetched over REST unconditionally, paginated per feed
+/// with its own cursor, and their posts flow into the same
+/// [`CandidatePost`] pipeline as everything else.
+///
+/// The watched feed URIs are read live from the roster (via `watchlist_rx`)
+/// on every tick, and a roster reload (add/remove) wakes the loop's sleep so
+/// a UI change is acted on immediately.
 pub struct FeedPoller {
     client: std::sync::Arc<BlueskyClient>,
     archive: ArchiveStore,
@@ -349,6 +370,8 @@ pub struct FeedPoller {
 }
 
 impl FeedPoller {
+    /// `watchlist_rx` is the live watch-list receiver (see
+    /// [`crate::watchlist::Watchlist::subscribe`]).
     pub fn new(
         client: std::sync::Arc<BlueskyClient>,
         archive: ArchiveStore,
@@ -361,6 +384,7 @@ impl FeedPoller {
             archive,
             sender,
             watchlist_rx,
+            roster_alive: true,
             config,
         }
     }
@@ -455,14 +479,18 @@ impl FeedPoller {
             debug!(delay_ms = delay.as_millis() as u64, "feed poller sleeping");
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
-                changed = self.watchlist_rx.changed() => {
-                    if changed.is_err() {
-                        // The watchlist is gone (shutting down); keep polling
-                        // the last-known set on the normal cadence rather than
-                        // spinning on a closed channel.
-                        continue;
+                changed = self.watchlist_rx.changed(), if self.roster_alive => {
+                    // A live roster reload: falling out of this select
+                    // re-polls the (possibly updated) feed set on the next
+                    // loop iteration. On a closed roster channel, disable the
+                    // arm so the loop can't spin on a permanently-resolvable
+                    // `changed()`.
+                    match changed {
+                        Err(_) => self.roster_alive = false,
+                        Ok(()) => {
+                            let _ = self.watchlist_rx.borrow_and_update();
+                        }
                     }
-                    let _ = self.watchlist_rx.borrow_and_update();
                 }
             }
         }
@@ -471,6 +499,18 @@ impl FeedPoller {
 
 /// Page size used by the web UI's one-shot backfill passes.
 pub const BACKFILL_PAGE_LIMIT: u32 = 50;
+
+/// Errors from a single poll-and-drain pass over one account's authored feed
+/// or one watched feed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PollHandleError {
+    #[error(transparent)]
+    Bluesky(#[from] BlueskyError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("candidate post channel closed")]
+    ChannelClosed,
+}
 
 /// Errors from a single one-shot backfill pass ([`backfill_account_once`] /
 /// [`backfill_feed_once`]).
@@ -525,23 +565,12 @@ pub async fn backfill_feed_once(
         .map_err(BackfillError::from)
 }
 
-/// Errors from a single poll-and-drain pass over one handle's feed.
-#[derive(Debug, thiserror::Error)]
-enum PollHandleError {
-    #[error(transparent)]
-    Bluesky(#[from] BlueskyError),
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("candidate post channel closed")]
-    ChannelClosed,
-}
-
 /// Walks `handle`'s authored feed newest-first, one page at a time, until
 /// either the feed is exhausted or a post already present in `archive` is
 /// reached (the dedup boundary — everything older is assumed already
 /// archived). Archive-worthy posts found before that boundary are sent to
 /// `sender`. Returns how many new candidates were sent.
-async fn poll_handle_once(
+pub(crate) async fn poll_handle_once(
     client: &BlueskyClient,
     archive: &ArchiveStore,
     sender: &CandidatePostSender,
@@ -560,52 +589,9 @@ async fn poll_handle_once(
             break;
         }
 
-        for item in &page.feed {
-            let Some(post) = item.get("post") else {
-                continue;
-            };
-            let (Some(at_uri), Some(cid), Some(author_did)) = (
-                post.get("uri").and_then(|v| v.as_str()),
-                post.get("cid").and_then(|v| v.as_str()),
-                post.get("author")
-                    .and_then(|a| a.get("did"))
-                    .and_then(|v| v.as_str()),
-            ) else {
-                warn!("rest poller skipping feed item missing uri/cid/author.did");
-                continue;
-            };
-
-            if archive.is_archived(Category::Post, at_uri).await? {
-                debug!(at_uri, "rest poller reached dedup boundary");
-                return Ok(new_count);
-            }
-
-            let Some(record) = post.get("record") else {
-                continue;
-            };
-            if !has_archivable_media(record) {
-                continue;
-            }
-
-            let media = post
-                .get("embed")
-                .map(extract_media_from_view)
-                .unwrap_or_default();
-
-            let candidate = CandidatePost {
-                at_uri: at_uri.to_string(),
-                cid: cid.to_string(),
-                author_did: author_did.to_string(),
-                category: PostCategory::Authored,
-                record: record.clone(),
-                media,
-            };
-
-            sender
-                .send(candidate)
-                .await
-                .map_err(|_| PollHandleError::ChannelClosed)?;
-            new_count += 1;
+        match drain_feed_items(archive, sender, &page.feed, new_count).await? {
+            DrainOutcome::DedupBoundary => break,
+            DrainOutcome::Continue(count) => new_count = count,
         }
 
         match page.cursor {
@@ -617,11 +603,11 @@ async fn poll_handle_once(
     Ok(new_count)
 }
 
-/// Walks `feed_uri`'s posts newest-first via `app.bsky.feed.getFeed`, one
-/// page at a time, until either the feed is exhausted or a post already
-/// present in `archive` is reached (the dedup boundary — everything older
-/// is assumed already archived). Archive-worthy posts found before that
-/// boundary are sent to `sender`. Returns how many new candidates were sent.
+/// Walks a watched feed (an `at://` `app.bsky.feed.generator` URI) newest-
+/// first via `app.bsky.feed.getFeed`, one page at a time, until either the
+/// feed is exhausted or a post already present in `archive` is reached (the
+/// dedup boundary). Archive-worthy posts found before that boundary are sent
+/// to `sender`. Returns how many new candidates were sent.
 async fn poll_feed_once(
     client: &BlueskyClient,
     archive: &ArchiveStore,
@@ -633,58 +619,17 @@ async fn poll_feed_once(
     let mut new_count = 0usize;
 
     loop {
-        let page = client.get_feed(feed_uri, cursor.as_deref(), page_limit).await?;
+        let page = client
+            .get_feed(feed_uri, cursor.as_deref(), page_limit)
+            .await?;
 
         if page.feed.is_empty() {
             break;
         }
 
-        for item in &page.feed {
-            let Some(post) = item.get("post") else {
-                continue;
-            };
-            let (Some(at_uri), Some(cid), Some(author_did)) = (
-                post.get("uri").and_then(|v| v.as_str()),
-                post.get("cid").and_then(|v| v.as_str()),
-                post.get("author")
-                    .and_then(|a| a.get("did"))
-                    .and_then(|v| v.as_str()),
-            ) else {
-                warn!("feed poller skipping feed item missing uri/cid/author.did");
-                continue;
-            };
-
-            if archive.is_archived(Category::Post, at_uri).await? {
-                debug!(at_uri, "feed poller reached dedup boundary");
-                return Ok(new_count);
-            }
-
-            let Some(record) = post.get("record") else {
-                continue;
-            };
-            if !has_archivable_media(record) {
-                continue;
-            }
-
-            let media = post
-                .get("embed")
-                .map(extract_media_from_view)
-                .unwrap_or_default();
-
-            let candidate = CandidatePost {
-                at_uri: at_uri.to_string(),
-                cid: cid.to_string(),
-                author_did: author_did.to_string(),
-                category: PostCategory::Authored,
-                record: record.clone(),
-                media,
-            };
-
-            sender
-                .send(candidate)
-                .await
-                .map_err(|_| PollHandleError::ChannelClosed)?;
-            new_count += 1;
+        match drain_feed_items(archive, sender, &page.feed, new_count).await? {
+            DrainOutcome::DedupBoundary => break,
+            DrainOutcome::Continue(count) => new_count = count,
         }
 
         match page.cursor {
@@ -694,6 +639,77 @@ async fn poll_feed_once(
     }
 
     Ok(new_count)
+}
+
+/// The outcome of draining one page of feed items.
+enum DrainOutcome {
+    /// An already-archived post was hit: defer to the caller, which must stop
+    /// paginating.
+    DedupBoundary,
+    /// The whole page was consumed; `count` is the running new-candidate
+    /// count.
+    Continue(usize),
+}
+
+/// Drains one page of `feed` items (as returned by `getAuthorFeed`/
+/// `getFeed`), sending archive-worthy posts to `sender` and deferring to the
+/// caller once the first already-archived post (the dedup boundary) is
+/// reached.
+async fn drain_feed_items(
+    archive: &ArchiveStore,
+    sender: &CandidatePostSender,
+    feed: &[serde_json::Value],
+    mut new_count: usize,
+) -> Result<DrainOutcome, PollHandleError> {
+    for item in feed {
+        let Some(post) = item.get("post") else {
+            continue;
+        };
+        let (Some(at_uri), Some(cid), Some(author_did)) = (
+            post.get("uri").and_then(|v| v.as_str()),
+            post.get("cid").and_then(|v| v.as_str()),
+            post.get("author")
+                .and_then(|a| a.get("did"))
+                .and_then(|v| v.as_str()),
+        ) else {
+            warn!("poller skipping feed item missing uri/cid/author.did");
+            continue;
+        };
+
+        if archive.is_archived(Category::Post, at_uri).await? {
+            debug!(at_uri, "poller reached dedup boundary");
+            return Ok(DrainOutcome::DedupBoundary);
+        }
+
+        let Some(record) = post.get("record") else {
+            continue;
+        };
+        if !has_archivable_media(record) {
+            continue;
+        }
+
+        let media = post
+            .get("embed")
+            .map(extract_media_from_view)
+            .unwrap_or_default();
+
+        let candidate = CandidatePost {
+            at_uri: at_uri.to_string(),
+            cid: cid.to_string(),
+            author_did: author_did.to_string(),
+            category: PostCategory::Authored,
+            record: record.clone(),
+            media,
+        };
+
+        sender
+            .send(candidate)
+            .await
+            .map_err(|_| PollHandleError::ChannelClosed)?;
+        new_count += 1;
+    }
+
+    Ok(DrainOutcome::Continue(new_count))
 }
 
 /// Extracts downloadable media from a hydrated embed *view* (as returned
@@ -1015,56 +1031,9 @@ mod tests {
     use super::*;
     use crate::config::Secret;
     use crate::pipeline::{candidate_post_channel, connection_health_channel};
-    use crate::storage::SourceKind as StoredSourceKind;
     use serde_json::json;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// A live watch-list receiver seeded with the given account values; the
-    /// matching `watch::Sender` is dropped, mirroring the app where
-    /// [`crate::watchlist::Watchlist`] outlives the producers.
-    fn account_roster(accounts: &[String]) -> watch::Receiver<Vec<WatchedSource>> {
-        let sources: Vec<WatchedSource> = accounts
-            .iter()
-            .enumerate()
-            .map(|(i, value)| WatchedSource {
-                id: i as i64 + 1,
-                kind: SourceKind::Account,
-                value: value.clone(),
-                did: Some(format!("did:plc:test-{i}")),
-                added_at: "2024-01-01T00:00:00Z".to_string(),
-            })
-            .collect();
-        let (tx, rx) = watch::channel(sources);
-        drop(tx);
-        rx
-    }
-
-    /// A live watch-list receiver seeded with the given feed URIs plus one
-    /// account (so the feed poller's filtering can be observed).
-    fn feed_roster(feeds: &[String]) -> watch::Receiver<Vec<WatchedSource>> {
-        let mut sources: Vec<WatchedSource> = feeds
-            .iter()
-            .enumerate()
-            .map(|(i, value)| WatchedSource {
-                id: i as i64 + 1,
-                kind: StoredSourceKind::Feed,
-                value: value.clone(),
-                did: None,
-                added_at: "2024-01-01T00:00:00Z".to_string(),
-            })
-            .collect();
-        sources.push(WatchedSource {
-            id: 99,
-            kind: StoredSourceKind::Account,
-            value: "account.bsky.social".to_string(),
-            did: Some("did:plc:account".to_string()),
-            added_at: "2024-01-01T00:00:00Z".to_string(),
-        });
-        let (tx, rx) = watch::channel(sources);
-        drop(tx);
-        rx
-    }
 
     fn feed_view_post(n: u32, with_media: bool) -> serde_json::Value {
         let record = if with_media {
@@ -1188,6 +1157,45 @@ mod tests {
 
     fn bookmark_wrap(post: serde_json::Value) -> serde_json::Value {
         json!({ "subject": post["post"] })
+    }
+
+    fn account_source(id: i64, value: &str, did: &str) -> WatchedSource {
+        WatchedSource {
+            id,
+            kind: SourceKind::Account,
+            value: value.to_string(),
+            did: Some(did.to_string()),
+            added_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn feed_source(id: i64, uri: &str) -> WatchedSource {
+        WatchedSource {
+            id,
+            kind: SourceKind::Feed,
+            value: uri.to_string(),
+            did: None,
+            added_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// A roster receiver seeded with the given accounts (the sender is
+    /// dropped, exactly the closed-channel case tests must tolerate).
+    fn account_roster(values: &[(&str, &str)]) -> watch::Receiver<Vec<WatchedSource>> {
+        let sources = values
+            .iter()
+            .enumerate()
+            .map(|(i, (value, did))| account_source(i as i64 + 1, value, did))
+            .collect();
+        let (_tx, rx) = watch::channel(sources);
+        rx
+    }
+
+    async fn wait_for_candidate(mut rx: crate::pipeline::CandidatePostReceiver) -> CandidatePost {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("candidate received in time")
+            .expect("channel open")
     }
 
     #[tokio::test]
@@ -1345,10 +1353,10 @@ mod tests {
             store,
             tx,
             health_rx,
-            account_roster(&["alice.bsky.social".to_string()]),
+            account_roster(&[("alice.bsky.social", "did:plc:alice")]),
             config,
         );
-        tokio::spawn(poller.run());
+        let handle = tokio::spawn(poller.run());
 
         // While healthy, waiting well past several health-recheck/baseline
         // intervals must never trigger a poll.
@@ -1371,6 +1379,115 @@ mod tests {
                 .any(|r| r.url.path() == "/xrpc/app.bsky.feed.getAuthorFeed"),
             "expected a poll once disconnected, got: {requests:?}"
         );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rest_fallback_polls_only_account_sources_not_feeds() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        let (_dir, store) = open_store().await;
+        let (tx, _rx) = candidate_post_channel(8);
+        let (_, health_rx) = connection_health_channel(ConnectionHealth::Disabled);
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"feed": [], "cursor": null})),
+            )
+            .mount(&server)
+            .await;
+
+        // The roster holds one account and one feed; the fallback must only
+        // ever poll the account.
+        let (_roster_tx, roster) = watch::channel(vec![
+            account_source(1, "alice.bsky.social", "did:plc:alice"),
+            feed_source(2, "at://did:plc:alice/app.bsky.feed.generator/whats-hot"),
+        ]);
+
+        let poller = RestFallbackPoller::new(
+            make_client(&server),
+            store,
+            tx,
+            health_rx,
+            roster,
+            PollerConfig::new(Duration::from_secs(60)),
+        );
+
+        assert_eq!(poller.poll_all_handles().await, CycleOutcome::Empty);
+
+        let requests = server.received_requests().await.unwrap();
+        let polls: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/xrpc/app.bsky.feed.getAuthorFeed")
+            .collect();
+        assert_eq!(polls.len(), 1, "exactly one account poll: {polls:?}");
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.url.path() == "/xrpc/app.bsky.feed.getFeed"),
+            "feeds must not be polled by the rest fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_fallback_polls_a_newly_added_account_on_reload() {
+        let server = MockServer::start().await;
+        mount_login(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"feed": [], "cursor": null})),
+            )
+            .mount(&server)
+            .await;
+
+        let (_dir, store) = open_store().await;
+        let (tx, _rx) = candidate_post_channel(8);
+        let (_, health_rx) = connection_health_channel(ConnectionHealth::Disabled);
+
+        let (roster_tx, roster) = watch::channel(vec![account_source(
+            1,
+            "alice.bsky.social",
+            "did:plc:alice",
+        )]);
+
+        let poller = RestFallbackPoller::new(
+            make_client(&server),
+            store,
+            tx,
+            health_rx,
+            roster,
+            PollerConfig::new(Duration::from_secs(60)),
+        );
+
+        // Adding an account via the UI reloads the roster; the fallback must
+        // pick it up on its next poll. `send_replace` returns the previous
+        // roster, which is not what this test is checking.
+        roster_tx.send_replace(vec![
+            account_source(1, "alice.bsky.social", "did:plc:alice"),
+            account_source(3, "bob.bsky.social", "did:plc:bob"),
+        ]);
+
+        assert_eq!(poller.poll_all_handles().await, CycleOutcome::Empty);
+        let requests = server.received_requests().await.unwrap();
+        let polls: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/xrpc/app.bsky.feed.getAuthorFeed")
+            .collect();
+        assert_eq!(polls.len(), 2, "{polls:?}");
+        let queries: Vec<&str> = polls
+            .iter()
+            .map(|r| r.url.query().unwrap_or_default())
+            .collect();
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.contains("actor=alice.bsky.social"))
+        );
+        assert!(queries.iter().any(|q| q.contains("actor=bob.bsky.social")));
     }
 
     #[tokio::test]
@@ -1668,15 +1785,6 @@ mod tests {
         assert!(rx.try_recv().is_err(), "text-only post has no media");
     }
 
-    // `LikesBookmarksPoller::run` used to compute its own backoff via a
-    // private `backoff_delay` free function (tested here directly as
-    // `backoff_delay_grows_and_caps`). AR-13 replaced that ad hoc backoff
-    // with the shared `ratelimit::Backoff` policy, which has its own
-    // dedicated growth/cap/circuit-breaker test suite in `ratelimit.rs` —
-    // so that coverage now lives there instead of being duplicated here.
-    // What's still poller-specific (and still covered below) is extracting
-    // a server-provided retry hint out of a failed poll pass.
-
     #[test]
     fn poll_error_retry_after_extracts_bluesky_hint() {
         let bluesky_err = PollError::Bluesky(BlueskyError::Api {
@@ -1709,5 +1817,221 @@ mod tests {
     fn extract_media_refs_ignores_unknown_embed() {
         let embed = json!({"$type": "app.bsky.embed.external#view"});
         assert!(extract_media_refs(&embed).is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Feed poller + live-roster reload behavior
+    // ---------------------------------------------------------------------
+
+    const FEED_URI: &str = "at://did:plc:alice/app.bsky.feed.generator/whats-hot";
+
+    #[tokio::test]
+    async fn feed_poll_walks_to_dedup_boundary_and_sends_media_candidates() {
+        let server = MockServer::start().await;
+        mount_login(&server).await;
+        let (_dir, store) = open_store().await;
+
+        // The oldest item is already archived; hitting it must stop
+        // pagination so the would-be page 3 is never requested.
+        store
+            .save_post(
+                Category::Post,
+                "at://did:plc:alice/app.bsky.feed.post/1",
+                "cid-1",
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .and(query_param("feed", FEED_URI))
+            .and(query_param("cursor", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [feed_view_post(1, true)],
+                "cursor": "page-3-should-never-be-requested",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .and(query_param("feed", FEED_URI))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [feed_view_post(3, true), feed_view_post(2, false)],
+                "cursor": "page-2",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tx, mut rx) = candidate_post_channel(8);
+        let client = test_client(&server);
+        let new_count = poll_feed_once(&client, &store, &tx, FEED_URI, 50)
+            .await
+            .expect("feed poll succeeds");
+
+        assert_eq!(new_count, 1, "only the media post is newly sent");
+        drop(tx);
+        let sent = rx.recv().await.expect("candidate sent");
+        assert_eq!(sent.at_uri, "at://did:plc:alice/app.bsky.feed.post/3");
+        assert_eq!(sent.category, PostCategory::Authored);
+        assert_eq!(sent.media.len(), 1);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn feed_poller_run_archives_media_posts_and_wakes_on_roster_reload() {
+        let server = MockServer::start().await;
+        mount_login(&server).await;
+        let (_dir, store) = open_store().await;
+        let (tx, rx) = candidate_post_channel(8);
+
+        let (roster_tx, roster_rx) = watch::channel(vec![feed_source(1, FEED_URI)]);
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [feed_view_post(5, true)],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let poller = FeedPoller::new(
+            make_client(&server),
+            store,
+            tx,
+            roster_rx,
+            PollerConfig::new(Duration::from_millis(200)),
+        );
+        let poller_handle = tokio::spawn(poller.run());
+
+        let candidate = wait_for_candidate(rx).await;
+        assert_eq!(candidate.at_uri, "at://did:plc:alice/app.bsky.feed.post/5");
+        assert_eq!(candidate.category, PostCategory::Authored);
+
+        // A roster reload must wake the poller into an immediate extra poll.
+        let before_wake = server.received_requests().await.unwrap().len();
+        roster_tx.send_replace(vec![feed_source(1, FEED_URI)]);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let after_wake = server.received_requests().await.unwrap().len();
+        assert!(
+            after_wake > before_wake,
+            "roster reload should wake the feed poller for an immediate poll"
+        );
+
+        poller_handle.abort();
+        let _ = poller_handle.await;
+    }
+
+    #[tokio::test]
+    async fn feed_poller_wakes_to_poll_a_newly_added_feed() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        let feed_uri = "at://did:plc:alice/app.bsky.feed.generator/fresh";
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .and(query_param("feed", feed_uri))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [feed_view_post(6, true)],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let (_dir, store) = open_store().await;
+        let (tx, rx) = candidate_post_channel(8);
+        let (roster_tx, roster_rx) = watch::channel(Vec::new());
+
+        let poller = FeedPoller::new(
+            make_client(&server),
+            store,
+            tx,
+            roster_rx,
+            PollerConfig::new(Duration::from_millis(200)),
+        );
+        let poller_handle = tokio::spawn(poller.run());
+
+        // An empty roster means no feed requests at all.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path() == "/xrpc/app.bsky.feed.getFeed"),
+            "no feed to poll yet"
+        );
+
+        // The UI adds the feed: the roster reload wakes the poller.
+        roster_tx.send_replace(vec![feed_source(1, feed_uri)]);
+        let candidate = wait_for_candidate(rx).await;
+        assert_eq!(candidate.at_uri, "at://did:plc:alice/app.bsky.feed.post/6");
+
+        poller_handle.abort();
+        let _ = poller_handle.await;
+    }
+
+    #[tokio::test]
+    async fn backfill_account_once_archives_media_candidates() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [feed_view_post(7, true)],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let (_dir, store) = open_store().await;
+        let (tx, mut rx) = candidate_post_channel(8);
+        let client = test_client(&server);
+        let new_count = backfill_account_once(&client, &store, &tx, "bob.bsky.social")
+            .await
+            .expect("backfill succeeds");
+        assert_eq!(new_count, 1);
+
+        drop(tx);
+        let sent = rx.recv().await.expect("candidate sent");
+        assert_eq!(sent.at_uri, "at://did:plc:alice/app.bsky.feed.post/7");
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn backfill_feed_once_archives_only_archive_worthy_posts() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getFeed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [
+                    feed_view_post(8, true),
+                    { "post": { "uri": "at://did:plc:alice/app.bsky.feed.post/two", "cid": "cid", "author": {"did": "did:plc:alice"}, "record": {"text": "no media"} } },
+                ],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let (_dir, store) = open_store().await;
+        let (tx, mut rx) = candidate_post_channel(8);
+        let client = test_client(&server);
+        let new_count = backfill_feed_once(&client, &store, &tx, FEED_URI)
+            .await
+            .expect("backfill succeeds");
+        assert_eq!(new_count, 1);
+
+        drop(tx);
+        let sent = rx.recv().await.expect("candidate sent");
+        assert_eq!(sent.at_uri, "at://did:plc:alice/app.bsky.feed.post/8");
+        assert!(rx.recv().await.is_none(), "text-only post skipped");
     }
 }

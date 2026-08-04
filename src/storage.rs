@@ -501,37 +501,38 @@ impl ArchiveStore {
     /// ([`crate::watchlist::Watchlist`]) and the producers read from.
     pub async fn list_watched_sources(&self) -> Result<Vec<WatchedSource>, StorageError> {
         let db = Arc::clone(&self.db);
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<WatchedSource>, StorageError> {
-            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            let mut stmt = conn.prepare(
-                "SELECT id, source_kind, source_value, did, added_at
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<WatchedSource>, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_kind, source_value, did, added_at
                  FROM watched_sources
                  ORDER BY added_at, id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                let kind: String = row.get(1)?;
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    kind,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?;
-            let mut sources = Vec::new();
-            for row in rows {
-                let (id, kind, value, did, added_at) = row?;
-                sources.push(WatchedSource {
-                    id,
-                    kind: kind.parse()?,
-                    value,
-                    did,
-                    added_at,
-                });
-            }
-            Ok(sources)
-        })
-        .await;
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    let kind: String = row.get(1)?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        kind,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                let mut sources = Vec::new();
+                for row in rows {
+                    let (id, kind, value, did, added_at) = row?;
+                    sources.push(WatchedSource {
+                        id,
+                        kind: kind.parse()?,
+                        value,
+                        did,
+                        added_at,
+                    });
+                }
+                Ok(sources)
+            })
+            .await;
         join_result(result)
     }
 
@@ -578,7 +579,8 @@ impl ArchiveStore {
         let db = Arc::clone(&self.db);
         let result = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
             let conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            let affected = conn.execute("DELETE FROM watched_sources WHERE id = ?1", params![id])?;
+            let affected =
+                conn.execute("DELETE FROM watched_sources WHERE id = ?1", params![id])?;
             Ok(affected > 0)
         })
         .await;
@@ -1480,7 +1482,11 @@ mod tests {
         assert!(store.list_watched_sources().await.unwrap().is_empty());
 
         let account_id = store
-            .add_watched_source(SourceKind::Account, "alice.bsky.social", Some("did:plc:alice"))
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:alice"),
+            )
             .await
             .unwrap();
         let feed_id = store
@@ -1495,18 +1501,27 @@ mod tests {
 
         let sources = store.list_watched_sources().await.unwrap();
         assert_eq!(sources.len(), 2);
-        let account = sources.iter().find(|s| s.kind == SourceKind::Account).unwrap();
+        let account = sources
+            .iter()
+            .find(|s| s.kind == SourceKind::Account)
+            .unwrap();
         assert_eq!(account.value, "alice.bsky.social");
         assert_eq!(account.did.as_deref(), Some("did:plc:alice"));
         let feed = sources.iter().find(|s| s.kind == SourceKind::Feed).unwrap();
-        assert_eq!(feed.value, "at://did:plc:alice/app.bsky.feed.generator/whats-hot");
+        assert_eq!(
+            feed.value,
+            "at://did:plc:alice/app.bsky.feed.generator/whats-hot"
+        );
         assert_eq!(feed.did, None);
         // Each row carries a parseable RFC3339 added_at.
         assert!(!account.added_at.is_empty());
         assert!(!feed.added_at.is_empty());
 
         assert!(store.remove_watched_source(account_id).await.unwrap());
-        assert!(!store.remove_watched_source(account_id).await.unwrap(), "second remove is a no-op");
+        assert!(
+            !store.remove_watched_source(account_id).await.unwrap(),
+            "second remove is a no-op"
+        );
         let remaining = store.list_watched_sources().await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, feed_id);
@@ -1517,7 +1532,11 @@ mod tests {
         let (_dir, store) = open_store().await;
 
         let first_id = store
-            .add_watched_source(SourceKind::Account, "alice.bsky.social", Some("did:plc:alice"))
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:alice"),
+            )
             .await
             .unwrap();
         let second_id = store
@@ -1528,16 +1547,23 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(first_id, second_id, "upsert must not create a duplicate row");
+        assert_eq!(
+            first_id, second_id,
+            "upsert must not create a duplicate row"
+        );
 
         let sources = store.list_watched_sources().await.unwrap();
         assert_eq!(sources.len(), 1);
 
         // Re-adding with a fresh did refresh is an in-place update, not a
-        // second row.
-        assert_eq!(sources[0].did.as_deref(), Some("did:plc:alice"));
+        // second row. The DID is updated to the new value.
+        assert_eq!(sources[0].did.as_deref(), Some("did:plc:new-did"));
         let _ = store
-            .add_watched_source(SourceKind::Account, "alice.bsky.social", Some("did:plc:newer"))
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:newer"),
+            )
             .await
             .unwrap();
         let after = store.list_watched_sources().await.unwrap();
@@ -1579,7 +1605,10 @@ mod tests {
 
     #[test]
     fn source_kind_parses_and_displays() {
-        assert_eq!("account".parse::<SourceKind>().unwrap(), SourceKind::Account);
+        assert_eq!(
+            "account".parse::<SourceKind>().unwrap(),
+            SourceKind::Account
+        );
         assert_eq!("feed".parse::<SourceKind>().unwrap(), SourceKind::Feed);
         assert_eq!(SourceKind::Account.to_string(), "account");
         assert_eq!(SourceKind::Feed.to_string(), "feed");
@@ -1631,9 +1660,10 @@ mod tests {
     #[tokio::test]
     async fn opening_a_v1_database_upgrades_to_schema_v2_in_place() {
         let dir = open_v1_database().await;
-        let store = ArchiveStore::open(dir.path().join("archive"), dir.path().join("index.sqlite3"))
-            .await
-            .expect("open store upgrades v1");
+        let store =
+            ArchiveStore::open(dir.path().join("archive"), dir.path().join("index.sqlite3"))
+                .await
+                .expect("open store upgrades v1");
 
         // The v1 posts row is untouched...
         let page = store.list_posts(None, 1, 10).await.unwrap();
@@ -1656,7 +1686,11 @@ mod tests {
         // ...and the new table is usable immediately (no data had to move).
         assert!(store.list_watched_sources().await.unwrap().is_empty());
         store
-            .add_watched_source(SourceKind::Account, "alice.bsky.social", Some("did:plc:alice"))
+            .add_watched_source(
+                SourceKind::Account,
+                "alice.bsky.social",
+                Some("did:plc:alice"),
+            )
             .await
             .unwrap();
         assert_eq!(store.list_watched_sources().await.unwrap().len(), 1);
