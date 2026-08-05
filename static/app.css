@@ -609,3 +609,12 @@ nav form {
   min-height: 0;
   width: auto;
 }
+
+.app-footer {
+  margin-top: 3rem;
+  padding: 1rem 0;
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--pico-muted-color, #6b7280);
+  border-top: 1px solid var(--pico-muted-border-color, #ccc);
+}

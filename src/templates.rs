@@ -252,6 +252,7 @@ pub struct CategoryOption {
 #[derive(Template)]
 #[template(path = "posts.html")]
 pub struct PostsTemplate {
+    pub version: &'static str,
     pub rows: Vec<PostRow>,
     pub pagination: Pagination,
     pub category_options: Vec<CategoryOption>,
@@ -274,6 +275,7 @@ pub struct PostMedia {
 #[derive(Template)]
 #[template(path = "post_detail.html")]
 pub struct PostDetailTemplate {
+    pub version: &'static str,
     pub category_label: &'static str,
     pub category_badge_class: &'static str,
     pub author: String,
@@ -345,6 +347,7 @@ pub struct GalleryExport {
 #[derive(Template)]
 #[template(path = "gallery.html")]
 pub struct GalleryTemplate {
+    pub version: &'static str,
     pub items: Vec<GalleryItem>,
     pub pagination: Pagination,
     pub category_options: Vec<CategoryOption>,
