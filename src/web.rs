@@ -1551,6 +1551,7 @@ mod tests {
             body.contains(&format!("bsky-archiver v{}", env!("CARGO_PKG_VERSION"))),
             "version footer missing"
         );
+        assert!(body.contains("Hello World"), "Hello World text missing");
     }
 
     #[tokio::test]
