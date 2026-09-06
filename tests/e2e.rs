@@ -298,13 +298,19 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
     Mock::given(method("GET"))
         .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "bookmarks": [{"subject": media_post_view(
-                &server.uri(),
-                "did:plc:e2e-bookmarked-author",
-                "e2e-bookmarked",
-                "an e2e bookmarked post with media",
-                "/cdn/bookmark-image.jpg",
-            )}],
+            "bookmarks": [{
+                "subject": {
+                    "uri": "at://did:plc:e2e-bookmarked-author/app.bsky.feed.post/e2e-bookmarked",
+                    "cid": "cid-e2e-bookmarked",
+                },
+                "item": media_post_view(
+                    &server.uri(),
+                    "did:plc:e2e-bookmarked-author",
+                    "e2e-bookmarked",
+                    "an e2e bookmarked post with media",
+                    "/cdn/bookmark-image.jpg",
+                ),
+            }],
             "cursor": null,
         })))
         .mount(&server)

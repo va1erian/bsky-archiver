@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::bluesky::{BlueskyClient, BlueskyError, PostView};
+use crate::bluesky::{BlueskyClient, BlueskyError, BookmarkItem, PostView};
 use crate::pipeline::{
     CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver, MediaRef,
     PostCategory, has_archivable_media,
@@ -913,8 +913,12 @@ impl LikesBookmarksPoller {
             }
 
             for entry in &page.bookmarks {
+                let Some(post) = entry.item.as_ref().and_then(BookmarkItem::post) else {
+                    debug!(subject = %entry.subject.uri, "bookmark not resolvable; skipping");
+                    continue;
+                };
                 if self
-                    .archive_one(Category::Bookmark, PostCategory::Bookmark, &entry.subject)
+                    .archive_one(Category::Bookmark, PostCategory::Bookmark, post)
                     .await?
                 {
                     return Ok(());
@@ -1155,8 +1159,17 @@ mod tests {
         })
     }
 
+    /// Wraps a `postView` the way `app.bsky.bookmark.defs#bookmarkView`
+    /// actually does: `subject` is only a strong ref and the hydrated post
+    /// lives under `item`.
     fn bookmark_wrap(post: serde_json::Value) -> serde_json::Value {
-        json!({ "subject": post["post"] })
+        json!({
+            "subject": {
+                "uri": post["post"]["uri"],
+                "cid": post["post"]["cid"],
+            },
+            "item": post["post"],
+        })
     }
 
     fn account_source(id: i64, value: &str, did: &str) -> WatchedSource {
