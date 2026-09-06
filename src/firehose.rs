@@ -268,6 +268,10 @@ impl FirehoseConsumer {
         }
     }
 
+    // tungstenite::Error is a large enum (~136 bytes), so returning
+    // FirehoseError by value trips clippy's result_large_err lint; the
+    // ergonomics of the `#[from]` conversion are worth the allow here.
+    #[allow(clippy::result_large_err)]
     async fn connect_and_process(
         &mut self,
         shutdown: &mut watch::Receiver<bool>,
@@ -308,6 +312,7 @@ impl FirehoseConsumer {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     async fn read_loop(
         &mut self,
         mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
