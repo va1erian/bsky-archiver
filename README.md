@@ -110,7 +110,7 @@ rather than re-implementing them.
 
 The application ships as a single Docker image (see the multi-stage `Dockerfile` in
 this repo) and is configured entirely via environment variables — no config file
-editing is required. A ready-to-use `docker-compose.yml` example is included; copy
+editing is required. A ready-to-use `docker-compose.yml.example` is included; copy
 it, fill in the secrets, and run:
 
 ```sh
@@ -119,6 +119,21 @@ docker compose up -d
 
 This is also directly usable as a Cosmos Cloud app definition (Cosmos Cloud consumes
 Docker Compose-style service definitions).
+
+### Building and publishing to a local registry
+
+When deploying from this checkout to a host that pulls from a local registry
+(e.g. a Cosmos-Server-adjacent registry listening on `localhost:5000`), build and
+push the image there, then point your compose file's `image:` at
+`localhost:5000/bsky-archiver:latest`:
+
+```sh
+docker build . -t bsky-archiver:latest
+docker tag bsky-archiver:latest localhost:5000/bsky-archiver:latest
+docker push localhost:5000/bsky-archiver:latest
+```
+
+(Prefix each with `sudo` if your user is not in the `docker` group.)
 
 ### Environment variables
 
@@ -185,8 +200,9 @@ visible in container logs/exit status rather than hanging.
 1. Create a dedicated Bluesky [app password](https://bsky.app/settings/app-passwords)
    for the account you want to watch/archive from — do not use your main account
    password.
-2. Copy `docker-compose.yml`, fill in `BSKY_IDENTIFIER`, `BSKY_APP_PASSWORD`,
-   `UI_PASSWORD`, and a random `UI_SESSION_SECRET` (32+ characters).
+2. Copy `docker-compose.yml.example` to `docker-compose.yml`, fill in
+   `BSKY_IDENTIFIER`, `BSKY_APP_PASSWORD`, `UI_PASSWORD`, and a random
+   `UI_SESSION_SECRET` (32+ characters).
 3. `docker compose up -d`, then check `docker compose logs -f` — on a bad credential
    or config the container exits non-zero immediately with a `fatal startup error`
    log line, rather than starting up broken.

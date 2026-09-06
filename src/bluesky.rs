@@ -103,10 +103,42 @@ pub struct LikesPage {
     pub cursor: Option<String>,
 }
 
-/// One entry in a `getBookmarks` page: the bookmarked post.
+/// The hydrated item of a `bookmarkView`: a real [`PostView`] when the
+/// bookmarked record still resolves. The lexicon also allows
+/// `blockedPost`/`notFoundPost` variants, which deserialize to
+/// [`BookmarkItem::Unresolved`].
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum BookmarkItem {
+    Post(PostView),
+    Unresolved(serde_json::Value),
+}
+
+impl BookmarkItem {
+    /// The bookmarked post, if it resolved to a real `postView`.
+    pub fn post(&self) -> Option<&PostView> {
+        match self {
+            BookmarkItem::Post(post) => Some(post),
+            BookmarkItem::Unresolved(_) => None,
+        }
+    }
+}
+
+/// A `com.atproto.repo.strongRef`: a record's uri and cid.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct StrongRef {
+    pub uri: String,
+    pub cid: String,
+}
+
+/// One entry in a `getBookmarks` page. Per `app.bsky.bookmark.defs#bookmarkView`,
+/// `subject` is only a strong ref to the bookmarked record and the hydrated
+/// post lives under `item`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct BookmarkView {
-    pub subject: PostView,
+    pub subject: StrongRef,
+    #[serde(default)]
+    pub item: Option<BookmarkItem>,
 }
 
 /// A page of `app.bsky.bookmark.getBookmarks` results.
@@ -521,6 +553,10 @@ mod tests {
                     "subject": {
                         "uri": "at://did:plc:carol/app.bsky.feed.post/2",
                         "cid": "cid-2",
+                    },
+                    "item": {
+                        "uri": "at://did:plc:carol/app.bsky.feed.post/2",
+                        "cid": "cid-2",
                         "author": {"did": "did:plc:carol"},
                         "record": {"text": "bookmarked"},
                     }
@@ -541,7 +577,51 @@ mod tests {
             page.bookmarks[0].subject.uri,
             "at://did:plc:carol/app.bsky.feed.post/2"
         );
+        let post = page.bookmarks[0]
+            .item
+            .as_ref()
+            .and_then(BookmarkItem::post)
+            .expect("bookmark item should resolve to a postView");
+        assert_eq!(post.record["text"], "bookmarked");
         assert_eq!(page.cursor, None);
+    }
+
+    #[tokio::test]
+    async fn get_bookmarks_skips_blocked_and_not_found_items() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bookmarks": [
+                    {
+                        "subject": {"uri": "at://did:plc:x/app.bsky.feed.post/1", "cid": "cid-1"},
+                        "item": {"uri": "at://did:plc:x/app.bsky.feed.post/1", "notFound": true},
+                    },
+                    {
+                        "subject": {"uri": "at://did:plc:y/app.bsky.feed.post/2", "cid": "cid-2"},
+                        "item": {
+                            "uri": "at://did:plc:y/app.bsky.feed.post/2",
+                            "cid": "cid-2",
+                            "author": {"did": "did:plc:y"},
+                            "blocked": true,
+                        },
+                    },
+                ],
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let page = client
+            .get_bookmarks(None, 50)
+            .await
+            .expect("blocked/not-found bookmark items should not fail the page");
+
+        assert_eq!(page.bookmarks.len(), 2);
+        assert!(page.bookmarks[0].item.as_ref().unwrap().post().is_none());
+        assert!(page.bookmarks[1].item.as_ref().unwrap().post().is_none());
     }
 
     #[tokio::test]
