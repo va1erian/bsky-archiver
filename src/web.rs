@@ -22,7 +22,9 @@ use tokio_util::io::ReaderStream;
 use crate::health::{HealthSnapshot, Status};
 use crate::poller;
 use crate::state::SharedAppState;
-use crate::storage::{ArchiveStore, Category, MediaSummary, PostSummary, SourceKind, StorageError};
+use crate::storage::{
+    ArchiveStore, Category, MediaSort, MediaSummary, PostSummary, SourceKind, StorageError,
+};
 use crate::templates;
 
 /// Total export size (in bytes) over which the gallery shows a soft
@@ -430,6 +432,69 @@ struct GalleryQuery {
     category: Option<String>,
     page: Option<u32>,
     page_size: Option<u32>,
+    sort: Option<String>,
+}
+
+/// Parses a gallery `sort` query value into a [`MediaSort`]: `newest`
+/// (default, archive time) / `oldest` / `created-newest` / `created-oldest`;
+/// anything else is a `400`, matching how an unknown category is handled.
+fn parse_gallery_sort(raw: Option<&str>) -> Result<MediaSort, WebError> {
+    let sort = match raw {
+        None | Some("newest") => MediaSort::NewestArchived,
+        Some("oldest") => MediaSort::OldestArchived,
+        Some("created-newest") => MediaSort::NewestCreated,
+        Some("created-oldest") => MediaSort::OldestCreated,
+        Some(other) => {
+            return Err(WebError::BadRequest {
+                message: format!("unknown sort {other:?}"),
+            });
+        }
+    };
+    Ok(sort)
+}
+
+/// The query token for a [`MediaSort`] in gallery links, the token that
+/// [`parse_gallery_sort`] accepts.
+fn sort_token(sort: MediaSort) -> &'static str {
+    match sort {
+        MediaSort::NewestArchived => "newest",
+        MediaSort::OldestArchived => "oldest",
+        MediaSort::NewestCreated => "created-newest",
+        MediaSort::OldestCreated => "created-oldest",
+    }
+}
+
+/// Builds `/gallery` hrefs carrying every active filter, so switching one
+/// (category, sort, page) keeps the others.
+fn gallery_href(category: Option<Category>, sort: MediaSort, page: u32, page_size: u32) -> String {
+    let category_token = category
+        .map(category_token)
+        .map(|token| format!("category={token}&"))
+        .unwrap_or_default();
+    format!(
+        "/gallery?{category_token}sort={}&page={page}&page_size={page_size}",
+        sort_token(sort)
+    )
+}
+
+fn build_gallery_sort_options(
+    active_category: Option<Category>,
+    selected: MediaSort,
+    page_size: u32,
+) -> Vec<templates::SortOption> {
+    [
+        (MediaSort::NewestArchived, "Newest archived"),
+        (MediaSort::OldestArchived, "Oldest archived"),
+        (MediaSort::NewestCreated, "Newest created"),
+        (MediaSort::OldestCreated, "Oldest created"),
+    ]
+    .into_iter()
+    .map(|(sort, label)| templates::SortOption {
+        label,
+        href: gallery_href(active_category, sort, 1, page_size),
+        selected: sort == selected,
+    })
+    .collect()
 }
 
 /// Parses a gallery/export `category` query value into a [`Category`].
@@ -464,10 +529,14 @@ fn category_token(category: Category) -> &'static str {
     }
 }
 
-fn build_gallery_category_options(selected: Option<Category>) -> Vec<templates::CategoryOption> {
+fn build_gallery_category_options(
+    selected: Option<Category>,
+    sort: MediaSort,
+    page_size: u32,
+) -> Vec<templates::CategoryOption> {
     let mut options = vec![templates::CategoryOption {
         label: "All",
-        href: "/gallery".to_string(),
+        href: gallery_href(None, sort, 1, page_size),
         selected: selected.is_none(),
     }];
     for (category, label) in [
@@ -477,7 +546,7 @@ fn build_gallery_category_options(selected: Option<Category>) -> Vec<templates::
     ] {
         options.push(templates::CategoryOption {
             label,
-            href: format!("/gallery?category={}", category_token(category)),
+            href: gallery_href(Some(category), sort, 1, page_size),
             selected: selected == Some(category),
         });
     }
@@ -490,25 +559,20 @@ async fn gallery(
     headers: HeaderMap,
 ) -> Result<Response, WebError> {
     let category = parse_gallery_category(query.category.as_deref())?;
+    let sort = parse_gallery_sort(query.sort.as_deref())?;
     let page = query.page.unwrap_or(1).max(1);
     let page_size = clamp_page_size(query.page_size);
 
     let result = state
         .app
         .store
-        .list_media(category, page, page_size)
+        .list_media(category, page, page_size, sort)
         .await?;
     let items: Vec<_> = result.items.iter().map(templates::gallery_item).collect();
 
-    let cat_token = category.map(category_token);
     let pagination =
         templates::build_pagination(result.page, result.total_pages, result.total_items, |n| {
-            match cat_token {
-                Some(token) => {
-                    format!("/gallery?category={token}&page={n}&page_size={page_size}")
-                }
-                None => format!("/gallery?page={n}&page_size={page_size}"),
-            }
+            gallery_href(category, sort, n, page_size)
         });
 
     if is_htmx_request(&headers) {
@@ -517,12 +581,14 @@ async fn gallery(
     } else {
         let estimate = state.app.store.export_estimate(category).await?;
         let export = build_gallery_export(category, estimate);
-        let category_options = build_gallery_category_options(category);
+        let category_options = build_gallery_category_options(category, sort, page_size);
+        let sort_options = build_gallery_sort_options(category, sort, page_size);
         let template = templates::GalleryTemplate {
             version: templates::APP_VERSION,
             items,
             pagination,
             category_options,
+            sort_options,
             export,
         };
         Ok(askama_axum::into_response(&template))
@@ -1335,6 +1401,7 @@ mod tests {
                 category: None,
                 page: Some(1),
                 page_size: Some(10),
+                sort: None,
             }),
             HeaderMap::new(),
         )
@@ -1352,6 +1419,7 @@ mod tests {
                 category: None,
                 page: Some(2),
                 page_size: Some(10),
+                sort: None,
             }),
             HeaderMap::new(),
         )
@@ -1913,6 +1981,7 @@ mod tests {
                 category: Some("like".to_string()),
                 page: Some(1),
                 page_size: Some(20),
+                sort: None,
             }),
             HeaderMap::new(),
         )
@@ -1923,6 +1992,95 @@ mod tests {
         assert!(!likes_body.contains(&encode_post_id(&image_post)));
         // The category nav marks the current selection.
         assert!(likes_body.contains("<span class=\"current\">Likes</span>"));
+    }
+
+    #[tokio::test]
+    async fn gallery_unknown_sort_is_a_400() {
+        let (_dir, state) = test_state().await;
+        let key = Key::derive_from(state.config.ui_session_secret.expose_secret().as_bytes());
+        let app_state = WebState {
+            app: Arc::clone(&state),
+            key,
+        };
+
+        let result = gallery(
+            State(app_state),
+            Query(GalleryQuery {
+                category: None,
+                page: Some(1),
+                page_size: Some(10),
+                sort: Some("bogus".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(WebError::BadRequest { .. })));
+    }
+
+    #[tokio::test]
+    async fn gallery_sort_is_marked_in_options_and_survives_pagination() {
+        let (_dir, state) = test_state().await;
+        seed_image_and_video(&state.store).await;
+        // A second post-category image so the posts selection spans 2 pages
+        // at page_size=1 and the pagination carries the sort along.
+        let extra = "at://did:plc:alice/app.bsky.feed.post/extra";
+        state
+            .store
+            .save_post(StorageCategory::Post, extra, "cid-extra", json!({}))
+            .await
+            .unwrap();
+        state
+            .store
+            .save_media(
+                StorageCategory::Post,
+                extra,
+                "001.jpg",
+                Some("image/jpeg".to_string()),
+                vec![0x11u8; 6],
+            )
+            .await
+            .unwrap();
+        let key = Key::derive_from(state.config.ui_session_secret.expose_secret().as_bytes());
+        let app_state = WebState {
+            app: Arc::clone(&state),
+            key,
+        };
+
+        let page = gallery(
+            State(app_state),
+            Query(GalleryQuery {
+                category: Some("post".to_string()),
+                page: Some(1),
+                page_size: Some(1),
+                sort: Some("created-oldest".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let body = body_string(page.into_response()).await;
+
+        // The sort select is present, with every option offered. Askama
+        // escapes the `&` separators inside option values.
+        for href in [
+            "/gallery?category=post&amp;sort=newest&amp;page=1&amp;page_size=1",
+            "/gallery?category=post&amp;sort=oldest&amp;page=1&amp;page_size=1",
+            "/gallery?category=post&amp;sort=created-newest&amp;page=1&amp;page_size=1",
+            "/gallery?category=post&amp;sort=created-oldest&amp;page=1&amp;page_size=1",
+        ] {
+            assert!(
+                body.contains(href),
+                "sort option missing from the select: {href}"
+            );
+        }
+        // The active option is marked selected.
+        assert!(
+            body.contains("created-oldest"),
+            "created-oldest option rendered"
+        );
+
+        // Pagination links keep the active sort while moving pages.
+        assert!(body.contains("sort=created-oldest&amp;page=2"));
     }
 
     #[tokio::test]
@@ -1963,6 +2121,7 @@ mod tests {
                 category: Some("post".to_string()),
                 page: Some(1),
                 page_size: Some(20),
+                sort: None,
             }),
             HeaderMap::new(),
         )
@@ -1979,6 +2138,7 @@ mod tests {
                 category: Some("like".to_string()),
                 page: Some(1),
                 page_size: Some(20),
+                sort: None,
             }),
             HeaderMap::new(),
         )

@@ -68,5 +68,85 @@
   });
 })();
 </script>
+<dialog id="lightbox" aria-modal="true">
+<article>
+<button aria-label="Close" id="lightbox-close" class="close-lightbox">&times;</button>
+<button aria-label="Previous" class="lightbox-nav" data-nav="prev" id="lightbox-prev">&#10094;</button>
+<button aria-label="Next" class="lightbox-nav" data-nav="next" id="lightbox-next">&#10095;</button>
+<span id="lightbox-counter" class="lightbox-counter" aria-live="polite"></span>
+<div id="lightbox-content"></div>
+</article>
+</dialog>
+
+<script>
+(function () {
+  var dialog = document.getElementById("lightbox");
+  var content = document.getElementById("lightbox-content");
+  var counter = document.getElementById("lightbox-counter");
+  var prevBtn = document.getElementById("lightbox-prev");
+  var nextBtn = document.getElementById("lightbox-next");
+  if (!dialog || !content || typeof dialog.showModal !== "function") return;
+
+  // Media links of the current page, re-collected on every open so pages
+  // swapped in by htmx (gallery/post-list pagination) are included.
+  var items = [];
+  var index = -1;
+
+  function render() {
+    var link = items[index];
+    if (!link) return;
+    var isVideo = link.getAttribute("data-media-type") === "video";
+    var alt = link.getAttribute("data-alt") || "";
+    content.innerHTML = isVideo
+      ? "<video src=\"" + link.href + "\" controls autoplay></video>"
+      : "<img src=\"" + link.href + "\" alt=\"" + alt + "\">";
+    counter.textContent = items.length > 1 ? (index + 1) + " / " + items.length : "";
+    prevBtn.disabled = index <= 0;
+    nextBtn.disabled = index >= items.length - 1;
+  }
+
+  function show(link) {
+    items = Array.prototype.slice.call(document.querySelectorAll("[data-lightbox]"));
+    index = items.indexOf(link);
+    if (index < 0) return;
+    render();
+    dialog.showModal();
+  }
+
+  document.addEventListener("click", function (event) {
+    var link = event.target.closest("[data-lightbox]");
+    if (!link) return;
+    event.preventDefault();
+    show(link);
+  });
+
+  prevBtn.addEventListener("click", function () {
+    if (index > 0) { index--; render(); }
+  });
+  nextBtn.addEventListener("click", function () {
+    if (index < items.length - 1) { index++; render(); }
+  });
+
+  document.getElementById("lightbox-close").addEventListener("click", function () {
+    dialog.close();
+  });
+  dialog.addEventListener("click", function (event) {
+    if (event.target === dialog) dialog.close();
+  });
+
+  document.addEventListener("keydown", function (event) {
+    if (!dialog.open) return;
+    if (event.key === "ArrowRight" && index < items.length - 1) {
+      event.preventDefault();
+      index++;
+      render();
+    } else if (event.key === "ArrowLeft" && index > 0) {
+      event.preventDefault();
+      index--;
+      render();
+    }
+  });
+})();
+</script>
 </body>
 </html>

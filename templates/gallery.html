@@ -10,6 +10,14 @@
 <a href="{{ opt.href }}">{{ opt.label }}</a>
 {% endif %}
 {% endfor %}
+<span class="gallery-sort">
+<label for="gallery-sort">Sort</label>
+<select id="gallery-sort">
+{% for opt in sort_options %}
+<option value="{{ opt.href }}" {% if opt.selected %}selected{% endif %}>{{ opt.label }}</option>
+{% endfor %}
+</select>
+</span>
 </nav>
 
 <section class="export-panel">
@@ -26,37 +34,14 @@
 
 {% include "gallery_grid.html" %}
 
-<dialog id="lightbox">
-<article>
-<button aria-label="Close" id="lightbox-close" class="close-lightbox">&times;</button>
-<div id="lightbox-content"></div>
-</article>
-</dialog>
-
 <script>
 (function () {
-  var dialog = document.getElementById("lightbox");
-  var content = document.getElementById("lightbox-content");
-  if (!dialog || !content || typeof dialog.showModal !== "function") return;
-
-  document.addEventListener("click", function (event) {
-    var link = event.target.closest("[data-lightbox]");
-    if (!link) return;
-    event.preventDefault();
-    var isVideo = link.getAttribute("data-media-type") === "video";
-    var alt = link.getAttribute("data-alt") || "";
-    content.innerHTML = isVideo
-      ? "<video src=\"" + link.href + "\" controls autoplay></video>"
-      : "<img src=\"" + link.href + "\" alt=\"" + alt + "\">";
-    dialog.showModal();
-  });
-
-  document.getElementById("lightbox-close").addEventListener("click", function () {
-    dialog.close();
-  });
-  dialog.addEventListener("click", function (event) {
-    if (event.target === dialog) dialog.close();
+  var select = document.getElementById("gallery-sort");
+  if (!select) return;
+  select.addEventListener("change", function () {
+    if (select.value) window.location.href = select.value;
   });
 })();
 </script>
+
 {% endblock %}

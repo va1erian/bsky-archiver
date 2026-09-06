@@ -3,11 +3,13 @@
 {% for row in rows %}
 <article class="item-card">
 {% if let Some(thumb) = row.thumbnail %}
+<a class="gallery-item gallery-item-thumb" href="{{ thumb.url }}" data-lightbox data-media-type="{% if thumb.is_video %}video{% else %}image{% endif %}" data-alt="{{ thumb.alt }}">
 {% if thumb.is_video %}
 <video class="thumb" src="{{ thumb.url }}" muted preload="metadata"></video>
 {% else %}
 <img class="thumb" src="{{ thumb.url }}" alt="{{ thumb.alt }}" loading="lazy">
 {% endif %}
+</a>
 {% endif %}
 <span class="badge {{ row.category_badge_class }}">{{ row.category_label }}</span>
 {% if let Some(deleted) = row.deleted_at %}<span class="badge badge-deleted">Deleted</span>{% endif %}

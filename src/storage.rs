@@ -198,6 +198,40 @@ pub struct PostSummary {
     pub deleted_at: Option<String>,
 }
 
+/// How rows are ordered for the gallery view. The media index stores the
+/// archive time (`indexed_at`); the record's own `createdAt` is mirrored
+/// into the posts table (`record_created_at`) so the original post/edit
+/// time can also drive ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaSort {
+    #[default]
+    NewestArchived,
+    OldestArchived,
+    NewestCreated,
+    OldestCreated,
+}
+
+impl MediaSort {
+    /// SQL used as the ordering key (column/tiebreak pair inline) in
+    /// `list_media`, where `media` and `posts` are the table aliases in
+    /// scope. `record_created_at` falls back to the media's archive time
+    /// for rows whose record carried no `createdAt`.
+    fn sql(self) -> &'static str {
+        match self {
+            MediaSort::NewestArchived => "media.indexed_at DESC, media.id DESC",
+            MediaSort::OldestArchived => "media.indexed_at ASC, media.id ASC",
+            // Joined through the posts table; NULL falls back to the media's
+            // archive time.
+            MediaSort::NewestCreated => {
+                "COALESCE(record_created_at, media.indexed_at) DESC, media.id DESC"
+            }
+            MediaSort::OldestCreated => {
+                "COALESCE(record_created_at, media.indexed_at) ASC, media.id ASC"
+            }
+        }
+    }
+}
+
 /// A row for the gallery view: one media file plus a pointer back to its
 /// post.
 #[derive(Debug, Clone, PartialEq)]
@@ -208,6 +242,9 @@ pub struct MediaSummary {
     pub content_type: Option<String>,
     pub size_bytes: u64,
     pub indexed_at: String,
+    /// The record's own `createdAt` (RFC 3339) when it carried one; `None`
+    /// otherwise (e.g. pre-backfill rows).
+    pub record_created_at: Option<String>,
 }
 
 /// The image count and total byte size of an export selection, for the
@@ -342,7 +379,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// list); version 1 had only `posts`/`media`. Both statements are
 /// `CREATE TABLE IF NOT EXISTS`, so a version-1 database upgrades in place
 /// (the new table is created empty) with no data rows to move.
-const SCHEMA_VERSION: i64 = 2;
+///
+/// Version 3 adds `posts.record_created_at`, mirroring the record's own
+/// `createdAt` so the gallery can sort by it. The column is nullable and
+/// backfilled from the on-disk `record.json` for rows that predate it.
+const SCHEMA_VERSION: i64 = 3;
 
 fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -358,6 +399,7 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
             cid TEXT NOT NULL,
             indexed_at TEXT NOT NULL,
             record_path TEXT NOT NULL,
+            record_created_at TEXT,
             PRIMARY KEY (category, at_uri)
         );
         CREATE INDEX IF NOT EXISTS idx_posts_category_indexed_at
@@ -404,6 +446,10 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         migrate_v1_to_v2(conn)?;
     }
 
+    if previous_version < 3 {
+        migrate_v2_to_v3(conn)?;
+    }
+
     if current_version != Some(SCHEMA_VERSION) {
         conn.execute(
             "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
@@ -432,6 +478,96 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Adds the `record_created_at` mirror column to existing `posts` tables
+/// (fresh databases already have it from `bootstrap_schema`), then its
+/// ordering index. Backfilling values from `record.json` happens in
+/// [`ArchiveStore::open`], which owns the filesystem paths the column
+/// derives from.
+fn migrate_v2_to_v3(conn: &Connection) -> Result<(), StorageError> {
+    let has_column: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('posts') WHERE name = 'record_created_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?;
+    if !has_column {
+        conn.execute_batch("ALTER TABLE posts ADD COLUMN record_created_at TEXT;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_posts_category_record_created_at
+             ON posts(category, record_created_at, at_uri);",
+    )?;
+    Ok(())
+}
+
+/// Extracts the RFC 3339 timestamp a record self-reports under `createdAt`
+/// (posts under every category carry one), for the `record_created_at`
+/// mirror used by the gallery's created-time sorting.
+fn record_created_at_from(record: &serde_json::Value) -> Option<String> {
+    record
+        .get("createdAt")
+        .and_then(|value| value.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Number of `posts` rows still missing their mirrored `record_created_at`.
+fn count_missing_record_created_at(conn: &Connection) -> Result<i64, StorageError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM posts WHERE record_created_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Backfills `posts.record_created_at` from each row's on-disk
+/// `record.json` (inside its `ArchivedRecord` envelope). Idempotent: only
+/// rows with a NULL column are read and updated, so it costs nothing once
+/// every row has a value.
+fn backfill_record_created_at(conn: &Connection, archive_dir: &Path) -> Result<(), StorageError> {
+    if count_missing_record_created_at(conn)? == 0 {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT category, at_uri, record_path, indexed_at
+             FROM posts WHERE record_created_at IS NULL",
+    )?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |row| {
+            let category: String = row.get(0)?;
+            let at_uri: String = row.get(1)?;
+            let record_path: String = row.get(2)?;
+            Ok((category, at_uri, record_path))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut updated = 0usize;
+    for (category, at_uri, record_path) in rows {
+        // Best effort: a missing/corrupt file just leaves the column NULL,
+        // mirroring a record with no `createdAt`.
+        let Ok(bytes) = std::fs::read(archive_dir.join(&record_path)) else {
+            continue;
+        };
+        let Ok(archived) = serde_json::from_slice::<ArchivedRecord>(&bytes) else {
+            continue;
+        };
+        let Some(created_at) = record_created_at_from(&archived.record) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE posts SET record_created_at = ?1
+                 WHERE category = ?2 AND at_uri = ?3",
+            params![created_at, category, at_uri],
+        )?;
+        updated += 1;
+    }
+    tracing::info!(updated, "backfilled posts.record_created_at");
+    Ok(())
+}
+
 /// Owns the on-disk archive under `archive_dir` and the SQLite query
 /// index that mirrors it. All SQLite access happens on a blocking thread
 /// via `tokio::task::spawn_blocking`; nothing here blocks the async
@@ -453,11 +589,15 @@ impl ArchiveStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        let archive_dir_for_backfill = archive_dir.clone();
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, StorageError> {
             let conn = Connection::open(&database_path)?;
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
             bootstrap_schema(&conn)?;
+            // Restore mirrored `createdAt` for rows archived before the
+            // column existed. Cheap no-op once backfilled.
+            backfill_record_created_at(&conn, &archive_dir_for_backfill)?;
             Ok(conn)
         })
         .await;
@@ -504,14 +644,15 @@ impl ArchiveStore {
 
             let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
-                "INSERT OR IGNORE INTO posts (at_uri, category, cid, indexed_at, record_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR IGNORE INTO posts (at_uri, category, cid, indexed_at, record_path, record_created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     at_uri,
                     category.as_dir(),
                     cid,
                     indexed_at,
-                    relative_str(&archive_dir, &path)
+                    relative_str(&archive_dir, &path),
+                    record_created_at_from(&archived.record),
                 ],
             )?;
 
@@ -790,15 +931,16 @@ impl ArchiveStore {
         join_result(result)
     }
 
-    /// Lists archived media newest-first, for the gallery view. `category`
-    /// filters to a single category; `None` lists every category (today's
-    /// behaviour). This still returns every media kind (images *and* video)
-    /// — only the zip export narrows to images.
+    /// Lists archived media for the gallery view, filtered by `category`
+    /// (`None` lists every category — today's behaviour) and ordered by
+    /// `sort` (see [`MediaSort`]). This still returns every media kind
+    /// (images *and* video) — only the zip export narrows to images.
     pub async fn list_media(
         &self,
         category: Option<Category>,
         page: u32,
         page_size: u32,
+        sort: MediaSort,
     ) -> Result<Page<MediaSummary>, StorageError> {
         let db = Arc::clone(&self.db);
         let page = page.max(1);
@@ -816,13 +958,21 @@ impl ArchiveStore {
                 )? as u64;
 
                 let offset = (page - 1) as i64 * page_size as i64;
-                let mut stmt = conn.prepare(
-                    "SELECT post_at_uri, category, filename, content_type, size_bytes, indexed_at
-                 FROM media
-                 WHERE ?1 IS NULL OR category = ?1
-                 ORDER BY indexed_at DESC, id DESC
-                 LIMIT ?2 OFFSET ?3",
-                )?;
+                let sql = format!(
+                    "SELECT media.post_at_uri, media.category, media.filename,
+                            media.content_type, media.size_bytes, media.indexed_at,
+                            posts.record_created_at AS record_created_at
+                     FROM media
+                     LEFT JOIN posts
+                         ON posts.category = media.category
+                         AND posts.at_uri = media.post_at_uri
+                     WHERE ?1 IS NULL OR media.category = ?1
+                     ORDER BY {order}
+                     LIMIT ?2 OFFSET ?3
+                    ",
+                    order = sort.sql()
+                );
+                let mut stmt = conn.prepare(&sql)?;
                 let rows =
                     stmt.query_map(params![category_filter, page_size as i64, offset], |row| {
                         let category: String = row.get(1)?;
@@ -833,6 +983,7 @@ impl ArchiveStore {
                             content_type: row.get(3)?,
                             size_bytes: row.get::<_, i64>(4)? as u64,
                             indexed_at: row.get(5)?,
+                            record_created_at: row.get(6)?,
                         })
                     })?;
                 let items = rows.collect::<Result<Vec<_>, _>>()?;
@@ -909,6 +1060,10 @@ impl ArchiveStore {
                         content_type: row.get(3)?,
                         size_bytes: row.get::<_, i64>(4)? as u64,
                         indexed_at: row.get(5)?,
+                        // The export is a byte stream; the created-time
+                        // mirror isn't needed by the zipped layout, so no
+                        // posts join is attempted here.
+                        record_created_at: None,
                     })
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()
@@ -1029,6 +1184,7 @@ impl ArchiveStore {
                             archived.cid.clone(),
                             archived.indexed_at.clone(),
                             relative_str(&archive_dir, &record_file),
+                            record_created_at_from(&archived.record),
                         ));
                     }
                 }
@@ -1050,22 +1206,24 @@ impl ArchiveStore {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM media", [])?;
             tx.execute("DELETE FROM posts", [])?;
-            for (at_uri, category, cid, indexed_at, record_path) in found_posts {
+            for (at_uri, category, cid, indexed_at, record_path, record_created_at) in found_posts
+            {
                 let deleted_at = if deleted_uris.contains(&at_uri) {
                     Some(indexed_at.clone())
                 } else {
                     None
                 };
                 tx.execute(
-                    "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path, deleted_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path, deleted_at, record_created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         at_uri,
                         category.as_dir(),
                         cid,
                         indexed_at,
                         record_path,
-                        deleted_at
+                        deleted_at,
+                        record_created_at
                     ],
                 )?;
             }
@@ -1321,7 +1479,10 @@ mod tests {
         assert_eq!(record.media[0].filename, "image1.jpg");
         assert_eq!(record.media[0].size_bytes, "fake-image-bytes".len() as u64);
 
-        let gallery = store.list_media(None, 1, 10).await.unwrap();
+        let gallery = store
+            .list_media(None, 1, 10, MediaSort::NewestArchived)
+            .await
+            .unwrap();
         assert_eq!(gallery.total_items, 1);
         assert_eq!(gallery.items[0].filename, "image1.jpg");
         assert_eq!(gallery.items[0].post_at_uri, at_uri);
@@ -1377,7 +1538,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record_again.media.len(), 1);
-        let gallery_again = store.list_media(None, 1, 10).await.unwrap();
+        let gallery_again = store
+            .list_media(None, 1, 10, MediaSort::NewestArchived)
+            .await
+            .unwrap();
         assert_eq!(gallery_again.total_items, 1);
     }
 
@@ -1503,7 +1667,10 @@ mod tests {
             .unwrap();
 
         let before_posts = store.list_posts(None, 1, 100).await.unwrap();
-        let before_media = store.list_media(None, 1, 100).await.unwrap();
+        let before_media = store
+            .list_media(None, 1, 100, MediaSort::NewestArchived)
+            .await
+            .unwrap();
 
         // A brand-new store pointed at a fresh database file, over the
         // same on-disk archive: the index starts empty.
@@ -1517,7 +1684,10 @@ mod tests {
         fresh_store.reindex().await.unwrap();
 
         let after_posts = fresh_store.list_posts(None, 1, 100).await.unwrap();
-        let after_media = fresh_store.list_media(None, 1, 100).await.unwrap();
+        let after_media = fresh_store
+            .list_media(None, 1, 100, MediaSort::NewestArchived)
+            .await
+            .unwrap();
 
         assert_eq!(after_posts.total_items, before_posts.total_items);
         let mut before_uris: Vec<_> = before_posts
@@ -1593,16 +1763,127 @@ mod tests {
         let (_dir, store) = open_store().await;
         seed_one_image_per_category(&store).await;
 
-        let all = store.list_media(None, 1, 100).await.unwrap();
+        let all = store
+            .list_media(None, 1, 100, MediaSort::NewestArchived)
+            .await
+            .unwrap();
         assert_eq!(all.total_items, 3);
 
         let likes = store
-            .list_media(Some(Category::Like), 1, 100)
+            .list_media(Some(Category::Like), 1, 100, MediaSort::NewestArchived)
             .await
             .unwrap();
         assert_eq!(likes.total_items, 1);
         assert_eq!(likes.items.len(), 1);
         assert!(likes.items.iter().all(|m| m.category == Category::Like));
+    }
+
+    /// The created-time sort mirrors the record's own `createdAt`, so the
+    /// ordering can differ from the archive-time ordering; missing
+    /// `createdAt` falls back to the archive time.
+    #[tokio::test]
+    async fn list_media_sorts_by_created_at_when_available() {
+        let (_dir, store) = open_store().await;
+
+        // Archive order: A stored first, then B. Record times: A is the
+        // newest post ever, B much older — the opposite ordering.
+        let old = "at://did:plc:alice/app.bsky.feed.post/1";
+        let new = "at://did:plc:alice/app.bsky.feed.post/2";
+        store
+            .save_post(
+                Category::Post,
+                new,
+                "cid-new",
+                json!({"createdAt": "2030-01-01T00:00:00.000Z"}),
+            )
+            .await
+            .unwrap();
+        store
+            .save_media(
+                Category::Post,
+                new,
+                "aa.jpg",
+                Some("image/jpeg".into()),
+                vec![0u8; 10],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        store
+            .save_post(
+                Category::Post,
+                old,
+                "cid-old",
+                json!({"createdAt": "2000-01-01T00:00:00.000Z"}),
+            )
+            .await
+            .unwrap();
+        store
+            .save_media(
+                Category::Post,
+                old,
+                "bb.jpg",
+                Some("image/jpeg".into()),
+                vec![0u8; 10],
+            )
+            .await
+            .unwrap();
+
+        let archived_newest = store
+            .list_media(None, 1, 10, MediaSort::NewestArchived)
+            .await
+            .unwrap();
+        assert_eq!(
+            archived_newest
+                .items
+                .iter()
+                .map(|m| m.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["bb.jpg", "aa.jpg"],
+        );
+
+        let created_newest = store
+            .list_media(None, 1, 10, MediaSort::NewestCreated)
+            .await
+            .unwrap();
+        assert_eq!(
+            created_newest
+                .items
+                .iter()
+                .map(|m| m.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["aa.jpg", "bb.jpg"],
+        );
+        assert_eq!(
+            created_newest.items[0].record_created_at.as_deref(),
+            Some("2030-01-01T00:00:00.000Z"),
+        );
+
+        let created_oldest = store
+            .list_media(None, 1, 10, MediaSort::OldestCreated)
+            .await
+            .unwrap();
+        assert_eq!(
+            created_oldest
+                .items
+                .iter()
+                .map(|m| m.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["bb.jpg", "aa.jpg"],
+        );
+
+        let archived_oldest = store
+            .list_media(None, 1, 10, MediaSort::OldestArchived)
+            .await
+            .unwrap();
+        assert_eq!(
+            archived_oldest
+                .items
+                .iter()
+                .map(|m| m.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["aa.jpg", "bb.jpg"],
+        );
     }
 
     #[tokio::test]
@@ -1800,7 +2081,8 @@ mod tests {
         assert_eq!(page.total_items, 1);
         assert_eq!(page.items[0].at_uri, "at://did:plc:v1/app.bsky.feed.post/1");
 
-        // ...the schema version says 2...
+        // ...the schema version always reads the latest stamp (v1 data has
+        // been upgraded in place through every intermediate version)...
         let bytes = std::fs::read(dir.path().join("index.sqlite3")).unwrap();
         drop(bytes);
         let conn = rusqlite::Connection::open(dir.path().join("index.sqlite3")).unwrap();
@@ -1811,7 +2093,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "2");
+        assert_eq!(version, "3");
 
         // ...and the new table is usable immediately (no data had to move).
         assert!(store.list_watched_sources().await.unwrap().is_empty());

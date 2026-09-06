@@ -200,40 +200,89 @@
   border-radius: var(--pico-border-radius, 0.25rem);
 }
 
+/* The lightbox is a true full-screen viewer: the dialog fills the whole
+   viewport (100dvw/100dvh, so mobile browser chrome doesn't clip it), the
+   media letterboxes with object-fit, and the close button, prev/next
+   arrows, and counter are overlaid on top. */
 #lightbox {
   padding: 0;
   border: none;
-  max-width: 90vw;
-  max-height: 90vh;
+  border-radius: 0;
+  max-width: none;
+  width: 100dvw;
+  height: 100dvh;
   background: transparent;
-}
-
-#lightbox img,
-#lightbox video {
-  max-width: 90vw;
-  max-height: 85vh;
-  display: block;
-  margin: 0 auto;
-}
-
-#lightbox::backdrop {
-  background: rgba(0, 0, 0, 0.75);
 }
 
 #lightbox article {
   position: relative;
-  padding: 1rem;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+#lightbox img,
+#lightbox video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+#lightbox::backdrop {
+  background: rgba(0, 0, 0, 0.92);
 }
 
 .close-lightbox {
   position: absolute;
   top: 0.5rem;
   right: 0.5rem;
-  width: 2rem;
-  height: 2rem;
+  width: 2.75rem;
+  height: 2.75rem;
+  line-height: 1;
+  z-index: 2;
+}
+
+/* Prev/next overlay arrows: anchored to the viewport edges, vertically
+   centred, and disabled beyond the current page's media list. */
+.lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2.75rem;
+  height: 2.75rem;
   padding: 0;
   line-height: 1;
-  z-index: 1;
+  z-index: 2;
+}
+
+.lightbox-nav[data-nav="prev"] {
+  left: 0.5rem;
+}
+
+.lightbox-nav[data-nav="next"] {
+  right: 0.5rem;
+}
+
+.lightbox-nav[disabled] {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
+.lightbox-counter {
+  position: absolute;
+  bottom: 0.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #fff;
+  font-size: 0.85rem;
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.8);
+  user-select: none;
+  pointer-events: none;
 }
 
 .config-table td:first-child {
@@ -503,7 +552,38 @@ nav form {
 
   /* The monospace nowrap on the config keys is what forces the document wide
      today; once the cells are stacked it has to give way or the page scrolls. */
-  .config-table td:first-child {
+/* Post-list thumbnails shared the plain img styling; wrapping them in the
+   lightbox link zeroes out link chrome so the visual stays identical. */
+a.gallery-item-thumb {
+  display: block;
+  border-bottom: none;
+  color: inherit;
+}
+
+/* Sort-picker sits inline with the category filter links without the
+   label/select disturbing the nav spacing. */
+.gallery-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+
+.gallery-sort label {
+  margin: 0;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.gallery-sort select {
+  margin: 0;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+  min-height: 0;
+  width: auto;
+}
+
+.config-table td:first-child {
     white-space: normal;
   }
 
@@ -555,6 +635,21 @@ nav form {
   .close-lightbox {
     width: 44px;
     height: 44px;
+  }
+
+  .lightbox-nav {
+    width: 44px;
+    height: 44px;
+  }
+
+  /* Sort selector follows the accent-picker's compact styling so it sits on
+     one row with the category filters. */
+  #gallery-sort {
+    margin: 0;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+    min-height: 0;
+    width: auto;
   }
 }
 

@@ -249,6 +249,14 @@ pub struct CategoryOption {
     pub selected: bool,
 }
 
+/// One entry of the gallery's sort dropdown; href resets to page 1 with the
+/// sort applied while keeping the active category.
+pub struct SortOption {
+    pub label: &'static str,
+    pub href: String,
+    pub selected: bool,
+}
+
 #[derive(Template)]
 #[template(path = "posts.html")]
 pub struct PostsTemplate {
@@ -351,6 +359,7 @@ pub struct GalleryTemplate {
     pub items: Vec<GalleryItem>,
     pub pagination: Pagination,
     pub category_options: Vec<CategoryOption>,
+    pub sort_options: Vec<SortOption>,
     pub export: GalleryExport,
 }
 
