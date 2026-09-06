@@ -216,7 +216,7 @@ impl MediaDownloader {
             (&media.declared_mime_type, &downloaded.content_type)
             && base_mime(declared) != base_mime(actual)
         {
-            tracing::warn!(
+            tracing::debug!(
                 at_uri = %at_uri,
                 cdn_url = %media.cdn_url,
                 declared = %declared,

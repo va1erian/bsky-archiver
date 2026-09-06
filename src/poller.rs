@@ -978,7 +978,7 @@ impl LikesBookmarksPoller {
         }
 
         if outcome == SaveOutcome::Inserted {
-            info!(at_uri = %post.uri, %category, "archived new item");
+            debug!(at_uri = %post.uri, %category, "archived new item");
         }
 
         Ok(false)
