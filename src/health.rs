@@ -66,6 +66,7 @@ pub struct HealthSnapshot {
     pub rest_fallback: SubsystemHealth,
     pub feed_poller: SubsystemHealth,
     pub likes_bookmarks: SubsystemHealth,
+    pub nightly_sweep: SubsystemHealth,
     pub media_downloader: SubsystemHealth,
 }
 
@@ -78,6 +79,7 @@ impl Default for HealthSnapshot {
             rest_fallback: starting.clone(),
             feed_poller: starting.clone(),
             likes_bookmarks: starting.clone(),
+            nightly_sweep: starting.clone(),
             media_downloader: starting,
         }
     }
@@ -108,6 +110,7 @@ mod tests {
         assert_eq!(snapshot.rest_fallback.status, Status::Degraded);
         assert_eq!(snapshot.feed_poller.status, Status::Degraded);
         assert_eq!(snapshot.likes_bookmarks.status, Status::Degraded);
+        assert_eq!(snapshot.nightly_sweep.status, Status::Degraded);
         assert_eq!(snapshot.media_downloader.status, Status::Degraded);
     }
 

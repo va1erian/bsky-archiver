@@ -21,6 +21,7 @@ const ALL_VARS: &[&str] = &[
     "JETSTREAM_URL",
     "MEDIA_MAX_CONCURRENT_DOWNLOADS",
     "MEDIA_MAX_BYTES",
+    "NIGHTLY_SWEEP_LOCAL_HOUR",
 ];
 
 mod defaults {
@@ -30,6 +31,7 @@ mod defaults {
     pub const JETSTREAM_URL: &str = "wss://jetstream1.us-east.bsky.network/subscribe";
     pub const MEDIA_MAX_CONCURRENT_DOWNLOADS: usize = 4;
     pub const MEDIA_MAX_BYTES: u64 = 104_857_600;
+    pub const NIGHTLY_SWEEP_LOCAL_HOUR: u32 = 3;
 }
 
 /// A secret string value (app password, UI password, session signing key).
@@ -97,6 +99,9 @@ pub struct AppConfig {
     pub jetstream_url: url::Url,
     pub media_max_concurrent_downloads: usize,
     pub media_max_bytes: u64,
+    /// Local hour of day (0-23) at which the nightly likes/bookmarks
+    /// deletion sweep runs. See [`crate::sweep`].
+    pub nightly_sweep_local_hour: u32,
 }
 
 impl AppConfig {
@@ -158,6 +163,11 @@ impl AppConfig {
             None => defaults::MEDIA_MAX_BYTES,
         };
 
+        let nightly_sweep_local_hour = match optional_var("NIGHTLY_SWEEP_LOCAL_HOUR") {
+            Some(raw) => parse_hour("NIGHTLY_SWEEP_LOCAL_HOUR", &raw)?,
+            None => defaults::NIGHTLY_SWEEP_LOCAL_HOUR,
+        };
+
         Ok(AppConfig {
             bsky_identifier,
             bsky_app_password,
@@ -170,6 +180,7 @@ impl AppConfig {
             jetstream_url,
             media_max_concurrent_downloads,
             media_max_bytes,
+            nightly_sweep_local_hour,
         })
     }
 }
@@ -221,6 +232,20 @@ fn parse_positive_usize(var: &'static str, raw: &str) -> Result<usize, ConfigErr
         return Err(ConfigError::InvalidValue {
             var,
             message: "must be greater than 0".to_string(),
+        });
+    }
+    Ok(value)
+}
+
+fn parse_hour(var: &'static str, raw: &str) -> Result<u32, ConfigError> {
+    let value: u32 = raw.parse().map_err(|_| ConfigError::InvalidValue {
+        var,
+        message: format!("{raw:?} is not a valid hour of day (0-23)"),
+    })?;
+    if value > 23 {
+        return Err(ConfigError::InvalidValue {
+            var,
+            message: format!("{value} is not a valid hour of day (0-23)"),
         });
     }
     Ok(value)
@@ -352,6 +377,10 @@ mod tests {
             defaults::MEDIA_MAX_CONCURRENT_DOWNLOADS
         );
         assert_eq!(config.media_max_bytes, defaults::MEDIA_MAX_BYTES);
+        assert_eq!(
+            config.nightly_sweep_local_hour,
+            defaults::NIGHTLY_SWEEP_LOCAL_HOUR
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -461,6 +490,42 @@ mod tests {
         let err = AppConfig::from_env().expect_err("non-numeric media bytes should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "MEDIA_MAX_BYTES"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_nightly_sweep_hour_produces_specific_error() {
+        let dir = temp_dir("invalid-sweep-hour");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("NIGHTLY_SWEEP_LOCAL_HOUR", "24"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::from_env().expect_err("hour 24 should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "NIGHTLY_SWEEP_LOCAL_HOUR"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_numeric_nightly_sweep_hour_produces_specific_error() {
+        let dir = temp_dir("non-numeric-sweep-hour");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("NIGHTLY_SWEEP_LOCAL_HOUR", "three-am"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::from_env().expect_err("non-numeric hour should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "NIGHTLY_SWEEP_LOCAL_HOUR"),
             other => panic!("expected InvalidValue, got {other:?}"),
         }
 

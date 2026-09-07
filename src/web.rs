@@ -193,6 +193,7 @@ async fn healthz(State(state): State<WebState>) -> Response {
         &snapshot.rest_fallback,
         &snapshot.feed_poller,
         &snapshot.likes_bookmarks,
+        &snapshot.nightly_sweep,
         &snapshot.media_downloader,
     ]
     .iter()
@@ -241,6 +242,7 @@ async fn dashboard(State(state): State<WebState>) -> Result<Response, WebError> 
         templates::subsystem_row("REST fallback", &snapshot.rest_fallback),
         templates::subsystem_row("Feed poller", &snapshot.feed_poller),
         templates::subsystem_row("Likes & bookmarks", &snapshot.likes_bookmarks),
+        templates::subsystem_row("Nightly sweep", &snapshot.nightly_sweep),
         templates::subsystem_row("Media downloader", &snapshot.media_downloader),
     ];
 
@@ -436,14 +438,18 @@ struct GalleryQuery {
 }
 
 /// Parses a gallery `sort` query value into a [`MediaSort`]: `newest`
-/// (default, archive time) / `oldest` / `created-newest` / `created-oldest`;
-/// anything else is a `400`, matching how an unknown category is handled.
+/// (default, archive time) / `oldest` / `created-newest` / `created-oldest`
+/// / `bookmarked-newest` / `bookmarked-oldest` (the bookmark action time,
+/// the order Bluesky's own bookmarks list uses); anything else is a `400`,
+/// matching how an unknown category is handled.
 fn parse_gallery_sort(raw: Option<&str>) -> Result<MediaSort, WebError> {
     let sort = match raw {
         None | Some("newest") => MediaSort::NewestArchived,
         Some("oldest") => MediaSort::OldestArchived,
         Some("created-newest") => MediaSort::NewestCreated,
         Some("created-oldest") => MediaSort::OldestCreated,
+        Some("bookmarked-newest") => MediaSort::NewestAction,
+        Some("bookmarked-oldest") => MediaSort::OldestAction,
         Some(other) => {
             return Err(WebError::BadRequest {
                 message: format!("unknown sort {other:?}"),
@@ -461,6 +467,8 @@ fn sort_token(sort: MediaSort) -> &'static str {
         MediaSort::OldestArchived => "oldest",
         MediaSort::NewestCreated => "created-newest",
         MediaSort::OldestCreated => "created-oldest",
+        MediaSort::NewestAction => "bookmarked-newest",
+        MediaSort::OldestAction => "bookmarked-oldest",
     }
 }
 
@@ -487,6 +495,8 @@ fn build_gallery_sort_options(
         (MediaSort::OldestArchived, "Oldest archived"),
         (MediaSort::NewestCreated, "Newest created"),
         (MediaSort::OldestCreated, "Oldest created"),
+        (MediaSort::NewestAction, "Newest bookmarked"),
+        (MediaSort::OldestAction, "Oldest bookmarked"),
     ]
     .into_iter()
     .map(|(sort, label)| templates::SortOption {
@@ -854,6 +864,11 @@ async fn config_view(State(state): State<WebState>) -> Response {
             value: config.media_max_bytes.to_string(),
             redacted: false,
         },
+        templates::ConfigRow {
+            key: "NIGHTLY_SWEEP_LOCAL_HOUR",
+            value: config.nightly_sweep_local_hour.to_string(),
+            redacted: false,
+        },
     ];
     let sources = match state.app.store.list_watched_sources().await {
         Ok(list) => list.iter().map(templates::source_row).collect(),
@@ -1144,6 +1159,7 @@ mod tests {
             jetstream_url: url::Url::parse("wss://jetstream.example.com/subscribe").unwrap(),
             media_max_concurrent_downloads: 4,
             media_max_bytes: 104_857_600,
+            nightly_sweep_local_hour: 3,
         };
 
         let (_health_tx, health_rx) = health_channel();
@@ -2270,6 +2286,7 @@ mod tests {
             jetstream_url: url::Url::parse("wss://jetstream.example.com/subscribe").unwrap(),
             media_max_concurrent_downloads: 4,
             media_max_bytes: 104_857_600,
+            nightly_sweep_local_hour: 3,
         };
 
         let (candidate_tx, _candidate_rx) = crate::pipeline::candidate_post_channel(8);

@@ -17,6 +17,9 @@
 //!   the watched account's authored posts with media.
 //! - [`poller`] — REST-polling fallback for authored posts (when the
 //!   firehose is unavailable) plus the periodic likes/bookmarks poller.
+//! - [`sweep`] — the nightly likes/bookmarks deletion sweep: walks both
+//!   lists in full and batch-verifies every archived like/bookmark URI,
+//!   marking posts deleted upstream with a `deleted_at` timestamp.
 //! - [`pipeline`] — the shared `CandidatePost` channel and
 //!   `has_archivable_media` predicate connecting every producer
 //!   (firehose/poller) to the one consumer (media downloader).
@@ -46,6 +49,7 @@ pub mod poller;
 pub mod ratelimit;
 pub mod state;
 pub mod storage;
+pub mod sweep;
 pub mod templates;
 pub mod watchlist;
 pub mod web;

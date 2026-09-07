@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::bluesky::{BlueskyClient, BlueskyError, BookmarkItem, PostView};
+use crate::bluesky::{BlueskyClient, BlueskyError, PostView};
 use crate::pipeline::{
     CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver, MediaRef,
     PostCategory, has_archivable_media,
@@ -759,8 +759,9 @@ fn extract_media_from_view(embed: &serde_json::Value) -> Vec<MediaRef> {
     }
 }
 
-/// Page size requested per `getActorLikes` / `getBookmarks` call.
-const PAGE_SIZE: u32 = 50;
+/// Page size requested per `getActorLikes` / `getBookmarks` call. Also used
+/// by the nightly sweeper's full walks of the same lists.
+pub(crate) const PAGE_SIZE: u32 = 50;
 
 /// Errors that can end a single poll pass for one category.
 #[derive(Debug, thiserror::Error)]
@@ -883,7 +884,7 @@ impl LikesBookmarksPoller {
 
             for entry in &page.feed {
                 if self
-                    .archive_one(Category::Like, PostCategory::Like, &entry.post)
+                    .archive_one(Category::Like, PostCategory::Like, &entry.post, None)
                     .await?
                 {
                     // Dedup boundary: this item (and everything older) is
@@ -900,7 +901,11 @@ impl LikesBookmarksPoller {
     }
 
     /// One pagination pass over bookmarks, newest-first, stopping as soon
-    /// as an already-archived item is hit (or pages run out).
+    /// as an already-archived item is hit (or pages run out). A bookmark
+    /// whose post no longer resolves upstream is not a dedup boundary (the
+    /// pagination order is unaffected by deletion); if it specifically came
+    /// back as `notFound` — the post was deleted — the archived copy is
+    /// marked with a `deleted_at` timestamp so the UI can badge it.
     pub async fn poll_bookmarks(&self) -> Result<(), PollError> {
         let mut cursor: Option<String> = None;
         loop {
@@ -913,12 +918,30 @@ impl LikesBookmarksPoller {
             }
 
             for entry in &page.bookmarks {
-                let Some(post) = entry.item.as_ref().and_then(BookmarkItem::post) else {
-                    debug!(subject = %entry.subject.uri, "bookmark not resolvable; skipping");
+                let Some(item) = entry.item.as_ref() else {
+                    debug!(subject = %entry.subject.uri, "bookmark item missing; skipping");
+                    continue;
+                };
+                let Some(post) = item.post() else {
+                    if item.is_not_found() {
+                        if let Some(created_at) = entry.created_at.as_deref() {
+                            self.store
+                                .set_action_at(Category::Bookmark, &entry.subject.uri, created_at)
+                                .await?;
+                        }
+                        mark_bookmark_deleted(&self.store, &entry.subject.uri).await?;
+                    } else {
+                        debug!(subject = %entry.subject.uri, "bookmark not resolvable (blocked?); skipping");
+                    }
                     continue;
                 };
                 if self
-                    .archive_one(Category::Bookmark, PostCategory::Bookmark, post)
+                    .archive_one(
+                        Category::Bookmark,
+                        PostCategory::Bookmark,
+                        post,
+                        entry.created_at.as_deref(),
+                    )
                     .await?
                 {
                     return Ok(());
@@ -941,47 +964,101 @@ impl LikesBookmarksPoller {
         category: Category,
         post_category: PostCategory,
         post: &PostView,
+        action_at: Option<&str>,
     ) -> Result<bool, PollError> {
-        if self.store.is_archived(category, &post.uri).await? {
-            debug!(at_uri = %post.uri, %category, "reached dedup boundary");
-            return Ok(true);
+        archive_like_bookmark_post(
+            &self.store,
+            &self.sender,
+            category,
+            post_category,
+            post,
+            action_at,
+        )
+        .await
+    }
+}
+
+/// Archives one like/bookmark post (JSON record, plus a [`CandidatePost`]
+/// if it has media), deduping against the archive. Shared by
+/// [`LikesBookmarksPoller`] and the nightly sweeper ([`crate::sweep`]).
+/// `action_at` is the bookmark action time (`bookmarkView.createdAt`) for
+/// bookmarks — the ordering Bluesky's own bookmarks list uses — and is
+/// recorded in the index + envelope whether the post is newly saved or was
+/// already archived (the sweeper's full walks backfill older rows that
+/// way). Returns `true` if the post was already archived (i.e. the dedup
+/// boundary for a pagination pass has been reached).
+pub(crate) async fn archive_like_bookmark_post(
+    store: &ArchiveStore,
+    sender: &CandidatePostSender,
+    category: Category,
+    post_category: PostCategory,
+    post: &PostView,
+    action_at: Option<&str>,
+) -> Result<bool, PollError> {
+    if store.is_archived(category, &post.uri).await? {
+        if let Some(action_at) = action_at {
+            store.set_action_at(category, &post.uri, action_at).await?;
         }
+        debug!(at_uri = %post.uri, %category, "reached dedup boundary");
+        return Ok(true);
+    }
 
-        let outcome = self
-            .store
-            .save_post(category, &post.uri, &post.cid, post.record.clone())
-            .await?;
+    let outcome = store
+        .save_post(category, &post.uri, &post.cid, post.record.clone())
+        .await?;
 
-        if outcome == SaveOutcome::Inserted && has_archivable_media(&post.record) {
-            let media = post
-                .embed
-                .as_ref()
-                .map(extract_media_refs)
-                .unwrap_or_default();
+    if outcome == SaveOutcome::Inserted && has_archivable_media(&post.record) {
+        let media = post
+            .embed
+            .as_ref()
+            .map(extract_media_refs)
+            .unwrap_or_default();
 
-            if !media.is_empty() {
-                let candidate = CandidatePost {
-                    at_uri: post.uri.clone(),
-                    cid: post.cid.clone(),
-                    author_did: post.author.did.clone(),
-                    category: post_category,
-                    record: post.record.clone(),
-                    media,
-                };
-                if self.sender.send(candidate).await.is_err() {
-                    warn!(
-                        at_uri = %post.uri,
-                        "candidate post channel closed; media downloader not receiving"
-                    );
-                }
+        if !media.is_empty() {
+            let candidate = CandidatePost {
+                at_uri: post.uri.clone(),
+                cid: post.cid.clone(),
+                author_did: post.author.did.clone(),
+                category: post_category,
+                record: post.record.clone(),
+                media,
+            };
+            if sender.send(candidate).await.is_err() {
+                warn!(
+                    at_uri = %post.uri,
+                    "candidate post channel closed; media downloader not receiving"
+                );
             }
         }
+    }
 
-        if outcome == SaveOutcome::Inserted {
-            debug!(at_uri = %post.uri, %category, "archived new item");
+    if let Some(action_at) = action_at {
+        store.set_action_at(category, &post.uri, action_at).await?;
+    }
+
+    if outcome == SaveOutcome::Inserted {
+        debug!(at_uri = %post.uri, %category, "archived new item");
+    }
+
+    Ok(false)
+}
+
+/// Marks an archived post as deleted in the index after the API reported
+/// its bookmark as `notFound` (the post was deleted upstream). Storage
+/// failures are logged and swallowed: one unmarkable row must not abort
+/// the whole pagination pass, and the nightly sweep re-checks every
+/// archived URI anyway.
+async fn mark_bookmark_deleted(store: &ArchiveStore, subject_uri: &str) -> Result<(), PollError> {
+    match store.mark_post_deleted(subject_uri).await {
+        Ok(true) => {
+            info!(subject = %subject_uri, "bookmarked post deleted upstream; marked in index");
+            Ok(())
         }
-
-        Ok(false)
+        Ok(false) => Ok(()),
+        Err(err) => {
+            warn!(subject = %subject_uri, error = %err, "failed to mark deleted bookmarked post");
+            Ok(())
+        }
     }
 }
 
@@ -1569,6 +1646,128 @@ mod tests {
                 .is_archived(Category::Like, "at://did:plc:carol/app.bsky.feed.post/2")
                 .await
                 .unwrap()
+        );
+    }
+
+    /// A bookmarked post deleted upstream comes back as a `notFound`
+    /// bookmark item: the archived copy must be kept and marked with a
+    /// `deleted_at` timestamp. A blocked post still exists, so it must
+    /// never be marked.
+    #[tokio::test]
+    async fn deleted_bookmarked_post_is_marked_deleted_in_index() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        let (_dir, store) = open_store().await;
+        let deleted_uri = "at://did:plc:carol/app.bsky.feed.post/1";
+        store
+            .save_post(
+                Category::Bookmark,
+                deleted_uri,
+                "cid-1",
+                json!({"text": "deleted later"}),
+            )
+            .await
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bookmarks": [
+                    {
+                        "subject": {"uri": deleted_uri, "cid": "cid-1"},
+                        "item": {"uri": deleted_uri, "notFound": true},
+                    },
+                    {
+                        "subject": {
+                            "uri": "at://did:plc:y/app.bsky.feed.post/2",
+                            "cid": "cid-2",
+                        },
+                        "item": {
+                            "uri": "at://did:plc:y/app.bsky.feed.post/2",
+                            "cid": "cid-2",
+                            "author": {"did": "did:plc:y"},
+                            "blocked": true,
+                        },
+                    },
+                ],
+            })))
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = candidate_post_channel(8);
+        let poller = LikesBookmarksPoller::new(
+            make_client(&server),
+            store.clone(),
+            tx,
+            "did:plc:alice".to_string(),
+            Duration::from_secs(60),
+        );
+        poller.poll_bookmarks().await.expect("poll bookmarks");
+
+        let record = store
+            .get_post(Category::Bookmark, deleted_uri)
+            .await
+            .expect("get_post")
+            .expect("deleted post is still archived (kept, not removed)");
+        assert!(
+            record.deleted_at.is_some(),
+            "deleted bookmarked post should be marked"
+        );
+    }
+
+    /// The bookmark action time (`bookmarkView.createdAt` — what Bluesky's
+    /// own bookmarks list is ordered by) is captured at archive time so the
+    /// gallery's "bookmarked" sorts can reproduce that ordering.
+    #[tokio::test]
+    async fn bookmark_action_time_is_recorded_at_archive_time() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        let (_dir, store) = open_store().await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bookmarks": [{
+                    "subject": {
+                        "uri": "at://did:plc:carol/app.bsky.feed.post/1",
+                        "cid": "cid-1",
+                    },
+                    "createdAt": "2026-09-05T08:30:00.000Z",
+                    "item": {
+                        "uri": "at://did:plc:carol/app.bsky.feed.post/1",
+                        "cid": "cid-1",
+                        "author": {"did": "did:plc:carol"},
+                        "record": {"text": "bookmarked"},
+                    },
+                }],
+            })))
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = candidate_post_channel(8);
+        let poller = LikesBookmarksPoller::new(
+            make_client(&server),
+            store.clone(),
+            tx,
+            "did:plc:alice".to_string(),
+            Duration::from_secs(60),
+        );
+        poller.poll_bookmarks().await.expect("poll bookmarks");
+
+        let record = store
+            .get_post(
+                Category::Bookmark,
+                "at://did:plc:carol/app.bsky.feed.post/1",
+            )
+            .await
+            .expect("get_post")
+            .expect("bookmark archived");
+        assert_eq!(
+            record.action_at.as_deref(),
+            Some("2026-09-05T08:30:00.000Z"),
+            "the bookmark action time should be stored"
         );
     }
 

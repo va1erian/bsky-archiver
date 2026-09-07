@@ -122,6 +122,20 @@ impl BookmarkItem {
             BookmarkItem::Unresolved(_) => None,
         }
     }
+
+    /// Whether this unresolved item is a `notFoundPost` — the bookmarked
+    /// record no longer exists upstream (deleted, or the author's account
+    /// is deactivated). A `blockedPost` also fails to resolve, but the
+    /// post itself still exists, so it must not be treated as deleted.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            BookmarkItem::Post(_) => false,
+            BookmarkItem::Unresolved(value) => value
+                .get("notFound")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }
+    }
 }
 
 /// A `com.atproto.repo.strongRef`: a record's uri and cid.
@@ -139,6 +153,12 @@ pub struct BookmarkView {
     pub subject: StrongRef,
     #[serde(default)]
     pub item: Option<BookmarkItem>,
+    /// When the authenticated account bookmarked the post (the bookmark
+    /// action time). This — not the post's own `createdAt` — is what
+    /// Bluesky's bookmarks list is ordered by, so the gallery's
+    /// "bookmarked" sorts key off it. Optional per the lexicon.
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<String>,
 }
 
 /// A page of `app.bsky.bookmark.getBookmarks` results.
@@ -148,6 +168,28 @@ pub struct BookmarksPage {
     pub bookmarks: Vec<BookmarkView>,
     #[serde(default)]
     pub cursor: Option<String>,
+}
+
+/// A post reference the API could not hydrate to a `postView`, returned in
+/// a `getPosts` response's `notFoundPosts`/`blockedPosts` arrays.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct UnresolvedPost {
+    pub uri: String,
+}
+
+/// One page of `app.bsky.feed.getPosts` results: the posts that resolved,
+/// plus the requested refs that did not. `not_found_posts` covers posts
+/// that no longer exist (deleted, or the author's account is deactivated);
+/// `blocked_posts` covers posts that exist but the authenticated account
+/// cannot view (a block relationship).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PostsPage {
+    #[serde(default)]
+    pub posts: Vec<serde_json::Value>,
+    #[serde(default, rename = "notFoundPosts")]
+    pub not_found_posts: Vec<UnresolvedPost>,
+    #[serde(default, rename = "blockedPosts")]
+    pub blocked_posts: Vec<UnresolvedPost>,
 }
 
 /// One page of an account's authored feed, as returned by
@@ -385,6 +427,16 @@ impl BlueskyClient {
             .await
     }
 
+    /// Hydrates a batch of posts by URI (`app.bsky.feed.getPosts`). The
+    /// endpoint accepts at most 25 `uris` per call; callers must chunk.
+    /// Posts that fail to resolve come back in `not_found_posts`/
+    /// `blocked_posts` rather than failing the request.
+    pub async fn get_posts(&self, uris: &[String]) -> Result<PostsPage, BlueskyError> {
+        let query: Vec<(&str, String)> = uris.iter().map(|uri| ("uris", uri.clone())).collect();
+        self.get_authenticated("app.bsky.feed.getPosts", &query)
+            .await
+    }
+
     /// Authenticates immediately, returning the authenticated account's own
     /// DID. Used at startup to fail fast on bad credentials rather than
     /// discovering the problem on the first real API call.
@@ -554,6 +606,7 @@ mod tests {
                         "uri": "at://did:plc:carol/app.bsky.feed.post/2",
                         "cid": "cid-2",
                     },
+                    "createdAt": "2026-09-07T12:00:00.000Z",
                     "item": {
                         "uri": "at://did:plc:carol/app.bsky.feed.post/2",
                         "cid": "cid-2",
@@ -576,6 +629,11 @@ mod tests {
         assert_eq!(
             page.bookmarks[0].subject.uri,
             "at://did:plc:carol/app.bsky.feed.post/2"
+        );
+        assert_eq!(
+            page.bookmarks[0].created_at.as_deref(),
+            Some("2026-09-07T12:00:00.000Z"),
+            "the bookmark action time should be parsed"
         );
         let post = page.bookmarks[0]
             .item
@@ -622,6 +680,50 @@ mod tests {
         assert_eq!(page.bookmarks.len(), 2);
         assert!(page.bookmarks[0].item.as_ref().unwrap().post().is_none());
         assert!(page.bookmarks[1].item.as_ref().unwrap().post().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_posts_sends_uris_and_parses_unresolved() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getPosts"))
+            .and(query_param("uris", "at://did:plc:x/app.bsky.feed.post/1"))
+            .and(query_param("uris", "at://did:plc:y/app.bsky.feed.post/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "posts": [{
+                    "uri": "at://did:plc:x/app.bsky.feed.post/1",
+                    "cid": "cid-1",
+                    "author": {"did": "did:plc:x"},
+                    "record": {"text": "still here"},
+                }],
+                "notFoundPosts": [
+                    {"uri": "at://did:plc:y/app.bsky.feed.post/2"},
+                ],
+                "blockedPosts": [],
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let page = client
+            .get_posts(&[
+                "at://did:plc:x/app.bsky.feed.post/1".to_string(),
+                "at://did:plc:y/app.bsky.feed.post/2".to_string(),
+            ])
+            .await
+            .expect("get_posts should succeed");
+
+        assert_eq!(page.posts.len(), 1);
+        assert_eq!(page.posts[0]["record"]["text"], "still here");
+        assert_eq!(
+            page.not_found_posts,
+            vec![UnresolvedPost {
+                uri: "at://did:plc:y/app.bsky.feed.post/2".to_string(),
+            }]
+        );
+        assert!(page.blocked_posts.is_empty());
     }
 
     #[tokio::test]

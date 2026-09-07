@@ -20,14 +20,22 @@ archived remains browsable and exportable).
 For each archived item, the full post record is stored as JSON and any attached
 images/video are downloaded and stored alongside it. A small web UI lets a human
 browse the archive (post list + detail), view a gallery of archived media —
-filterable by category (posts / likes / bookmarks) and downloadable as a single
-zip of every image in the current selection — and see the active (non-secret)
+filterable by category (posts / likes / bookmarks), sortable by archive time,
+the post's own `createdAt`, or the bookmark action time ("Newest/Oldest
+bookmarked", which reproduces the order of Bluesky's own bookmarks list; rows
+without a recorded action time fall back to archive time) — and downloadable as a
+single zip of every image in the current selection — and see the active (non-secret)
 configuration.
 
 Real-time capture of the watched accounts' own posts uses a Jetstream firehose
 subscription; a REST-polling path fully substitutes for it whenever the firehose
 connection is unavailable. Likes and bookmarks aren't available on the firehose at
-all, so they're always fetched via periodic REST polling. The application ships as a
+all, so they're always fetched via periodic REST polling. Posts deleted upstream
+are never removed from the archive: a delete of a *watched* account's post is
+observed on the firehose, and deleted liked/bookmarked posts are caught by the
+bookmarks poller and a nightly verification sweep (see the module map's `sweep`
+row) — in every case the on-disk copy is kept and marked with a `deleted_at`
+timestamp in the index and the UI. The application ships as a
 single Docker image, configured by environment variables plus the UI-managed watch
 list, and is intended to run under Cosmos Cloud (a Docker Compose-style host) or
 plain `docker compose`.
@@ -39,10 +47,11 @@ plain `docker compose`.
 | `config` | Loading, defaulting, and validating every environment variable into one typed `AppConfig`. Startup fails fast (non-zero exit) on anything invalid. |
 | `bluesky` | The `com.atproto.*` / `app.bsky.*` REST (XRPC) client: session auth (with automatic re-login on a 401), `getAuthorFeed`, `getFeed`, `getActorLikes`, `getBookmarks`, and handle resolution. |
 | `firehose` | The Jetstream websocket consumer: real-time capture of the watched accounts' authored posts with media, filtered by DID from the live roster, with reconnect/backoff, a persisted cursor so a restart resumes roughly where it left off, and an immediate reconnect when the watched-account set changes. |
-| `poller` | The REST-polling fallback for authored posts (active whenever the firehose is down), the feed poller (algorithm/custom feeds, which are never on the firehose), and the periodic likes/bookmarks poller. All use adaptive intervals with jittered exponential backoff. |
+| `poller` | The REST-polling fallback for authored posts (active whenever the firehose is down), the feed poller (algorithm/custom feeds, which are never on the firehose), and the periodic likes/bookmarks poller. All use adaptive intervals with jittered exponential backoff. The bookmarks poller also detects deletions: a bookmark whose post comes back as `notFound` was deleted upstream, and its archived copy is marked with a `deleted_at` timestamp (a `blocked` post still exists and is never marked). |
+| `sweep` | The nightly likes/bookmarks deletion sweeper. Once per night at a fixed local hour (`NIGHTLY_SWEEP_LOCAL_HOUR`), it walks the entire bookmark and like lists (archiving anything the periodic pollers missed), then batch-verifies (`app.bsky.feed.getPosts`, 25 URIs per call) every URI already archived under those categories and marks the ones the API reports as gone. This is what catches deleted liked/bookmarked posts — including for authors not on the watch list, whom the firehose delete-op path never sees — and deletions that happened while the service was down. Marking only touches the index: the on-disk record and its media are always kept. |
 | `pipeline` | The shared `CandidatePost` channel and the `has_archivable_media` predicate connecting every producer (firehose, REST fallback, feed poller, likes/bookmarks poller) to the one consumer (the media downloader). |
 | `media` | Concurrency-limited, size-capped media downloading: streams each file, aborts if it exceeds `MEDIA_MAX_BYTES`, retries transient failures, and never leaves a partial file on disk. |
-| `storage` | The on-disk JSON archive (source of truth) plus the SQLite query index built on top of it (including the UI-managed `watched_sources` watch list). The index is fully rebuildable from disk (`reindex`) and is rebuilt automatically on startup if missing. |
+| `storage` | The on-disk JSON archive (source of truth) plus the SQLite query index built on top of it (including the UI-managed `watched_sources` watch list). Mirrors two timestamps per row for gallery ordering: `record_created_at` (the post's own `createdAt`) and `action_at` (when the account bookmarked it, from `bookmarkView.createdAt`). The index is fully rebuildable from disk (`reindex`) and is rebuilt automatically on startup if missing. |
 | `ratelimit` | The shared backoff/circuit-breaker policy and the process-wide inflight-request cap used by the pollers, the Bluesky client, and the media downloader. |
 | `health` | Per-subsystem health tracking (`Connected` / `Degraded` / `Error`), read by `/healthz` and the dashboard. |
 | `watchlist` | The in-memory `Watchlist` roster: a live `watch`-channel mirror of the `watched_sources` table that every producer reads and that reloads (with a bump) after each UI add/remove. |
@@ -53,8 +62,9 @@ plain `docker compose`.
 
 Every background task in `app::serve` is independently supervised: a panic or
 unexpected exit in the firehose consumer, REST fallback poller, feed poller,
-likes/bookmarks poller, or media downloader is logged and restarted with exponential
-backoff, rather than taking down the rest of the service. The only failures that stop
+likes/bookmarks poller, nightly sweeper, or media downloader is logged and
+restarted with exponential backoff, rather than taking down the rest of the
+service. The only failures that stop
 the process outright are genuine startup-validation failures (invalid config, bad
 Bluesky credentials, an unwritable database path) — those are surfaced immediately,
 with a non-zero exit, so a misconfigured deployment fails visibly instead of running
@@ -157,6 +167,7 @@ docker push localhost:5000/bsky-archiver:latest
 | `JETSTREAM_URL` | `wss://jetstream1.us-east.bsky.network/subscribe` | Jetstream websocket endpoint for real-time firehose consumption. Override to point at a self-hosted Jetstream instance. |
 | `MEDIA_MAX_CONCURRENT_DOWNLOADS` | `4` | Cap on simultaneous media downloads. |
 | `MEDIA_MAX_BYTES` | `104857600` (100 MiB) | Per-file download size safety cap. |
+| `NIGHTLY_SWEEP_LOCAL_HOUR` | `3` | Local hour of day (0-23) at which the nightly likes/bookmarks deletion sweep runs. In a container this is the container's timezone (usually UTC; set `TZ` to shift it). |
 | `RUST_LOG` | `info` | Standard `tracing`/`tracing-subscriber` filter string. |
 
 What the archiver watches is **not** configured via environment variables: the watch
@@ -190,7 +201,8 @@ image and recreating the container against the same volume.
 
 The image defines a `HEALTHCHECK` that polls `GET /healthz` (no auth required) and
 reports unhealthy if any background subsystem (firehose, REST fallback, feed
-poller, likes/bookmarks poller, media downloader) is in an error state. The
+poller, likes/bookmarks poller, nightly sweeper, media downloader) is in an error
+state. The
 process also fails fast and exits non-zero on startup if configuration is invalid
 or Bluesky authentication fails, so a misconfigured deployment is immediately
 visible in container logs/exit status rather than hanging.
