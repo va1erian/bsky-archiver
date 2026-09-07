@@ -71,6 +71,7 @@ fn test_config(archive_dir: std::path::PathBuf, database_path: std::path::PathBu
         jetstream_url: url::Url::parse("wss://jetstream.example.invalid/subscribe").unwrap(),
         media_max_concurrent_downloads: 4,
         media_max_bytes: 10_000_000,
+        nightly_sweep_local_hour: 3,
     }
 }
 

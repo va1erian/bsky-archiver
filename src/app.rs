@@ -45,6 +45,7 @@ use crate::poller::{FeedPoller, LikesBookmarksPoller, PollerConfig, RestFallback
 use crate::ratelimit::RequestLimiter;
 use crate::state::{AppState, SharedAppState};
 use crate::storage::{ArchiveStore, SourceKind, StorageError};
+use crate::sweep::NightlySweeper;
 use crate::watchlist::Watchlist;
 
 /// The production Bluesky XRPC entryway. Not part of the canonical env var
@@ -246,8 +247,18 @@ pub async fn serve(started: Started) {
         Arc::clone(&bluesky_client),
         state.store.clone(),
         candidate_tx.clone(),
-        self_did,
+        self_did.clone(),
         Duration::from_secs(config.poll_interval_seconds),
+        health_tx.clone(),
+        shutdown_rx.clone(),
+    );
+
+    let nightly_sweep_handle = spawn_nightly_sweep(
+        Arc::clone(&bluesky_client),
+        state.store.clone(),
+        candidate_tx.clone(),
+        self_did,
+        config.nightly_sweep_local_hour,
         health_tx.clone(),
         shutdown_rx.clone(),
     );
@@ -278,6 +289,7 @@ pub async fn serve(started: Started) {
         rest_fallback_handle,
         feed_poller_handle,
         likes_bookmarks_handle,
+        nightly_sweep_handle,
         web_handle
     );
 
@@ -408,6 +420,37 @@ fn spawn_likes_bookmarks(
                 base_interval,
             );
             async move { poller.run().await }
+        },
+    ))
+}
+
+/// Spawns the nightly likes/bookmarks deletion sweeper under the same
+/// supervisor as every other background task. Unlike the pollers it is
+/// mostly idle (sleeping until its configured local hour), so its health
+/// entry means "task alive and scheduled", not "actively sweeping".
+fn spawn_nightly_sweep(
+    client: Arc<BlueskyClient>,
+    store: ArchiveStore,
+    candidate_tx: CandidatePostSender,
+    actor: String,
+    local_hour: u32,
+    health_tx: HealthSender,
+    shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(supervise(
+        "nightly_sweep",
+        shutdown_rx,
+        health_tx,
+        |snapshot, health| snapshot.nightly_sweep = health,
+        move || {
+            let sweeper = NightlySweeper::new(
+                Arc::clone(&client),
+                store.clone(),
+                candidate_tx.clone(),
+                actor.clone(),
+                local_hour,
+            );
+            async move { sweeper.run().await }
         },
     ))
 }
@@ -629,6 +672,7 @@ mod tests {
             jetstream_url: Url::parse("wss://jetstream.example.com/subscribe").unwrap(),
             media_max_concurrent_downloads: 4,
             media_max_bytes: 104_857_600,
+            nightly_sweep_local_hour: 3,
         }
     }
 

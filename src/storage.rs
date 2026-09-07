@@ -174,6 +174,14 @@ pub struct ArchivedRecord {
     pub record: serde_json::Value,
     #[serde(default)]
     pub deleted_at: Option<String>,
+    /// When the authenticated account saved this item into the category —
+    /// the bookmark action time for bookmarks, from the API's
+    /// `bookmarkView.createdAt`. `None` for posts/likes (no action time
+    /// exists) and for rows archived before the column was added. Mirrored
+    /// into the index so the gallery can reproduce Bluesky's own bookmarks
+    /// ordering.
+    #[serde(default)]
+    pub action_at: Option<String>,
 }
 
 /// Metadata about one media file attached to an archived record.
@@ -201,7 +209,9 @@ pub struct PostSummary {
 /// How rows are ordered for the gallery view. The media index stores the
 /// archive time (`indexed_at`); the record's own `createdAt` is mirrored
 /// into the posts table (`record_created_at`) so the original post/edit
-/// time can also drive ordering.
+/// time can also drive ordering, and the bookmark action time is mirrored
+/// into `action_at` so the gallery can reproduce Bluesky's own bookmarks
+/// ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MediaSort {
     #[default]
@@ -209,13 +219,17 @@ pub enum MediaSort {
     OldestArchived,
     NewestCreated,
     OldestCreated,
+    NewestAction,
+    OldestAction,
 }
 
 impl MediaSort {
     /// SQL used as the ordering key (column/tiebreak pair inline) in
     /// `list_media`, where `media` and `posts` are the table aliases in
     /// scope. `record_created_at` falls back to the media's archive time
-    /// for rows whose record carried no `createdAt`.
+    /// for rows whose record carried no `createdAt`; `action_at` falls
+    /// back the same way (it only exists for bookmarks saved after it was
+    /// introduced).
     fn sql(self) -> &'static str {
         match self {
             MediaSort::NewestArchived => "media.indexed_at DESC, media.id DESC",
@@ -227,6 +241,12 @@ impl MediaSort {
             }
             MediaSort::OldestCreated => {
                 "COALESCE(record_created_at, media.indexed_at) ASC, media.id ASC"
+            }
+            MediaSort::NewestAction => {
+                "COALESCE(posts.action_at, media.indexed_at) DESC, media.id DESC"
+            }
+            MediaSort::OldestAction => {
+                "COALESCE(posts.action_at, media.indexed_at) ASC, media.id ASC"
             }
         }
     }
@@ -383,7 +403,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Version 3 adds `posts.record_created_at`, mirroring the record's own
 /// `createdAt` so the gallery can sort by it. The column is nullable and
 /// backfilled from the on-disk `record.json` for rows that predate it.
-const SCHEMA_VERSION: i64 = 3;
+///
+/// Version 4 adds `posts.action_at`, the bookmark action time (from the
+/// API's `bookmarkView.createdAt`), so the gallery can reproduce Bluesky's
+/// own bookmarks ordering. Nullable; backfilled for bookmarks by the
+/// nightly sweeper's full walks.
+const SCHEMA_VERSION: i64 = 4;
 
 fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -400,6 +425,7 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
             indexed_at TEXT NOT NULL,
             record_path TEXT NOT NULL,
             record_created_at TEXT,
+            action_at TEXT,
             PRIMARY KEY (category, at_uri)
         );
         CREATE INDEX IF NOT EXISTS idx_posts_category_indexed_at
@@ -450,6 +476,10 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         migrate_v2_to_v3(conn)?;
     }
 
+    if previous_version < 4 {
+        migrate_v3_to_v4(conn)?;
+    }
+
     if current_version != Some(SCHEMA_VERSION) {
         conn.execute(
             "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
@@ -497,6 +527,27 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_posts_category_record_created_at
              ON posts(category, record_created_at, at_uri);",
+    )?;
+    Ok(())
+}
+
+/// Adds the `action_at` mirror column (the bookmark action time) to
+/// existing `posts` tables (fresh databases already have it from
+/// [`bootstrap_schema`]), then its ordering index.
+fn migrate_v3_to_v4(conn: &Connection) -> Result<(), StorageError> {
+    let has_column: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('posts') WHERE name = 'action_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?;
+    if !has_column {
+        conn.execute_batch("ALTER TABLE posts ADD COLUMN action_at TEXT;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_posts_category_action_at
+             ON posts(category, action_at, at_uri);",
     )?;
     Ok(())
 }
@@ -638,6 +689,7 @@ impl ArchiveStore {
                 media: Vec::new(),
                 record,
                 deleted_at: None,
+                action_at: None,
             };
             let bytes = serde_json::to_vec_pretty(&archived)?;
             atomic_write(&path, &bytes)?;
@@ -1185,6 +1237,7 @@ impl ArchiveStore {
                             archived.indexed_at.clone(),
                             relative_str(&archive_dir, &record_file),
                             record_created_at_from(&archived.record),
+                            archived.action_at.clone(),
                         ));
                     }
                 }
@@ -1206,7 +1259,8 @@ impl ArchiveStore {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM media", [])?;
             tx.execute("DELETE FROM posts", [])?;
-            for (at_uri, category, cid, indexed_at, record_path, record_created_at) in found_posts
+            for (at_uri, category, cid, indexed_at, record_path, record_created_at, action_at) in
+                found_posts
             {
                 let deleted_at = if deleted_uris.contains(&at_uri) {
                     Some(indexed_at.clone())
@@ -1214,8 +1268,8 @@ impl ArchiveStore {
                     None
                 };
                 tx.execute(
-                    "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path, deleted_at, record_created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path, deleted_at, record_created_at, action_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         at_uri,
                         category.as_dir(),
@@ -1223,7 +1277,8 @@ impl ArchiveStore {
                         indexed_at,
                         record_path,
                         deleted_at,
-                        record_created_at
+                        record_created_at,
+                        action_at
                     ],
                 )?;
             }
@@ -1298,19 +1353,118 @@ impl ArchiveStore {
 
     /// Marks a post as deleted in the index. Idempotent: if already marked,
     /// the earlier timestamp is preserved. Only affects the index; the
-    /// on-disk record.json remains untouched.
-    pub async fn mark_post_deleted(&self, at_uri: &str) -> Result<(), StorageError> {
+    /// on-disk record.json remains untouched. Returns `true` if this call
+    /// newly marked the post (i.e. it wasn't already marked).
+    pub async fn mark_post_deleted(&self, at_uri: &str) -> Result<bool, StorageError> {
         let db = Arc::clone(&self.db);
         let at_uri = at_uri.to_string();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
             let deleted_at = now_rfc3339();
             let conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute(
+            let changed = conn.execute(
                 "UPDATE posts SET deleted_at = ?1
                  WHERE at_uri = ?2 AND deleted_at IS NULL",
                 params![deleted_at, at_uri],
             )?;
-            Ok(())
+            Ok(changed > 0)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Lists every archived `at_uri` under `category`, oldest-indexed first.
+    /// Used by the nightly sweeper to batch-verify that liked/bookmarked
+    /// posts still exist upstream.
+    pub async fn list_archived_uris(
+        &self,
+        category: Category,
+    ) -> Result<Vec<String>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<String>, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt =
+                conn.prepare("SELECT at_uri FROM posts WHERE category = ?1 ORDER BY indexed_at")?;
+            let rows = stmt.query_map(params![category.as_dir()], |row| row.get::<_, String>(0))?;
+            let mut uris = Vec::new();
+            for row in rows {
+                uris.push(row?);
+            }
+            Ok(uris)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Records when the authenticated account saved this item into the
+    /// category (`bookmarkView.createdAt` — the bookmark action time the
+    /// Bluesky UI itself orders by). Only writes rows that don't have the
+    /// value yet, and mirrors it into the on-disk `record.json` envelope so
+    /// [`ArchiveStore::reindex`] preserves it. Returns `true` if this call
+    /// newly recorded a value.
+    ///
+    /// A failure here is the caller's problem to log and swallow: an
+    /// unrecorded action time only degrades the bookmarked sorting for that
+    /// row (it falls back to archive time), never the archive itself.
+    pub async fn set_action_at(
+        &self,
+        category: Category,
+        at_uri: &str,
+        action_at: &str,
+    ) -> Result<bool, StorageError> {
+        let archive_dir = self.archive_dir.clone();
+        let db = Arc::clone(&self.db);
+        let at_uri = at_uri.to_string();
+        let category_dir = category.as_dir().to_string();
+        let action_at = action_at.to_string();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = conn.execute(
+                "UPDATE posts SET action_at = ?1
+                 WHERE category = ?2 AND at_uri = ?3 AND action_at IS NULL",
+                params![action_at, category_dir, at_uri],
+            )? > 0;
+
+            if changed {
+                // Mirror into the envelope so a reindex (which rebuilds the
+                // index from disk) keeps the value. Best effort: an
+                // unreadable record just leaves the envelope without it.
+                let record_path: Option<String> = conn
+                    .query_row(
+                        "SELECT record_path FROM posts
+                         WHERE category = ?1 AND at_uri = ?2",
+                        params![category_dir, at_uri],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if let Some(record_path) = record_path {
+                    let path = archive_dir.join(&record_path);
+                    if let Ok(bytes) = std::fs::read(&path)
+                        && let Ok(mut archived) = serde_json::from_slice::<ArchivedRecord>(&bytes)
+                        && archived.action_at.is_none()
+                    {
+                        archived.action_at = Some(action_at);
+                        match serde_json::to_vec_pretty(&archived) {
+                            Ok(out) => {
+                                if let Err(err) = atomic_write(&path, &out) {
+                                    tracing::warn!(
+                                        at_uri = %at_uri,
+                                        error = %err,
+                                        "failed to persist action_at into record.json"
+                                    );
+                                }
+                            }
+                            Err(err) => tracing::warn!(
+                                at_uri = %at_uri,
+                                error = %err,
+                                "failed to serialize record.json for action_at"
+                            ),
+                        }
+                    }
+                }
+            }
+
+            Ok(changed)
         })
         .await;
         join_result(result)
@@ -2093,7 +2247,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
 
         // ...and the new table is usable immediately (no data had to move).
         assert!(store.list_watched_sources().await.unwrap().is_empty());
@@ -2184,7 +2338,11 @@ mod tests {
             .unwrap();
         }
 
-        store.mark_post_deleted(at_uri).await.unwrap();
+        let newly_marked = store.mark_post_deleted(at_uri).await.unwrap();
+        assert!(
+            !newly_marked,
+            "mark_post_deleted should report an already-marked post as not newly marked"
+        );
 
         let record = store
             .get_post(Category::Post, at_uri)
@@ -2196,6 +2354,78 @@ mod tests {
             Some(first_deleted_at),
             "mark_post_deleted should not overwrite earlier timestamp"
         );
+    }
+
+    #[tokio::test]
+    async fn mark_post_deleted_reports_whether_it_marked() {
+        let (_dir, store) = open_store().await;
+        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
+
+        store
+            .save_post(Category::Post, at_uri, "cid-1", json!({"text": "test"}))
+            .await
+            .unwrap();
+
+        let newly_marked = store.mark_post_deleted(at_uri).await.unwrap();
+        assert!(newly_marked, "first mark should report newly marked");
+
+        // A URI that was never archived marks nothing.
+        let missing = store
+            .mark_post_deleted("at://did:plc:alice/app.bsky.feed.post/missing")
+            .await
+            .unwrap();
+        assert!(
+            !missing,
+            "marking an unarchived URI reports not newly marked"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_archived_uris_returns_each_category_in_index_order() {
+        let (_dir, store) = open_store().await;
+
+        store
+            .save_post(
+                Category::Bookmark,
+                "at://did:plc:carol/app.bsky.feed.post/2",
+                "cid-2",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        store
+            .save_post(
+                Category::Bookmark,
+                "at://did:plc:carol/app.bsky.feed.post/1",
+                "cid-1",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        store
+            .save_post(
+                Category::Like,
+                "at://did:plc:dave/app.bsky.feed.post/9",
+                "cid-9",
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        let bookmarks = store.list_archived_uris(Category::Bookmark).await.unwrap();
+        assert_eq!(
+            bookmarks,
+            vec![
+                "at://did:plc:carol/app.bsky.feed.post/2",
+                "at://did:plc:carol/app.bsky.feed.post/1",
+            ]
+        );
+
+        let likes = store.list_archived_uris(Category::Like).await.unwrap();
+        assert_eq!(likes, vec!["at://did:plc:dave/app.bsky.feed.post/9"]);
+
+        let posts = store.list_archived_uris(Category::Post).await.unwrap();
+        assert!(posts.is_empty());
     }
 
     #[tokio::test]
@@ -2223,5 +2453,154 @@ mod tests {
             page.items[0].deleted_at.is_some(),
             "deleted post should have deleted_at set"
         );
+    }
+
+    /// `set_action_at` records the bookmark action time in both the index
+    /// and the on-disk envelope, is idempotent, and survives a reindex
+    /// (which rebuilds the index purely from disk).
+    #[tokio::test]
+    async fn set_action_at_updates_index_and_envelope_and_survives_reindex() {
+        let (dir, store) = open_store().await;
+        let at_uri = "at://did:plc:carol/app.bsky.feed.post/1";
+
+        store
+            .save_post(
+                Category::Bookmark,
+                at_uri,
+                "cid-1",
+                json!({"text": "saved"}),
+            )
+            .await
+            .unwrap();
+
+        let newly = store
+            .set_action_at(Category::Bookmark, at_uri, "2026-09-01T10:00:00.000Z")
+            .await
+            .unwrap();
+        assert!(newly, "first set should report newly recorded");
+
+        let again = store
+            .set_action_at(Category::Bookmark, at_uri, "2026-09-02T10:00:00.000Z")
+            .await
+            .unwrap();
+        assert!(!again, "second set must not overwrite the first value");
+
+        let record = store
+            .get_post(Category::Bookmark, at_uri)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.action_at.as_deref(),
+            Some("2026-09-01T10:00:00.000Z")
+        );
+
+        // The envelope on disk carries it too, so a full reindex — which
+        // rebuilds the index from the record.json files alone — preserves
+        // the ordering key.
+        store.reindex().await.unwrap();
+        let record = store
+            .get_post(Category::Bookmark, at_uri)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.action_at.as_deref(),
+            Some("2026-09-01T10:00:00.000Z"),
+            "action_at must survive a reindex"
+        );
+
+        // An unknown URI reports nothing recorded; a save_post that races
+        // in a second category is untouched.
+        let missing = store
+            .set_action_at(
+                Category::Bookmark,
+                "at://did:plc:carol/app.bsky.feed.post/x",
+                "2026-09-01T10:00:00.000Z",
+            )
+            .await
+            .unwrap();
+        assert!(!missing);
+        let _ = dir;
+    }
+
+    /// The gallery's "bookmarked" sorts order by `action_at` (Bluesky's own
+    /// bookmarks ordering), falling back to archive time for rows without
+    /// one.
+    #[tokio::test]
+    async fn list_media_bookmarked_sort_uses_action_at_with_archive_fallback() {
+        let (_dir, store) = open_store().await;
+
+        // Archive order: first, second, third. Action times deliberately
+        // scramble that: "first" was bookmarked most recently (Sep 3),
+        // "third" earliest (Sep 1), and "second" has no action time at all,
+        // so it falls back to its archive time — which is "now" for a test
+        // store, newer than both action times.
+        for (name, uri, text) in [
+            (
+                "first.png",
+                "at://did:plc:carol/app.bsky.feed.post/1",
+                "one",
+            ),
+            (
+                "second.png",
+                "at://did:plc:carol/app.bsky.feed.post/2",
+                "two",
+            ),
+            (
+                "third.png",
+                "at://did:plc:carol/app.bsky.feed.post/3",
+                "three",
+            ),
+        ] {
+            store
+                .save_post(Category::Bookmark, uri, name, json!({"text": text}))
+                .await
+                .unwrap();
+            store
+                .save_media(
+                    Category::Bookmark,
+                    uri,
+                    name,
+                    Some("image/png".to_string()),
+                    b"png-bytes".to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .set_action_at(
+                Category::Bookmark,
+                "at://did:plc:carol/app.bsky.feed.post/1",
+                "2026-09-03T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        store
+            .set_action_at(
+                Category::Bookmark,
+                "at://did:plc:carol/app.bsky.feed.post/3",
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+
+        fn names(page: &Page<MediaSummary>) -> Vec<String> {
+            page.items.iter().map(|m| m.filename.clone()).collect()
+        }
+
+        // Newest action first; the no-action-time row falls back to its
+        // (just-now) archive time, so it lands at the very front.
+        let newest = store
+            .list_media(Some(Category::Bookmark), 1, 10, MediaSort::NewestAction)
+            .await
+            .unwrap();
+        assert_eq!(names(&newest), vec!["second.png", "first.png", "third.png"]);
+
+        let oldest = store
+            .list_media(Some(Category::Bookmark), 1, 10, MediaSort::OldestAction)
+            .await
+            .unwrap();
+        assert_eq!(names(&oldest), vec!["third.png", "first.png", "second.png"]);
     }
 }

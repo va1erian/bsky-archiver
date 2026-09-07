@@ -655,30 +655,37 @@ a.gallery-item-thumb {
 
 /* ---------------------------------------------------------------------------
    Accent color palette. The default (blue) is Pico's own and needs no override.
-   Each [data-accent] block remaps the three Pico primary variables so links,
-   buttons, pagination, and category-filter highlights follow the user's choice.
+   Each block remaps the three Pico primary variables so links, buttons,
+   pagination, and category-filter highlights follow the user's choice.
    Category badges keep their own semantic colours — they don't use --pico-primary.
+
+   The selector must be `:root[data-accent=…]`, not bare `[data-accent=…]`: this
+   Pico build declares its palette on `:root:not([data-theme=dark])` (light) and
+   `:root:not([data-theme])` (dark), both specificity (0,2,0). A bare attribute
+   selector is (0,1,0) and loses the cascade in both schemes, so the picker
+   silently does nothing. `:root[data-accent=…]` ties at (0,2,0) and wins on
+   source order (app.css loads after pico.min.css).
    --------------------------------------------------------------------------- */
 
-[data-accent="purple"] {
+:root[data-accent="purple"] {
   --pico-primary: #7c3aed;
   --pico-primary-hover: #6d28d9;
   --pico-primary-background: #7c3aed;
 }
 
-[data-accent="green"] {
+:root[data-accent="green"] {
   --pico-primary: #059669;
   --pico-primary-hover: #047857;
   --pico-primary-background: #059669;
 }
 
-[data-accent="orange"] {
+:root[data-accent="orange"] {
   --pico-primary: #ea580c;
   --pico-primary-hover: #c2410c;
   --pico-primary-background: #ea580c;
 }
 
-[data-accent="pink"] {
+:root[data-accent="pink"] {
   --pico-primary: #db2777;
   --pico-primary-hover: #be185d;
   --pico-primary-background: #db2777;
