@@ -14,7 +14,9 @@ WORKDIR /build
 
 # Cache dependency compilation separately from application source so that
 # source-only changes don't invalidate the (slow) dependency build layer.
-COPY Cargo.toml Cargo.lock ./
+# build.rs is included here too: adding it later would invalidate the
+# dependency build (the package's build script is part of its fingerprint).
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src \
     && echo "fn main() {}" > src/main.rs \
     && cargo build --release \
@@ -23,6 +25,10 @@ RUN mkdir src \
 COPY src ./src
 COPY templates ./templates
 COPY static ./static
+# The build script bakes the git revision into the binary's footer; the
+# .git directory (kept small and un-excluded in .dockerignore) must be
+# present at compile time for that to work.
+COPY .git ./.git
 # Force cargo to notice main.rs changed since the dummy build above.
 RUN touch src/main.rs && cargo build --release
 
