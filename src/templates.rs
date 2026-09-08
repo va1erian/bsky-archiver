@@ -14,6 +14,21 @@ use crate::storage::{Category, MediaSummary, PostSummary, SourceKind, WatchedSou
 /// web UI footer so ops can tell which build is deployed.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The git revision this binary was built from (short `git rev-parse`
+/// output, captured by the build script; `"unknown"` when building outside
+/// a checkout). Surfaced in the web UI footer.
+pub const GIT_REVISION: &str = match option_env!("BSKY_ARCHIVER_GIT_SHA") {
+    Some(sha) => sha,
+    None => "unknown",
+};
+
+/// The UTC build timestamp (`YYYY-MM-DD HH:MM`), captured by the build
+/// script. Surfaced in the web UI footer.
+pub const BUILD_DATE: &str = match option_env!("BSKY_ARCHIVER_BUILD_DATE") {
+    Some(date) => date,
+    None => "unknown",
+};
+
 /// How many characters of a post's text are shown in list views before
 /// truncating with an ellipsis.
 const MAX_EXCERPT_CHARS: usize = 220;
@@ -185,6 +200,8 @@ pub fn subsystem_row(name: &'static str, health: &SubsystemHealth) -> SubsystemR
 #[template(path = "dashboard.html")]
 pub struct DashboardTemplate {
     pub version: &'static str,
+    pub git_revision: &'static str,
+    pub build_date: &'static str,
     pub posts_count: u64,
     pub likes_count: u64,
     pub bookmarks_count: u64,
@@ -261,6 +278,8 @@ pub struct SortOption {
 #[template(path = "posts.html")]
 pub struct PostsTemplate {
     pub version: &'static str,
+    pub git_revision: &'static str,
+    pub build_date: &'static str,
     pub rows: Vec<PostRow>,
     pub pagination: Pagination,
     pub category_options: Vec<CategoryOption>,
@@ -284,6 +303,8 @@ pub struct PostMedia {
 #[template(path = "post_detail.html")]
 pub struct PostDetailTemplate {
     pub version: &'static str,
+    pub git_revision: &'static str,
+    pub build_date: &'static str,
     pub category_label: &'static str,
     pub category_badge_class: &'static str,
     pub author: String,
@@ -356,6 +377,8 @@ pub struct GalleryExport {
 #[template(path = "gallery.html")]
 pub struct GalleryTemplate {
     pub version: &'static str,
+    pub git_revision: &'static str,
+    pub build_date: &'static str,
     pub items: Vec<GalleryItem>,
     pub pagination: Pagination,
     pub category_options: Vec<CategoryOption>,
@@ -394,6 +417,8 @@ pub struct ConfigRow {
 #[template(path = "config.html")]
 pub struct ConfigTemplate {
     pub version: &'static str,
+    pub git_revision: &'static str,
+    pub build_date: &'static str,
     pub rows: Vec<ConfigRow>,
     pub sources: Vec<SourceRow>,
     /// Inline error for the watched-sources panel (always `None` when the
@@ -495,6 +520,16 @@ mod tests {
         assert_eq!(
             bluesky_post_url("at://did:plc:alice/app.bsky.feed.like/abc"),
             None
+        );
+    }
+
+    #[test]
+    fn build_date_has_expected_shape() {
+        // "YYYY-MM-DD HH:MM UTC" is exactly 20 chars; otherwise the build
+        // script didn't run and the fallback applies.
+        assert!(
+            BUILD_DATE == "unknown" || (BUILD_DATE.len() == 20 && BUILD_DATE.ends_with(" UTC")),
+            "unexpected BUILD_DATE: {BUILD_DATE}"
         );
     }
 

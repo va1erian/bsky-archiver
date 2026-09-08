@@ -248,6 +248,8 @@ async fn dashboard(State(state): State<WebState>) -> Result<Response, WebError> 
 
     let template = templates::DashboardTemplate {
         version: templates::APP_VERSION,
+        git_revision: templates::GIT_REVISION,
+        build_date: templates::BUILD_DATE,
         posts_count,
         likes_count,
         bookmarks_count,
@@ -330,6 +332,8 @@ async fn list_posts(
         let category_options = build_category_options(query.category.as_deref());
         let template = templates::PostsTemplate {
             version: templates::APP_VERSION,
+            git_revision: templates::GIT_REVISION,
+            build_date: templates::BUILD_DATE,
             rows,
             pagination,
             category_options,
@@ -409,6 +413,8 @@ async fn post_detail(
 
             let template = templates::PostDetailTemplate {
                 version: templates::APP_VERSION,
+                git_revision: templates::GIT_REVISION,
+                build_date: templates::BUILD_DATE,
                 category_label: templates::category_label(category),
                 category_badge_class: templates::category_badge_class(category),
                 author: templates::author_did_from_at_uri(&at_uri).to_string(),
@@ -595,6 +601,8 @@ async fn gallery(
         let sort_options = build_gallery_sort_options(category, sort, page_size);
         let template = templates::GalleryTemplate {
             version: templates::APP_VERSION,
+            git_revision: templates::GIT_REVISION,
+            build_date: templates::BUILD_DATE,
             items,
             pagination,
             category_options,
@@ -879,6 +887,8 @@ async fn config_view(State(state): State<WebState>) -> Response {
     };
     askama_axum::into_response(&templates::ConfigTemplate {
         version: templates::APP_VERSION,
+        git_revision: templates::GIT_REVISION,
+        build_date: templates::BUILD_DATE,
         rows,
         sources,
         error: None,

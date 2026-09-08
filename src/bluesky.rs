@@ -69,6 +69,21 @@ fn header_as_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+/// The statuses whose response body is read up front rather than in the
+/// error path: those that can report an expired token (401), and those
+/// Bluesky reports expired tokens with (400) — the body is both the
+/// expired-token signal and the error message, so it can only be read once.
+fn reads_body_before_error(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::BAD_REQUEST
+}
+
+/// Whether an XRPC error body reports an expired access token —
+/// `{"error":"ExpiredToken","message":"Token has expired"}`. Matched on the
+/// error *name* (not the message) so a message change can't break recovery.
+fn is_expired_token_body(body: &str) -> bool {
+    body.contains("\"ExpiredToken\"")
+}
+
 /// A view of an author, as embedded in a [`PostView`].
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct AuthorView {
@@ -317,7 +332,8 @@ impl BlueskyClient {
     }
 
     /// Performs an authenticated GET against `method` with the given query
-    /// parameters, retrying once with a fresh session on a 401.
+    /// parameters, retrying once with a fresh session when the current
+    /// access token has expired.
     async fn get_authenticated<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
@@ -326,29 +342,54 @@ impl BlueskyClient {
         let url = self.xrpc_url(method);
         let mut access_token = self.access_token().await?;
 
-        let mut response = {
-            let _permit = self.throttle().await;
-            self.http
-                .get(url.clone())
-                .bearer_auth(&access_token)
-                .query(query)
-                .send()
-                .await?
-        };
+        let mut response = Some(self.send_get(&url, &access_token, query).await?);
+        let mut status = response.as_ref().expect("just sent").status();
+        let mut retry_after = parse_retry_hint(response.as_ref().expect("just sent").headers());
+        let mut body: Option<String> = None;
 
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            access_token = self.login().await?;
-            let _permit = self.throttle().await;
-            response = self
-                .http
-                .get(url)
-                .bearer_auth(&access_token)
-                .query(query)
-                .send()
-                .await?;
+        // Bluesky rejects an expired access token with HTTP 401, or with a
+        // 400 whose body names `ExpiredToken` (the AppView's own convention
+        // — not a 401, which is what makes long-running pollers strand on a
+        // stale session). Both mean the cached session is stale: log in
+        // again and retry the request exactly once. The response body is
+        // consumed up front for exactly those statuses because (a) it is
+        // what distinguishes an expired token from any other 400 and (b) it
+        // is the same body the error path below wants.
+        if reads_body_before_error(status) {
+            let sent = response.take().expect("response present");
+            retry_after = parse_retry_hint(sent.headers());
+            let body_text = sent.text().await.unwrap_or_default();
+            body = Some(body_text);
+
+            let expired = status == reqwest::StatusCode::UNAUTHORIZED
+                || body.as_deref().is_some_and(is_expired_token_body);
+            if expired {
+                tracing::info!(%method, "bluesky access token expired; re-authenticating");
+                access_token = self.login().await?;
+                let fresh = self.send_get(&url, &access_token, query).await?;
+                status = fresh.status();
+                retry_after = parse_retry_hint(fresh.headers());
+                if reads_body_before_error(status) {
+                    body = Some(fresh.text().await.unwrap_or_default());
+                } else {
+                    body = None;
+                    response = Some(fresh);
+                }
+            }
         }
 
-        let status = response.status();
+        // The body was already extracted only for the statuses that are
+        // always errors, so carrying one here means the request failed for
+        // good (the retry, if any, also errored).
+        if let Some(body) = body {
+            return Err(BlueskyError::Api {
+                status: status.as_u16(),
+                body,
+                retry_after,
+            });
+        }
+
+        let response = response.expect("response is present unless its body was extracted");
         if !status.is_success() {
             let retry_after = parse_retry_hint(response.headers());
             let body = response.text().await.unwrap_or_default();
@@ -360,6 +401,24 @@ impl BlueskyClient {
         }
 
         Ok(response.json().await?)
+    }
+
+    /// Sends one authenticated GET attempt. Split out so the expired-token
+    /// retry below can issue a second request with a fresh token.
+    async fn send_get(
+        &self,
+        url: &url::Url,
+        access_token: &str,
+        query: &[(&str, String)],
+    ) -> Result<reqwest::Response, BlueskyError> {
+        let _permit = self.throttle().await;
+        Ok(self
+            .http
+            .get(url.clone())
+            .bearer_auth(access_token)
+            .query(query)
+            .send()
+            .await?)
     }
 
     /// Fetches one page of `actor`'s authored feed
@@ -780,6 +839,93 @@ mod tests {
             .await
             .expect("should succeed after relogin");
         assert!(page.feed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_token_400_triggers_relogin_and_retry() {
+        let server = MockServer::start().await;
+
+        // First login returns a token the (mock) AppView then rejects with
+        // its expired-token convention: an HTTP 400 whose body names
+        // `ExpiredToken` — not a 401, which is what used to strand long
+        // pollers retrying forever on the stale session.
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessJwt": "token-1",
+                "refreshJwt": "refresh-1",
+                "did": "did:plc:alice",
+                "handle": "alice.bsky.social",
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessJwt": "token-2",
+                "refreshJwt": "refresh-2",
+                "did": "did:plc:alice",
+                "handle": "alice.bsky.social",
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+            .and(header("authorization", "Bearer token-1"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "ExpiredToken",
+                "message": "Token has expired",
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+            .and(header("authorization", "Bearer token-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bookmarks": [],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let page = client
+            .get_bookmarks(None, 50)
+            .await
+            .expect("should succeed after relogin on a 400 ExpiredToken");
+        assert!(page.bookmarks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_expired_400_is_surfaced_as_api_error() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "InvalidRequest",
+                "message": "bad limit",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let err = client
+            .get_bookmarks(None, 50)
+            .await
+            .expect_err("a plain 400 must surface as an api error");
+        match err {
+            BlueskyError::Api { status, body, .. } => {
+                assert_eq!(status, 400);
+                assert!(body.contains("InvalidRequest"), "body preserved: {body}");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
