@@ -311,6 +311,9 @@ pub struct PostDetailTemplate {
     pub bluesky_url: Option<String>,
     pub text: Option<String>,
     pub indexed_at: String,
+    /// When the account bookmarked the post (blank for other categories),
+    /// from the API's `bookmarkView.createdAt`.
+    pub action_at: Option<String>,
     pub deleted_at: Option<String>,
     pub media: Vec<PostMedia>,
     pub raw_json: String,

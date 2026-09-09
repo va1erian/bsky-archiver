@@ -28,6 +28,7 @@
 //!   SQLite query index built on top of it.
 //! - [`ratelimit`] — the shared backoff/circuit-breaker policy and
 //!   process-wide inflight request cap used by the pollers and downloader.
+//! - [`remux`] — MPEG-TS → MP4 remuxing for HLS video backups.
 //! - [`health`] — per-subsystem health tracking, read by `/healthz` and the
 //!   dashboard.
 //! - [`state`] — [`state::AppState`], the shared handle passed to request
@@ -47,6 +48,7 @@ pub mod media;
 pub mod pipeline;
 pub mod poller;
 pub mod ratelimit;
+pub mod remux;
 pub mod state;
 pub mod storage;
 pub mod sweep;
