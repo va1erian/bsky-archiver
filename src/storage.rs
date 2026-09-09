@@ -182,6 +182,13 @@ pub struct ArchivedRecord {
     /// ordering.
     #[serde(default)]
     pub action_at: Option<String>,
+    /// The item's position in Bluesky's own list (0 = newest) as of the
+    /// last full poll/sweep walk that ranked it. More reliable than
+    /// `action_at` for ordering — the live API does not always populate
+    /// `bookmarkView.createdAt`, but the list order is exactly what the
+    /// Bluesky app displays. `None` until first ranked.
+    #[serde(default)]
+    pub action_seq: Option<i64>,
 }
 
 /// Metadata about one media file attached to an archived record.
@@ -227,9 +234,10 @@ impl MediaSort {
     /// SQL used as the ordering key (column/tiebreak pair inline) in
     /// `list_media`, where `media` and `posts` are the table aliases in
     /// scope. `record_created_at` falls back to the media's archive time
-    /// for rows whose record carried no `createdAt`; `action_at` falls
-    /// back the same way (it only exists for bookmarks saved after it was
-    /// introduced).
+    /// for rows whose record carried no `createdAt`; the action sorts key
+    /// off `action_seq` (the item's position in Bluesky's own list — what
+    /// the Bluesky app displays), falling back to the post's archive time
+    /// for rows not yet ranked.
     fn sql(self) -> &'static str {
         match self {
             MediaSort::NewestArchived => "media.indexed_at DESC, media.id DESC",
@@ -242,12 +250,18 @@ impl MediaSort {
             MediaSort::OldestCreated => {
                 "COALESCE(record_created_at, media.indexed_at) ASC, media.id ASC"
             }
-            MediaSort::NewestAction => {
-                "COALESCE(posts.action_at, media.indexed_at) DESC, media.id DESC"
-            }
-            MediaSort::OldestAction => {
-                "COALESCE(posts.action_at, media.indexed_at) ASC, media.id ASC"
-            }
+            // Ranked rows first (`action_seq` 0 = newest in Bluesky's
+            // list), then rows the walk hasn't ranked yet, in archive
+            // order. `posts.indexed_at` is the archive-walk order, which
+            // mirrors the API's list order.
+            MediaSort::NewestAction => concat!(
+                "(posts.action_seq IS NULL) ASC, posts.action_seq ASC, ",
+                "posts.indexed_at DESC, media.id DESC"
+            ),
+            MediaSort::OldestAction => concat!(
+                "(posts.action_seq IS NULL) ASC, posts.action_seq DESC, ",
+                "posts.indexed_at ASC, media.id ASC"
+            ),
         }
     }
 }
@@ -405,10 +419,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// backfilled from the on-disk `record.json` for rows that predate it.
 ///
 /// Version 4 adds `posts.action_at`, the bookmark action time (from the
-/// API's `bookmarkView.createdAt`), so the gallery can reproduce Bluesky's
-/// own bookmarks ordering. Nullable; backfilled for bookmarks by the
+/// API's `bookmarkView.createdAt`), so the gallery can sort bookmarks by
+/// when they were bookmarked. Nullable; backfilled for bookmarks by the
 /// nightly sweeper's full walks.
-const SCHEMA_VERSION: i64 = 4;
+///
+/// Version 5 adds `posts.action_seq`, the item's *position in Bluesky's
+/// own list* at the last full poll/sweep walk (0 = newest). The live API
+/// does not reliably populate `bookmarkView.createdAt`, and its list order
+/// is what the Bluesky app actually displays — so the gallery's
+/// "bookmarked"/"liked" sorts key off the captured list position, falling
+/// back to archive order for rows not yet ranked.
+const SCHEMA_VERSION: i64 = 5;
 
 fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -426,6 +447,7 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
             record_path TEXT NOT NULL,
             record_created_at TEXT,
             action_at TEXT,
+            action_seq INTEGER,
             PRIMARY KEY (category, at_uri)
         );
         CREATE INDEX IF NOT EXISTS idx_posts_category_indexed_at
@@ -478,6 +500,10 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
 
     if previous_version < 4 {
         migrate_v3_to_v4(conn)?;
+    }
+
+    if previous_version < 5 {
+        migrate_v4_to_v5(conn)?;
     }
 
     if current_version != Some(SCHEMA_VERSION) {
@@ -548,6 +574,26 @@ fn migrate_v3_to_v4(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_posts_category_action_at
              ON posts(category, action_at, at_uri);",
+    )?;
+    Ok(())
+}
+
+/// Adds the `action_seq` column (the item's position in Bluesky's own
+/// list) to existing `posts` tables, then its ordering index.
+fn migrate_v4_to_v5(conn: &Connection) -> Result<(), StorageError> {
+    let has_column: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('posts') WHERE name = 'action_seq'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?;
+    if !has_column {
+        conn.execute_batch("ALTER TABLE posts ADD COLUMN action_seq INTEGER;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_posts_category_action_seq
+             ON posts(category, action_seq, at_uri);",
     )?;
     Ok(())
 }
@@ -690,6 +736,7 @@ impl ArchiveStore {
                 record,
                 deleted_at: None,
                 action_at: None,
+                action_seq: None,
             };
             let bytes = serde_json::to_vec_pretty(&archived)?;
             atomic_write(&path, &bytes)?;
@@ -1238,6 +1285,7 @@ impl ArchiveStore {
                             relative_str(&archive_dir, &record_file),
                             record_created_at_from(&archived.record),
                             archived.action_at.clone(),
+                            archived.action_seq,
                         ));
                     }
                 }
@@ -1259,7 +1307,7 @@ impl ArchiveStore {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM media", [])?;
             tx.execute("DELETE FROM posts", [])?;
-            for (at_uri, category, cid, indexed_at, record_path, record_created_at, action_at) in
+            for (at_uri, category, cid, indexed_at, record_path, record_created_at, action_at, action_seq) in
                 found_posts
             {
                 let deleted_at = if deleted_uris.contains(&at_uri) {
@@ -1268,8 +1316,8 @@ impl ArchiveStore {
                     None
                 };
                 tx.execute(
-                    "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path, deleted_at, record_created_at, action_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO posts (at_uri, category, cid, indexed_at, record_path, deleted_at, record_created_at, action_at, action_seq)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         at_uri,
                         category.as_dir(),
@@ -1278,7 +1326,8 @@ impl ArchiveStore {
                         record_path,
                         deleted_at,
                         record_created_at,
-                        action_at
+                        action_at,
+                        action_seq
                     ],
                 )?;
             }
@@ -1469,6 +1518,212 @@ impl ArchiveStore {
         .await;
         join_result(result)
     }
+
+    /// Records the item's position in Bluesky's own list (0 = newest) as
+    /// observed by the poller/sweeper walk that visited it. Unlike
+    /// [`ArchiveStore::set_action_at`] this OVERWRITES any previous value:
+    /// every item older than a new bookmark shifts position, so each walk
+    /// (the nightly sweeper's full walk especially) re-ranks what it sees.
+    /// Mirrored into the on-disk `record.json` envelope so
+    /// [`ArchiveStore::reindex`] preserves it.
+    ///
+    /// A failure here is the caller's problem to log and swallow: an
+    /// unrecorded rank only degrades the bookmarked/liked sorting for that
+    /// row (it falls back to archive order), never the archive itself.
+    pub async fn set_action_seq(
+        &self,
+        category: Category,
+        at_uri: &str,
+        seq: i64,
+    ) -> Result<(), StorageError> {
+        let archive_dir = self.archive_dir.clone();
+        let db = Arc::clone(&self.db);
+        let at_uri = at_uri.to_string();
+        let category_dir = category.as_dir().to_string();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = conn.execute(
+                "UPDATE posts SET action_seq = ?1
+                     WHERE category = ?2 AND at_uri = ?3",
+                params![seq, category_dir, at_uri],
+            )? > 0;
+
+            if changed {
+                // Mirror into the envelope so a reindex keeps the value.
+                // Best effort, same as `set_action_at`.
+                let record_path: Option<String> = conn
+                    .query_row(
+                        "SELECT record_path FROM posts
+                         WHERE category = ?1 AND at_uri = ?2",
+                        params![category_dir, at_uri],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                drop(conn);
+                if let Some(record_path) = record_path {
+                    let path = archive_dir.join(&record_path);
+                    if let Ok(bytes) = std::fs::read(&path)
+                        && let Ok(mut archived) = serde_json::from_slice::<ArchivedRecord>(&bytes)
+                        && archived.action_seq != Some(seq)
+                    {
+                        archived.action_seq = Some(seq);
+                        match serde_json::to_vec_pretty(&archived) {
+                            Ok(out) => {
+                                if let Err(err) = atomic_write(&path, &out) {
+                                    tracing::warn!(
+                                        at_uri = %at_uri,
+                                        error = %err,
+                                        "failed to persist action_seq into record.json"
+                                    );
+                                }
+                            }
+                            Err(err) => tracing::warn!(
+                                at_uri = %at_uri,
+                                error = %err,
+                                "failed to serialize record.json for action_seq"
+                            ),
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Reads up to `max_bytes` from the start of one stored media file.
+    /// `None` when the post or the file doesn't exist. Used to sniff
+    /// stored bytes for pre-fix corruption without loading whole files.
+    pub async fn read_media_head(
+        &self,
+        category: Category,
+        at_uri: &str,
+        filename: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let archive_dir = self.archive_dir.clone();
+        let at_uri = at_uri.to_string();
+        let filename = filename.to_string();
+
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, StorageError> {
+                let path = media_dir(&archive_dir, category, &at_uri).join(&filename);
+                if !path.is_file() {
+                    return Ok(None);
+                }
+                use std::io::Read;
+                let mut file = std::fs::File::open(&path)?;
+                let mut head = vec![0u8; max_bytes];
+                let read = file.read(&mut head).unwrap_or(0);
+                head.truncate(read);
+                Ok(Some(head))
+            })
+            .await;
+        join_result(result)
+    }
+
+    /// Lists one post's media rows (filename + content type), from the
+    /// index. Empty when the post has no media or isn't indexed.
+    pub async fn list_post_media(
+        &self,
+        category: Category,
+        at_uri: &str,
+    ) -> Result<Vec<(String, Option<String>)>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let at_uri = at_uri.to_string();
+        let category_dir = category.as_dir().to_string();
+
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, Option<String>)>, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(
+                    "SELECT filename, content_type FROM media
+                     WHERE category = ?1 AND post_at_uri = ?2
+                     ORDER BY id ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![category_dir, at_uri], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            },
+        )
+        .await;
+        join_result(result)
+    }
+
+    /// Deletes every media file + index row for one post (the record's
+    /// JSON stays). Used when stored media is found to be corrupt from a
+    /// pre-fix archive version: the caller re-queues the post's media for
+    /// download, and the fresh files land on clean rows. Returns how many
+    /// media rows were removed.
+    pub async fn delete_post_media(
+        &self,
+        category: Category,
+        at_uri: &str,
+    ) -> Result<usize, StorageError> {
+        let archive_dir = self.archive_dir.clone();
+        let db = Arc::clone(&self.db);
+        let at_uri = at_uri.to_string();
+        let category_dir = category.as_dir().to_string();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<usize, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+
+            let filenames: Vec<String> = conn
+                .prepare("SELECT filename FROM media WHERE category = ?1 AND post_at_uri = ?2")?
+                .query_map(params![category_dir, at_uri], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if filenames.is_empty() {
+                return Ok(0);
+            }
+
+            conn.execute(
+                "DELETE FROM media WHERE category = ?1 AND post_at_uri = ?2",
+                params![category_dir, at_uri],
+            )?;
+            drop(conn);
+
+            // Remove the files on disk.
+            let media_path = media_dir(&archive_dir, category, &at_uri);
+            for filename in &filenames {
+                match std::fs::remove_file(media_path.join(filename)) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            at_uri = %at_uri,
+                            filename = %filename,
+                            error = %err,
+                            "failed to remove corrupt media file"
+                        );
+                    }
+                }
+            }
+
+            // And the envelope's media list, so a reindex doesn't
+            // resurrect the removed rows.
+            let record_file = record_path(&archive_dir, category, &at_uri);
+            if record_file.exists()
+                && let Ok(bytes) = std::fs::read(&record_file)
+                && let Ok(mut archived) = serde_json::from_slice::<ArchivedRecord>(&bytes)
+                && !archived.media.is_empty()
+            {
+                archived.media.clear();
+                if let Ok(out) = serde_json::to_vec_pretty(&archived) {
+                    atomic_write(&record_file, &out)?;
+                }
+            }
+
+            Ok(filenames.len())
+        })
+        .await;
+        join_result(result)
+    }
 }
 
 fn relative_str(base: &Path, path: &Path) -> String {
@@ -1478,1129 +1733,44 @@ fn relative_str(base: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    async fn open_store() -> (tempfile::TempDir, ArchiveStore) {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let archive_dir = dir.path().join("archive");
-        let database_path = dir.path().join("index.sqlite3");
-        let store = ArchiveStore::open(archive_dir, database_path)
-            .await
-            .expect("open store");
-        (dir, store)
+/// Whether a stored media file's first bytes show corruption from a
+/// pre-fix archive version. Three signatures exist:
+///
+/// - a raw HLS playlist saved as the media file itself (`#EXTM3U…`);
+/// - an MPEG-TS stream stored under an `.mp4` name/type (the old HLS
+///   backup concatenated Bluesky's TS segments without remuxing);
+/// - a full HTTP response dump (an older download bug).
+///
+/// `head` is the first few bytes of the file (see
+/// [`ArchiveStore::read_media_head`]).
+pub(crate) fn stored_media_looks_corrupt(
+    filename: &str,
+    content_type: Option<&str>,
+    head: &[u8],
+) -> bool {
+    if head.starts_with(b"#EXTM3U") || head.starts_with(b"HTTP/1.") {
+        return true;
     }
-
-    #[tokio::test]
-    async fn save_then_list_round_trip() {
-        let (_dir, store) = open_store().await;
-
-        let outcome = store
-            .save_post(
-                Category::Post,
-                "at://did:plc:alice/app.bsky.feed.post/1",
-                "cid-1",
-                json!({"text": "hello"}),
-            )
-            .await
-            .expect("save post");
-        assert_eq!(outcome, SaveOutcome::Inserted);
-
-        let page = store.list_posts(None, 1, 10).await.expect("list posts");
-        assert_eq!(page.total_items, 1);
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(
-            page.items[0].at_uri,
-            "at://did:plc:alice/app.bsky.feed.post/1"
-        );
-        assert_eq!(page.items[0].cid, "cid-1");
-
-        let fetched = store
-            .get_post(Category::Post, "at://did:plc:alice/app.bsky.feed.post/1")
-            .await
-            .expect("get post")
-            .expect("post exists");
-        assert_eq!(fetched.record, json!({"text": "hello"}));
+    let base = content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if base == "application/vnd.apple.mpegurl" || base == "application/x-mpegurl" {
+        return true; // a playlist stored as if it were media
     }
-
-    #[tokio::test]
-    async fn saving_same_post_twice_is_a_dedup_no_op() {
-        let (_dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
-
-        let first = store
-            .save_post(Category::Post, at_uri, "cid-1", json!({"text": "v1"}))
-            .await
-            .expect("first save");
-        assert_eq!(first, SaveOutcome::Inserted);
-
-        let second = store
-            .save_post(Category::Post, at_uri, "cid-2", json!({"text": "v2"}))
-            .await
-            .expect("second save");
-        assert_eq!(second, SaveOutcome::AlreadyArchived);
-
-        let page = store.list_posts(None, 1, 10).await.expect("list posts");
-        assert_eq!(page.total_items, 1);
-
-        let fetched = store
-            .get_post(Category::Post, at_uri)
-            .await
-            .expect("get post")
-            .expect("post exists");
-        assert_eq!(
-            fetched.record,
-            json!({"text": "v1"}),
-            "second save must not overwrite"
-        );
-        assert_eq!(fetched.cid, "cid-1");
+    let looks_ts =
+        head.len() >= 3 * 188 && head[0] == 0x47 && head[188] == 0x47 && head[2 * 188] == 0x47;
+    if looks_ts && base.starts_with("video/") {
+        return true; // TS bytes wearing a video/mp4 label
     }
-
-    #[tokio::test]
-    async fn is_archived_reflects_disk_state() {
-        let (_dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
-
-        assert!(!store.is_archived(Category::Post, at_uri).await.unwrap());
-        store
-            .save_post(Category::Post, at_uri, "cid-1", json!({}))
-            .await
-            .unwrap();
-        assert!(store.is_archived(Category::Post, at_uri).await.unwrap());
+    if looks_ts && filename.ends_with(".mp4") {
+        return true;
     }
-
-    #[tokio::test]
-    async fn categories_are_isolated() {
-        let (_dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
-
-        store
-            .save_post(Category::Post, at_uri, "cid-1", json!({"kind": "post"}))
-            .await
-            .unwrap();
-        store
-            .save_post(Category::Like, at_uri, "cid-1", json!({"kind": "like"}))
-            .await
-            .unwrap();
-
-        let posts = store.list_posts(Some(Category::Post), 1, 10).await.unwrap();
-        let likes = store.list_posts(Some(Category::Like), 1, 10).await.unwrap();
-        assert_eq!(posts.total_items, 1);
-        assert_eq!(likes.total_items, 1);
-
-        let post = store
-            .get_post(Category::Post, at_uri)
-            .await
-            .unwrap()
-            .unwrap();
-        let like = store
-            .get_post(Category::Like, at_uri)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(post.record, json!({"kind": "post"}));
-        assert_eq!(like.record, json!({"kind": "like"}));
-    }
-
-    #[tokio::test]
-    async fn save_media_updates_record_and_gallery_index() {
-        let (_dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
-        store
-            .save_post(Category::Post, at_uri, "cid-1", json!({}))
-            .await
-            .unwrap();
-
-        store
-            .save_media(
-                Category::Post,
-                at_uri,
-                "image1.jpg",
-                Some("image/jpeg".to_string()),
-                b"fake-image-bytes".to_vec(),
-            )
-            .await
-            .unwrap();
-
-        let record = store
-            .get_post(Category::Post, at_uri)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(record.media.len(), 1);
-        assert_eq!(record.media[0].filename, "image1.jpg");
-        assert_eq!(record.media[0].size_bytes, "fake-image-bytes".len() as u64);
-
-        let gallery = store
-            .list_media(None, 1, 10, MediaSort::NewestArchived)
-            .await
-            .unwrap();
-        assert_eq!(gallery.total_items, 1);
-        assert_eq!(gallery.items[0].filename, "image1.jpg");
-        assert_eq!(gallery.items[0].post_at_uri, at_uri);
-
-        let post_list = store.list_posts(None, 1, 10).await.unwrap();
-        assert_eq!(
-            post_list.items[0].thumbnail_filename.as_deref(),
-            Some("image1.jpg")
-        );
-        assert_eq!(
-            post_list.items[0].thumbnail_content_type.as_deref(),
-            Some("image/jpeg")
-        );
-
-        let bytes = store
-            .read_media(Category::Post, at_uri, "image1.jpg")
-            .await
-            .unwrap()
-            .expect("media file should be readable");
-        assert_eq!(bytes, b"fake-image-bytes");
-
-        assert!(
-            store
-                .read_media(Category::Post, at_uri, "missing.jpg")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .read_media(Category::Post, at_uri, "../record.json")
-                .await
-                .unwrap()
-                .is_none(),
-            "path traversal attempts must be rejected"
-        );
-
-        // Re-saving the same filename is a no-op: no duplicate media rows,
-        // no duplicate entries in the record's media list.
-        store
-            .save_media(
-                Category::Post,
-                at_uri,
-                "image1.jpg",
-                Some("image/jpeg".to_string()),
-                b"different-bytes-should-be-ignored".to_vec(),
-            )
-            .await
-            .unwrap();
-        let record_again = store
-            .get_post(Category::Post, at_uri)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(record_again.media.len(), 1);
-        let gallery_again = store
-            .list_media(None, 1, 10, MediaSort::NewestArchived)
-            .await
-            .unwrap();
-        assert_eq!(gallery_again.total_items, 1);
-    }
-
-    #[tokio::test]
-    async fn save_media_without_post_fails() {
-        let (_dir, store) = open_store().await;
-        let err = store
-            .save_media(
-                Category::Post,
-                "at://did:plc:alice/app.bsky.feed.post/missing",
-                "x.jpg",
-                None,
-                b"bytes".to_vec(),
-            )
-            .await
-            .expect_err("media for unarchived post should fail");
-        assert!(matches!(err, StorageError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn atomic_write_never_exposes_a_partial_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested").join("record.json");
-
-        atomic_write(&path, b"{\"complete\": true}").unwrap();
-        assert!(path.exists());
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, "{\"complete\": true}");
-
-        // No leftover temp files after a successful write.
-        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "temp file was not cleaned up: {leftovers:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn pagination_returns_correct_slices_and_counts() {
-        let (_dir, store) = open_store().await;
-        for i in 0..25 {
-            store
-                .save_post(
-                    Category::Post,
-                    &format!("at://did:plc:alice/app.bsky.feed.post/{i:03}"),
-                    &format!("cid-{i}"),
-                    json!({"i": i}),
-                )
-                .await
-                .unwrap();
-        }
-
-        let page1 = store.list_posts(None, 1, 10).await.unwrap();
-        assert_eq!(page1.items.len(), 10);
-        assert_eq!(page1.total_items, 25);
-        assert_eq!(page1.total_pages, 3);
-
-        let page2 = store.list_posts(None, 2, 10).await.unwrap();
-        assert_eq!(page2.items.len(), 10);
-
-        let page3 = store.list_posts(None, 3, 10).await.unwrap();
-        assert_eq!(page3.items.len(), 5);
-
-        let page4 = store.list_posts(None, 4, 10).await.unwrap();
-        assert_eq!(page4.items.len(), 0);
-
-        // No overlap between pages.
-        let mut all_uris: Vec<_> = page1
-            .items
-            .iter()
-            .chain(page2.items.iter())
-            .chain(page3.items.iter())
-            .map(|p| p.at_uri.clone())
-            .collect();
-        all_uris.sort();
-        all_uris.dedup();
-        assert_eq!(all_uris.len(), 25);
-    }
-
-    #[tokio::test]
-    async fn reindex_from_empty_database_matches_incremental_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive_dir = dir.path().join("archive");
-        let database_path = dir.path().join("index.sqlite3");
-
-        let store = ArchiveStore::open(archive_dir.clone(), database_path.clone())
-            .await
-            .unwrap();
-        for i in 0..5 {
-            let at_uri = format!("at://did:plc:alice/app.bsky.feed.post/{i}");
-            store
-                .save_post(
-                    Category::Post,
-                    &at_uri,
-                    &format!("cid-{i}"),
-                    json!({"i": i}),
-                )
-                .await
-                .unwrap();
-            store
-                .save_media(
-                    Category::Post,
-                    &at_uri,
-                    "img.jpg",
-                    Some("image/jpeg".to_string()),
-                    vec![i as u8; 10],
-                )
-                .await
-                .unwrap();
-        }
-        store
-            .save_post(
-                Category::Like,
-                "at://did:plc:alice/app.bsky.feed.like/1",
-                "cid-like",
-                json!({}),
-            )
-            .await
-            .unwrap();
-
-        let before_posts = store.list_posts(None, 1, 100).await.unwrap();
-        let before_media = store
-            .list_media(None, 1, 100, MediaSort::NewestArchived)
-            .await
-            .unwrap();
-
-        // A brand-new store pointed at a fresh database file, over the
-        // same on-disk archive: the index starts empty.
-        let fresh_database_path = dir.path().join("index-fresh.sqlite3");
-        let fresh_store = ArchiveStore::open(archive_dir.clone(), fresh_database_path)
-            .await
-            .unwrap();
-        let empty_before_reindex = fresh_store.list_posts(None, 1, 100).await.unwrap();
-        assert_eq!(empty_before_reindex.total_items, 0);
-
-        fresh_store.reindex().await.unwrap();
-
-        let after_posts = fresh_store.list_posts(None, 1, 100).await.unwrap();
-        let after_media = fresh_store
-            .list_media(None, 1, 100, MediaSort::NewestArchived)
-            .await
-            .unwrap();
-
-        assert_eq!(after_posts.total_items, before_posts.total_items);
-        let mut before_uris: Vec<_> = before_posts
-            .items
-            .iter()
-            .map(|p| p.at_uri.clone())
-            .collect();
-        let mut after_uris: Vec<_> = after_posts.items.iter().map(|p| p.at_uri.clone()).collect();
-        before_uris.sort();
-        after_uris.sort();
-        assert_eq!(before_uris, after_uris);
-
-        assert_eq!(after_media.total_items, before_media.total_items);
-        let mut before_files: Vec<_> = before_media
-            .items
-            .iter()
-            .map(|m| (m.post_at_uri.clone(), m.filename.clone()))
-            .collect();
-        let mut after_files: Vec<_> = after_media
-            .items
-            .iter()
-            .map(|m| (m.post_at_uri.clone(), m.filename.clone()))
-            .collect();
-        before_files.sort();
-        after_files.sort();
-        assert_eq!(before_files, after_files);
-    }
-
-    #[tokio::test]
-    async fn reindex_on_existing_index_replaces_stale_rows() {
-        let (dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
-        store
-            .save_post(Category::Post, at_uri, "cid-1", json!({}))
-            .await
-            .unwrap();
-
-        // Simulate index drift: delete the on-disk record directly,
-        // bypassing the store, then reindex and confirm the stale row is
-        // gone.
-        let path = record_path(&dir.path().join("archive"), Category::Post, at_uri);
-        std::fs::remove_file(&path).unwrap();
-
-        store.reindex().await.unwrap();
-        let page = store.list_posts(None, 1, 10).await.unwrap();
-        assert_eq!(page.total_items, 0);
-    }
-
-    /// Seeds one image under each category so category-filtered queries have
-    /// something to isolate.
-    async fn seed_one_image_per_category(store: &ArchiveStore) {
-        for category in Category::ALL {
-            let at_uri = format!("at://did:plc:alice/app.bsky.feed.post/{category}");
-            store
-                .save_post(category, &at_uri, "cid", json!({}))
-                .await
-                .unwrap();
-            store
-                .save_media(
-                    category,
-                    &at_uri,
-                    "000.jpg",
-                    Some("image/jpeg".to_string()),
-                    vec![0u8; 10],
-                )
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn list_media_filters_by_category() {
-        let (_dir, store) = open_store().await;
-        seed_one_image_per_category(&store).await;
-
-        let all = store
-            .list_media(None, 1, 100, MediaSort::NewestArchived)
-            .await
-            .unwrap();
-        assert_eq!(all.total_items, 3);
-
-        let likes = store
-            .list_media(Some(Category::Like), 1, 100, MediaSort::NewestArchived)
-            .await
-            .unwrap();
-        assert_eq!(likes.total_items, 1);
-        assert_eq!(likes.items.len(), 1);
-        assert!(likes.items.iter().all(|m| m.category == Category::Like));
-    }
-
-    /// The created-time sort mirrors the record's own `createdAt`, so the
-    /// ordering can differ from the archive-time ordering; missing
-    /// `createdAt` falls back to the archive time.
-    #[tokio::test]
-    async fn list_media_sorts_by_created_at_when_available() {
-        let (_dir, store) = open_store().await;
-
-        // Archive order: A stored first, then B. Record times: A is the
-        // newest post ever, B much older — the opposite ordering.
-        let old = "at://did:plc:alice/app.bsky.feed.post/1";
-        let new = "at://did:plc:alice/app.bsky.feed.post/2";
-        store
-            .save_post(
-                Category::Post,
-                new,
-                "cid-new",
-                json!({"createdAt": "2030-01-01T00:00:00.000Z"}),
-            )
-            .await
-            .unwrap();
-        store
-            .save_media(
-                Category::Post,
-                new,
-                "aa.jpg",
-                Some("image/jpeg".into()),
-                vec![0u8; 10],
-            )
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        store
-            .save_post(
-                Category::Post,
-                old,
-                "cid-old",
-                json!({"createdAt": "2000-01-01T00:00:00.000Z"}),
-            )
-            .await
-            .unwrap();
-        store
-            .save_media(
-                Category::Post,
-                old,
-                "bb.jpg",
-                Some("image/jpeg".into()),
-                vec![0u8; 10],
-            )
-            .await
-            .unwrap();
-
-        let archived_newest = store
-            .list_media(None, 1, 10, MediaSort::NewestArchived)
-            .await
-            .unwrap();
-        assert_eq!(
-            archived_newest
-                .items
-                .iter()
-                .map(|m| m.filename.as_str())
-                .collect::<Vec<_>>(),
-            ["bb.jpg", "aa.jpg"],
-        );
-
-        let created_newest = store
-            .list_media(None, 1, 10, MediaSort::NewestCreated)
-            .await
-            .unwrap();
-        assert_eq!(
-            created_newest
-                .items
-                .iter()
-                .map(|m| m.filename.as_str())
-                .collect::<Vec<_>>(),
-            ["aa.jpg", "bb.jpg"],
-        );
-        assert_eq!(
-            created_newest.items[0].record_created_at.as_deref(),
-            Some("2030-01-01T00:00:00.000Z"),
-        );
-
-        let created_oldest = store
-            .list_media(None, 1, 10, MediaSort::OldestCreated)
-            .await
-            .unwrap();
-        assert_eq!(
-            created_oldest
-                .items
-                .iter()
-                .map(|m| m.filename.as_str())
-                .collect::<Vec<_>>(),
-            ["bb.jpg", "aa.jpg"],
-        );
-
-        let archived_oldest = store
-            .list_media(None, 1, 10, MediaSort::OldestArchived)
-            .await
-            .unwrap();
-        assert_eq!(
-            archived_oldest
-                .items
-                .iter()
-                .map(|m| m.filename.as_str())
-                .collect::<Vec<_>>(),
-            ["aa.jpg", "bb.jpg"],
-        );
-    }
-
-    #[tokio::test]
-    async fn watched_sources_round_trip_add_list_remove() {
-        let (_dir, store) = open_store().await;
-
-        assert!(store.list_watched_sources().await.unwrap().is_empty());
-
-        let account_id = store
-            .add_watched_source(
-                SourceKind::Account,
-                "alice.bsky.social",
-                Some("did:plc:alice"),
-            )
-            .await
-            .unwrap();
-        let feed_id = store
-            .add_watched_source(
-                SourceKind::Feed,
-                "at://did:plc:alice/app.bsky.feed.generator/whats-hot",
-                None,
-            )
-            .await
-            .unwrap();
-        assert_ne!(account_id, feed_id);
-
-        let sources = store.list_watched_sources().await.unwrap();
-        assert_eq!(sources.len(), 2);
-        let account = sources
-            .iter()
-            .find(|s| s.kind == SourceKind::Account)
-            .unwrap();
-        assert_eq!(account.value, "alice.bsky.social");
-        assert_eq!(account.did.as_deref(), Some("did:plc:alice"));
-        let feed = sources.iter().find(|s| s.kind == SourceKind::Feed).unwrap();
-        assert_eq!(
-            feed.value,
-            "at://did:plc:alice/app.bsky.feed.generator/whats-hot"
-        );
-        assert_eq!(feed.did, None);
-        // Each row carries a parseable RFC3339 added_at.
-        assert!(!account.added_at.is_empty());
-        assert!(!feed.added_at.is_empty());
-
-        assert!(store.remove_watched_source(account_id).await.unwrap());
-        assert!(
-            !store.remove_watched_source(account_id).await.unwrap(),
-            "second remove is a no-op"
-        );
-        let remaining = store.list_watched_sources().await.unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, feed_id);
-    }
-
-    #[tokio::test]
-    async fn adding_same_watched_source_twice_is_idempotent() {
-        let (_dir, store) = open_store().await;
-
-        let first_id = store
-            .add_watched_source(
-                SourceKind::Account,
-                "alice.bsky.social",
-                Some("did:plc:alice"),
-            )
-            .await
-            .unwrap();
-        let second_id = store
-            .add_watched_source(
-                SourceKind::Account,
-                "alice.bsky.social",
-                Some("did:plc:new-did"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            first_id, second_id,
-            "upsert must not create a duplicate row"
-        );
-
-        let sources = store.list_watched_sources().await.unwrap();
-        assert_eq!(sources.len(), 1);
-
-        // Re-adding with a fresh did refresh is an in-place update, not a
-        // second row. The DID is updated to the new value.
-        assert_eq!(sources[0].did.as_deref(), Some("did:plc:new-did"));
-        let _ = store
-            .add_watched_source(
-                SourceKind::Account,
-                "alice.bsky.social",
-                Some("did:plc:newer"),
-            )
-            .await
-            .unwrap();
-        let after = store.list_watched_sources().await.unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].did.as_deref(), Some("did:plc:newer"));
-        assert_eq!(after[0].value, "alice.bsky.social");
-        assert_eq!(
-            after[0].added_at, sources[0].added_at,
-            "re-adding must not reset the original added_at"
-        );
-    }
-
-    #[tokio::test]
-    async fn watched_sources_with_feed_and_account_kinds_stay_distinct() {
-        let (_dir, store) = open_store().await;
-
-        // The same string can appear for both kinds without colliding, since
-        // uniqueness is on (kind, value).
-        store
-            .add_watched_source(
-                SourceKind::Account,
-                "at://did:plc:alice/app.bsky.feed.generator/x",
-                Some("did:plc:alice"),
-            )
-            .await
-            .unwrap();
-        store
-            .add_watched_source(
-                SourceKind::Feed,
-                "at://did:plc:alice/app.bsky.feed.generator/x",
-                None,
-            )
-            .await
-            .unwrap();
-
-        let sources = store.list_watched_sources().await.unwrap();
-        assert_eq!(sources.len(), 2);
-    }
-
-    #[test]
-    fn source_kind_parses_and_displays() {
-        assert_eq!(
-            "account".parse::<SourceKind>().unwrap(),
-            SourceKind::Account
-        );
-        assert_eq!("feed".parse::<SourceKind>().unwrap(), SourceKind::Feed);
-        assert_eq!(SourceKind::Account.to_string(), "account");
-        assert_eq!(SourceKind::Feed.to_string(), "feed");
-        assert!(matches!(
-            "gallery".parse::<SourceKind>(),
-            Err(StorageError::InvalidSourceKind(_))
-        ));
-    }
-
-    async fn open_v1_database() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let database_path = dir.path().join("index.sqlite3");
-        let conn = Connection::open(&database_path).unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1');
-            CREATE TABLE posts (
-                category TEXT NOT NULL,
-                at_uri TEXT NOT NULL,
-                cid TEXT NOT NULL,
-                indexed_at TEXT NOT NULL,
-                record_path TEXT NOT NULL,
-                PRIMARY KEY (category, at_uri)
-            );
-            CREATE TABLE media (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL,
-                post_at_uri TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                content_type TEXT,
-                size_bytes INTEGER NOT NULL,
-                indexed_at TEXT NOT NULL,
-                UNIQUE(category, post_at_uri, filename)
-            );
-            ",
-        )
-        .unwrap();
-        // A v1 archive row that must survive the upgrade untouched.
-        conn.execute(
-            "INSERT INTO posts (category, at_uri, cid, indexed_at, record_path)
-             VALUES ('posts', 'at://did:plc:v1/app.bsky.feed.post/1', 'cid', '2024-01-01', 'x')",
-            [],
-        )
-        .unwrap();
-        dir
-    }
-
-    #[tokio::test]
-    async fn opening_a_v1_database_upgrades_to_schema_v2_in_place() {
-        let dir = open_v1_database().await;
-        let store =
-            ArchiveStore::open(dir.path().join("archive"), dir.path().join("index.sqlite3"))
-                .await
-                .expect("open store upgrades v1");
-
-        // The v1 posts row is untouched...
-        let page = store.list_posts(None, 1, 10).await.unwrap();
-        assert_eq!(page.total_items, 1);
-        assert_eq!(page.items[0].at_uri, "at://did:plc:v1/app.bsky.feed.post/1");
-
-        // ...the schema version always reads the latest stamp (v1 data has
-        // been upgraded in place through every intermediate version)...
-        let bytes = std::fs::read(dir.path().join("index.sqlite3")).unwrap();
-        drop(bytes);
-        let conn = rusqlite::Connection::open(dir.path().join("index.sqlite3")).unwrap();
-        let version: String = conn
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, "4");
-
-        // ...and the new table is usable immediately (no data had to move).
-        assert!(store.list_watched_sources().await.unwrap().is_empty());
-        store
-            .add_watched_source(
-                SourceKind::Account,
-                "alice.bsky.social",
-                Some("did:plc:alice"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(store.list_watched_sources().await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn export_predicate_selects_images_and_skips_video_and_bin() {
-        let (_dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/mixed";
-        store
-            .save_post(Category::Post, at_uri, "cid", json!({}))
-            .await
-            .unwrap();
-        // An image with an explicit content type.
-        store
-            .save_media(
-                Category::Post,
-                at_uri,
-                "000.jpg",
-                Some("image/jpeg".to_string()),
-                vec![0u8; 100],
-            )
-            .await
-            .unwrap();
-        // A null-content-type row whose filename extension marks it as an
-        // image — must still be included.
-        store
-            .save_media(Category::Post, at_uri, "001.png", None, vec![0u8; 200])
-            .await
-            .unwrap();
-        // A video — excluded.
-        store
-            .save_media(
-                Category::Post,
-                at_uri,
-                "002.mp4",
-                Some("video/mp4".to_string()),
-                vec![0u8; 400],
-            )
-            .await
-            .unwrap();
-        // A `.bin` fallback with an unknown/null content type — excluded.
-        store
-            .save_media(Category::Post, at_uri, "003.bin", None, vec![0u8; 800])
-            .await
-            .unwrap();
-
-        let estimate = store.export_estimate(None).await.unwrap();
-        assert_eq!(estimate.image_count, 2);
-        assert_eq!(estimate.total_bytes, 300);
-
-        let items = store.list_export_media(None).await.unwrap();
-        let names: Vec<_> = items.iter().map(|m| m.filename.as_str()).collect();
-        assert_eq!(items.len(), 2);
-        assert!(names.contains(&"000.jpg"));
-        assert!(names.contains(&"001.png"));
-        assert!(!names.contains(&"002.mp4"));
-        assert!(!names.contains(&"003.bin"));
-    }
-
-    #[tokio::test]
-    async fn mark_post_deleted_is_idempotent() {
-        let (_dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
-
-        store
-            .save_post(Category::Post, at_uri, "cid-1", json!({"text": "test"}))
-            .await
-            .unwrap();
-
-        let first_deleted_at = "2024-01-01T00:00:00Z";
-        {
-            let db = Arc::clone(&store.db);
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "UPDATE posts SET deleted_at = ?1 WHERE at_uri = ?2",
-                params![first_deleted_at, at_uri],
-            )
-            .unwrap();
-        }
-
-        let newly_marked = store.mark_post_deleted(at_uri).await.unwrap();
-        assert!(
-            !newly_marked,
-            "mark_post_deleted should report an already-marked post as not newly marked"
-        );
-
-        let record = store
-            .get_post(Category::Post, at_uri)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            record.deleted_at.as_deref(),
-            Some(first_deleted_at),
-            "mark_post_deleted should not overwrite earlier timestamp"
-        );
-    }
-
-    #[tokio::test]
-    async fn mark_post_deleted_reports_whether_it_marked() {
-        let (_dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
-
-        store
-            .save_post(Category::Post, at_uri, "cid-1", json!({"text": "test"}))
-            .await
-            .unwrap();
-
-        let newly_marked = store.mark_post_deleted(at_uri).await.unwrap();
-        assert!(newly_marked, "first mark should report newly marked");
-
-        // A URI that was never archived marks nothing.
-        let missing = store
-            .mark_post_deleted("at://did:plc:alice/app.bsky.feed.post/missing")
-            .await
-            .unwrap();
-        assert!(
-            !missing,
-            "marking an unarchived URI reports not newly marked"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_archived_uris_returns_each_category_in_index_order() {
-        let (_dir, store) = open_store().await;
-
-        store
-            .save_post(
-                Category::Bookmark,
-                "at://did:plc:carol/app.bsky.feed.post/2",
-                "cid-2",
-                json!({}),
-            )
-            .await
-            .unwrap();
-        store
-            .save_post(
-                Category::Bookmark,
-                "at://did:plc:carol/app.bsky.feed.post/1",
-                "cid-1",
-                json!({}),
-            )
-            .await
-            .unwrap();
-        store
-            .save_post(
-                Category::Like,
-                "at://did:plc:dave/app.bsky.feed.post/9",
-                "cid-9",
-                json!({}),
-            )
-            .await
-            .unwrap();
-
-        let bookmarks = store.list_archived_uris(Category::Bookmark).await.unwrap();
-        assert_eq!(
-            bookmarks,
-            vec![
-                "at://did:plc:carol/app.bsky.feed.post/2",
-                "at://did:plc:carol/app.bsky.feed.post/1",
-            ]
-        );
-
-        let likes = store.list_archived_uris(Category::Like).await.unwrap();
-        assert_eq!(likes, vec!["at://did:plc:dave/app.bsky.feed.post/9"]);
-
-        let posts = store.list_archived_uris(Category::Post).await.unwrap();
-        assert!(posts.is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_posts_includes_deleted_at() {
-        let (_dir, store) = open_store().await;
-        let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
-
-        store
-            .save_post(Category::Post, at_uri, "cid-1", json!({"text": "test"}))
-            .await
-            .unwrap();
-
-        let page = store.list_posts(None, 1, 10).await.unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert!(
-            page.items[0].deleted_at.is_none(),
-            "newly archived post should not be deleted"
-        );
-
-        store.mark_post_deleted(at_uri).await.unwrap();
-
-        let page = store.list_posts(None, 1, 10).await.unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert!(
-            page.items[0].deleted_at.is_some(),
-            "deleted post should have deleted_at set"
-        );
-    }
-
-    /// `set_action_at` records the bookmark action time in both the index
-    /// and the on-disk envelope, is idempotent, and survives a reindex
-    /// (which rebuilds the index purely from disk).
-    #[tokio::test]
-    async fn set_action_at_updates_index_and_envelope_and_survives_reindex() {
-        let (dir, store) = open_store().await;
-        let at_uri = "at://did:plc:carol/app.bsky.feed.post/1";
-
-        store
-            .save_post(
-                Category::Bookmark,
-                at_uri,
-                "cid-1",
-                json!({"text": "saved"}),
-            )
-            .await
-            .unwrap();
-
-        let newly = store
-            .set_action_at(Category::Bookmark, at_uri, "2026-09-01T10:00:00.000Z")
-            .await
-            .unwrap();
-        assert!(newly, "first set should report newly recorded");
-
-        let again = store
-            .set_action_at(Category::Bookmark, at_uri, "2026-09-02T10:00:00.000Z")
-            .await
-            .unwrap();
-        assert!(!again, "second set must not overwrite the first value");
-
-        let record = store
-            .get_post(Category::Bookmark, at_uri)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            record.action_at.as_deref(),
-            Some("2026-09-01T10:00:00.000Z")
-        );
-
-        // The envelope on disk carries it too, so a full reindex — which
-        // rebuilds the index from the record.json files alone — preserves
-        // the ordering key.
-        store.reindex().await.unwrap();
-        let record = store
-            .get_post(Category::Bookmark, at_uri)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            record.action_at.as_deref(),
-            Some("2026-09-01T10:00:00.000Z"),
-            "action_at must survive a reindex"
-        );
-
-        // An unknown URI reports nothing recorded; a save_post that races
-        // in a second category is untouched.
-        let missing = store
-            .set_action_at(
-                Category::Bookmark,
-                "at://did:plc:carol/app.bsky.feed.post/x",
-                "2026-09-01T10:00:00.000Z",
-            )
-            .await
-            .unwrap();
-        assert!(!missing);
-        let _ = dir;
-    }
-
-    /// The gallery's "bookmarked" sorts order by `action_at` (Bluesky's own
-    /// bookmarks ordering), falling back to archive time for rows without
-    /// one.
-    #[tokio::test]
-    async fn list_media_bookmarked_sort_uses_action_at_with_archive_fallback() {
-        let (_dir, store) = open_store().await;
-
-        // Archive order: first, second, third. Action times deliberately
-        // scramble that: "first" was bookmarked most recently (Sep 3),
-        // "third" earliest (Sep 1), and "second" has no action time at all,
-        // so it falls back to its archive time — which is "now" for a test
-        // store, newer than both action times.
-        for (name, uri, text) in [
-            (
-                "first.png",
-                "at://did:plc:carol/app.bsky.feed.post/1",
-                "one",
-            ),
-            (
-                "second.png",
-                "at://did:plc:carol/app.bsky.feed.post/2",
-                "two",
-            ),
-            (
-                "third.png",
-                "at://did:plc:carol/app.bsky.feed.post/3",
-                "three",
-            ),
-        ] {
-            store
-                .save_post(Category::Bookmark, uri, name, json!({"text": text}))
-                .await
-                .unwrap();
-            store
-                .save_media(
-                    Category::Bookmark,
-                    uri,
-                    name,
-                    Some("image/png".to_string()),
-                    b"png-bytes".to_vec(),
-                )
-                .await
-                .unwrap();
-        }
-        store
-            .set_action_at(
-                Category::Bookmark,
-                "at://did:plc:carol/app.bsky.feed.post/1",
-                "2026-09-03T00:00:00Z",
-            )
-            .await
-            .unwrap();
-        store
-            .set_action_at(
-                Category::Bookmark,
-                "at://did:plc:carol/app.bsky.feed.post/3",
-                "2026-09-01T00:00:00Z",
-            )
-            .await
-            .unwrap();
-
-        fn names(page: &Page<MediaSummary>) -> Vec<String> {
-            page.items.iter().map(|m| m.filename.clone()).collect()
-        }
-
-        // Newest action first; the no-action-time row falls back to its
-        // (just-now) archive time, so it lands at the very front.
-        let newest = store
-            .list_media(Some(Category::Bookmark), 1, 10, MediaSort::NewestAction)
-            .await
-            .unwrap();
-        assert_eq!(names(&newest), vec!["second.png", "first.png", "third.png"]);
-
-        let oldest = store
-            .list_media(Some(Category::Bookmark), 1, 10, MediaSort::OldestAction)
-            .await
-            .unwrap();
-        assert_eq!(names(&oldest), vec!["third.png", "first.png", "second.png"]);
-    }
+    false
 }
+
+#[cfg(test)]
+mod tests;

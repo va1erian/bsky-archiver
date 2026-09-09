@@ -18,12 +18,14 @@ is seeded automatically. Removing a source stops archiving it (a feed already
 archived remains browsable and exportable).
 
 For each archived item, the full post record is stored as JSON and any attached
-images/video are downloaded and stored alongside it. A small web UI lets a human
-browse the archive (post list + detail), view a gallery of archived media —
-filterable by category (posts / likes / bookmarks), sortable by archive time,
-the post's own `createdAt`, or the bookmark action time ("Newest/Oldest
-bookmarked", which reproduces the order of Bluesky's own bookmarks list; rows
-without a recorded action time fall back to archive time) — and downloadable as a
+images/video are downloaded and stored alongside it — HLS video (what Bluesky's
+CDN serves) is reassembled and remuxed into a self-contained MP4 playable in a
+browser. A small web UI lets a human browse the archive (post list + detail),
+view a gallery of archived media — filterable by category (posts / likes /
+bookmarks), sortable by archive time, the post's own `createdAt`, or the
+bookmark/like action ("Newest/Oldest bookmarked", which reproduces the order of
+Bluesky's own lists by keying off the item's captured list position; rows
+without a captured position fall back to archive time) — and downloadable as a
 single zip of every image in the current selection — and see the active (non-secret)
 configuration.
 
@@ -48,10 +50,11 @@ plain `docker compose`.
 | `bluesky` | The `com.atproto.*` / `app.bsky.*` REST (XRPC) client: session auth (with automatic re-login when the access token expires — either a 401 or the AppView's 400 `ExpiredToken` convention), `getAuthorFeed`, `getFeed`, `getActorLikes`, `getBookmarks`, and handle resolution. |
 | `firehose` | The Jetstream websocket consumer: real-time capture of the watched accounts' authored posts with media, filtered by DID from the live roster, with reconnect/backoff, a persisted cursor so a restart resumes roughly where it left off, and an immediate reconnect when the watched-account set changes. |
 | `poller` | The REST-polling fallback for authored posts (active whenever the firehose is down), the feed poller (algorithm/custom feeds, which are never on the firehose), and the periodic likes/bookmarks poller. All use adaptive intervals with jittered exponential backoff. The bookmarks poller also detects deletions: a bookmark whose post comes back as `notFound` was deleted upstream, and its archived copy is marked with a `deleted_at` timestamp (a `blocked` post still exists and is never marked). |
-| `sweep` | The nightly likes/bookmarks deletion sweeper. Once per night at a fixed local hour (`NIGHTLY_SWEEP_LOCAL_HOUR`), it walks the entire bookmark and like lists (archiving anything the periodic pollers missed), then batch-verifies (`app.bsky.feed.getPosts`, 25 URIs per call) every URI already archived under those categories and marks the ones the API reports as gone. This is what catches deleted liked/bookmarked posts — including for authors not on the watch list, whom the firehose delete-op path never sees — and deletions that happened while the service was down. Marking only touches the index: the on-disk record and its media are always kept. |
+| `sweep` | The likes/bookmarks deletion sweeper. It runs once at startup (so a deploy immediately catches up on anything the previous process missed and re-ranks the whole list) and then nightly at a fixed local hour (`NIGHTLY_SWEEP_LOCAL_HOUR`). It walks the entire bookmark and like lists (archiving anything the periodic pollers missed, re-ranking every item with its current position in Bluesky's list, and re-downloading stored media that carries a pre-fix corruption signature), then batch-verifies (`app.bsky.feed.getPosts`, 25 URIs per call) every URI already archived under those categories and marks the ones the API reports as gone. This is what catches deleted liked/bookmarked posts — including for authors not on the watch list, whom the firehose delete-op path never sees — and deletions that happened while the service was down. Marking only touches the index: the on-disk record and its media are always kept. |
 | `pipeline` | The shared `CandidatePost` channel and the `has_archivable_media` predicate connecting every producer (firehose, REST fallback, feed poller, likes/bookmarks poller) to the one consumer (the media downloader). |
-| `media` | Concurrency-limited, size-capped media downloading: streams each file, aborts if it exceeds `MEDIA_MAX_BYTES`, retries transient failures, and never leaves a partial file on disk. Videos arrive from Bluesky's CDN as HLS playlists, which are reassembled into a single self-contained, playable `.mp4` (the init segment plus every media segment, capped in total by `MEDIA_MAX_BYTES`). |
-| `storage` | The on-disk JSON archive (source of truth) plus the SQLite query index built on top of it (including the UI-managed `watched_sources` watch list). Mirrors two timestamps per row for gallery ordering: `record_created_at` (the post's own `createdAt`) and `action_at` (when the account bookmarked it, from `bookmarkView.createdAt`). The index is fully rebuildable from disk (`reindex`) and is rebuilt automatically on startup if missing. |
+| `media` | Concurrency-limited, size-capped media downloading: streams each file, aborts if it exceeds `MEDIA_MAX_BYTES`, retries transient failures, and never leaves a partial file on disk. Videos arrive from Bluesky's CDN as HLS playlists whose segments are MPEG-TS; the TS segments are demuxed and remuxed into a single self-contained, playable `.mp4` (fMP4-based streams concatenate directly), capped in total by `MEDIA_MAX_BYTES`. |
+| `remux` | MPEG-TS → MP4 remuxing for the HLS video backups: demuxes the concatenated segments (PAT/PMT/PES) and repackages the H.264/AAC samples into a moov-first progressive MP4 — a lossless recontainerization, no re-encoding. |
+| `storage` | The on-disk JSON archive (source of truth) plus the SQLite query index built on top of it (including the UI-managed `watched_sources` watch list). Mirrors ordering metadata per row: `record_created_at` (the post's own `createdAt`), `action_at` (when the account bookmarked it, from `bookmarkView.createdAt`, display-only) and `action_seq` (the item's position in Bluesky's own list at the last walk — what the Bluesky app displays, so the gallery's bookmarked/liked sorts reproduce it). The index is fully rebuildable from disk (`reindex`) and is rebuilt automatically on startup if missing. |
 | `ratelimit` | The shared backoff/circuit-breaker policy and the process-wide inflight-request cap used by the pollers, the Bluesky client, and the media downloader. |
 | `health` | Per-subsystem health tracking (`Connected` / `Degraded` / `Error`), read by `/healthz` and the dashboard. |
 | `watchlist` | The in-memory `Watchlist` roster: a live `watch`-channel mirror of the `watched_sources` table that every producer reads and that reloads (with a bump) after each UI add/remove. |
