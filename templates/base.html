@@ -97,6 +97,7 @@
     if (!link) return;
     var isVideo = link.getAttribute("data-media-type") === "video";
     var alt = link.getAttribute("data-alt") || "";
+    stopPlayback();
     content.innerHTML = isVideo
       ? "<video src=\"" + link.href + "\" controls autoplay></video>"
       : "<img src=\"" + link.href + "\" alt=\"" + alt + "\">";
@@ -104,6 +105,28 @@
     prevBtn.disabled = index <= 0;
     nextBtn.disabled = index >= items.length - 1;
   }
+
+  // A <dialog> that merely closes stays in the DOM: a playing <video>
+  // inside it keeps going (audio especially). Tear the media element down
+  // so playback and its network fetch actually stop.
+  function stopPlayback() {
+    var media = content.querySelector("video, audio");
+    if (media) {
+      media.pause();
+      media.removeAttribute("src");
+      media.load();
+    }
+    content.innerHTML = "";
+  }
+
+  // Every close path (✕ button, backdrop click, Escape) fires `close`.
+  dialog.addEventListener("close", stopPlayback);
+
+  // A swap (gallery pagination, …) replaces the page under an open
+  // lightbox; close it rather than leave media playing over new content.
+  document.body.addEventListener("htmx:afterSwap", function () {
+    if (dialog.open) dialog.close();
+  });
 
   function show(link) {
     items = Array.prototype.slice.call(document.querySelectorAll("[data-lightbox]"));
