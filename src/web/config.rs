@@ -30,6 +30,16 @@ pub(super) async fn config_view(State(state): State<WebState>) -> Response {
             redacted: true,
         },
         templates::ConfigRow {
+            key: "TUMBLR_* (likes archiver)",
+            value: if config.tumblr.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+            .to_string(),
+            redacted: false,
+        },
+        templates::ConfigRow {
             key: "ARCHIVE_DIR",
             value: config.archive_dir.display().to_string(),
             redacted: false,

@@ -46,12 +46,19 @@ use crate::ratelimit::RequestLimiter;
 use crate::state::{AppState, SharedAppState};
 use crate::storage::{ArchiveStore, SourceKind, StorageError};
 use crate::sweep::NightlySweeper;
+use crate::tumblr::{DEFAULT_TUMBLR_BASE_URL, TumblrClient, TumblrLikesPoller};
 use crate::watchlist::Watchlist;
 
 /// The production Bluesky XRPC entryway. Not part of the canonical env var
 /// schema (there is no `BSKY_BASE_URL`); overridable only for tests, which
 /// point [`init`] at a `wiremock` server instead.
 pub const DEFAULT_BLUESKY_BASE_URL: &str = "https://bsky.social";
+
+/// The production Tumblr API v2 entryway, parsed once for the Tumblr likes
+/// poller. Only used when Tumblr credentials are configured.
+fn tumblr_base_url() -> Url {
+    Url::parse(DEFAULT_TUMBLR_BASE_URL).expect("default tumblr base url is valid")
+}
 
 /// Process-wide soft cap on outbound Bluesky-related HTTP requests in
 /// flight at once (REST polling + media downloads combined). Not part of
@@ -253,6 +260,31 @@ pub async fn serve(started: Started) {
         shutdown_rx.clone(),
     );
 
+    // The Tumblr likes poller only runs when Tumblr credentials are
+    // configured; otherwise its health entry is marked Disabled so the
+    // dashboard reports the absence honestly instead of a stuck "starting
+    // up".
+    let tumblr_likes_handle = match state.config.tumblr.clone() {
+        Some(tumblr_config) => {
+            let tumblr_client = Arc::new(
+                TumblrClient::new(tumblr_base_url(), tumblr_config)
+                    .with_request_limiter(Arc::clone(&request_limiter)),
+            );
+            Some(spawn_tumblr_likes(
+                tumblr_client,
+                state.store.clone(),
+                candidate_tx.clone(),
+                Duration::from_secs(config.poll_interval_seconds),
+                health_tx.clone(),
+                shutdown_rx.clone(),
+            ))
+        }
+        None => {
+            health_tx.send_modify(|s| s.tumblr_likes = SubsystemHealth::disabled());
+            None
+        }
+    };
+
     let nightly_sweep_handle = spawn_nightly_sweep(
         Arc::clone(&bluesky_client),
         state.store.clone(),
@@ -292,6 +324,9 @@ pub async fn serve(started: Started) {
         nightly_sweep_handle,
         web_handle
     );
+    if let Some(tumblr_likes_handle) = tumblr_likes_handle {
+        let _ = tumblr_likes_handle.await;
+    }
 
     match tokio::time::timeout(Duration::from_secs(30), media_handle).await {
         Ok(_) => tracing::info!("media downloader drained cleanly"),
@@ -417,6 +452,34 @@ fn spawn_likes_bookmarks(
                 store.clone(),
                 candidate_tx.clone(),
                 actor.clone(),
+                base_interval,
+            );
+            async move { poller.run().await }
+        },
+    ))
+}
+
+/// Spawns the Tumblr likes poller under the same supervisor as every other
+/// background task. Only called when Tumblr credentials are configured.
+#[allow(clippy::too_many_arguments)]
+fn spawn_tumblr_likes(
+    client: Arc<TumblrClient>,
+    store: ArchiveStore,
+    candidate_tx: CandidatePostSender,
+    base_interval: Duration,
+    health_tx: HealthSender,
+    shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(supervise(
+        "tumblr_likes",
+        shutdown_rx,
+        health_tx,
+        |snapshot, health| snapshot.tumblr_likes = health,
+        move || {
+            let poller = TumblrLikesPoller::new(
+                Arc::clone(&client),
+                store.clone(),
+                candidate_tx.clone(),
                 base_interval,
             );
             async move { poller.run().await }
@@ -663,6 +726,7 @@ mod tests {
         AppConfig {
             bsky_identifier: "alice.bsky.social".to_string(),
             bsky_app_password: Secret::from("app-password".to_string()),
+            tumblr: None,
             archive_dir,
             database_path,
             ui_password: Secret::from("ui-password".to_string()),

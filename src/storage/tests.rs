@@ -483,7 +483,7 @@ async fn list_media_filters_by_category() {
         .list_media(None, 1, 100, MediaSort::NewestArchived)
         .await
         .unwrap();
-    assert_eq!(all.total_items, 3);
+    assert_eq!(all.total_items, Category::ALL.len() as u64);
 
     let likes = store
         .list_media(Some(Category::Like), 1, 100, MediaSort::NewestArchived)

@@ -24,6 +24,9 @@ pub enum Status {
     // AR-10 (the web UI), which reads this variant.
     #[allow(dead_code)]
     Error,
+    /// Intentionally not running (e.g. the Tumblr likes poller when no
+    /// Tumblr credentials are configured).
+    Disabled,
 }
 
 /// The status of one subsystem plus a short human-readable reason, if any.
@@ -55,6 +58,13 @@ impl SubsystemHealth {
             detail: Some(detail.into()),
         }
     }
+
+    pub fn disabled() -> Self {
+        SubsystemHealth {
+            status: Status::Disabled,
+            detail: Some("not configured".to_string()),
+        }
+    }
 }
 
 /// Health of every supervised subsystem, as a single snapshot suitable for
@@ -66,6 +76,7 @@ pub struct HealthSnapshot {
     pub rest_fallback: SubsystemHealth,
     pub feed_poller: SubsystemHealth,
     pub likes_bookmarks: SubsystemHealth,
+    pub tumblr_likes: SubsystemHealth,
     pub nightly_sweep: SubsystemHealth,
     pub media_downloader: SubsystemHealth,
 }
@@ -79,6 +90,7 @@ impl Default for HealthSnapshot {
             rest_fallback: starting.clone(),
             feed_poller: starting.clone(),
             likes_bookmarks: starting.clone(),
+            tumblr_likes: starting.clone(),
             nightly_sweep: starting.clone(),
             media_downloader: starting,
         }
@@ -110,6 +122,7 @@ mod tests {
         assert_eq!(snapshot.rest_fallback.status, Status::Degraded);
         assert_eq!(snapshot.feed_poller.status, Status::Degraded);
         assert_eq!(snapshot.likes_bookmarks.status, Status::Degraded);
+        assert_eq!(snapshot.tumblr_likes.status, Status::Degraded);
         assert_eq!(snapshot.nightly_sweep.status, Status::Degraded);
         assert_eq!(snapshot.media_downloader.status, Status::Degraded);
     }

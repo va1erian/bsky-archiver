@@ -37,6 +37,9 @@ pub enum PostCategory {
     /// A post the watched account bookmarked, seen via the likes/bookmarks
     /// poller (AR-7).
     Bookmark,
+    /// A Tumblr post the configured Tumblr account liked, seen via the
+    /// Tumblr likes poller ([`crate::tumblr`]).
+    TumblrLike,
 }
 
 /// A reference to one piece of media (image or video) attached to a

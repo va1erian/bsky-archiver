@@ -88,6 +88,7 @@ fn build_category_options(selected: Option<&str>) -> Vec<templates::CategoryOpti
         ("posts", "Posts"),
         ("likes", "Likes"),
         ("bookmarks", "Bookmarks"),
+        ("tumblr_likes", "Tumblr Likes"),
     ] {
         options.push(templates::CategoryOption {
             label,
@@ -102,7 +103,12 @@ pub(super) async fn post_detail(
     Path(id): Path<String>,
 ) -> Result<Response, WebError> {
     let at_uri = id;
-    for category in [Category::Post, Category::Like, Category::Bookmark] {
+    for category in [
+        Category::Post,
+        Category::Like,
+        Category::Bookmark,
+        Category::TumblrLike,
+    ] {
         if let Some(record) = state.app.store.get_post(category, &at_uri).await? {
             let text = templates::record_text(&record.record).map(str::to_string);
             let media = record

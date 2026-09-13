@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 const ALL_VARS: &[&str] = &[
     "BSKY_IDENTIFIER",
     "BSKY_APP_PASSWORD",
+    "TUMBLR_CONSUMER_KEY",
+    "TUMBLR_CONSUMER_SECRET",
+    "TUMBLR_OAUTH_TOKEN",
+    "TUMBLR_OAUTH_SECRET",
     "ARCHIVE_DIR",
     "DATABASE_PATH",
     "UI_PASSWORD",
@@ -86,10 +90,66 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Tumblr API v2 OAuth 1.0a credentials. All four values come from
+/// registering an application at <https://www.tumblr.com/oauth/apps>
+/// (consumer key/secret) and authorizing your own account against it via
+/// the API console at <https://api.tumblr.com/console> (OAuth token/secret).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TumblrConfig {
+    pub consumer_key: Secret,
+    pub consumer_secret: Secret,
+    pub oauth_token: Secret,
+    pub oauth_secret: Secret,
+}
+
+impl TumblrConfig {
+    const VARS: [&'static str; 4] = [
+        "TUMBLR_CONSUMER_KEY",
+        "TUMBLR_CONSUMER_SECRET",
+        "TUMBLR_OAUTH_TOKEN",
+        "TUMBLR_OAUTH_SECRET",
+    ];
+
+    /// Reads the four Tumblr variables from the environment. All-or-nothing:
+    /// `Ok(None)` when none are set (Tumblr archiving disabled), a config
+    /// error when only some are set, and the credentials when all four are.
+    fn from_env() -> Result<Option<Self>, ConfigError> {
+        let values: Vec<Option<String>> = Self::VARS.map(optional_var).into_iter().collect();
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if let Some(missing) = values
+            .iter()
+            .zip(Self::VARS)
+            .find_map(|(value, var)| value.is_none().then_some(var))
+        {
+            return Err(ConfigError::InvalidValue {
+                var: missing,
+                message: format!(
+                    "{missing} is set but the other Tumblr variables are missing; \
+                     set all of {} together (or none, to disable Tumblr archiving)",
+                    Self::VARS.join(", ")
+                ),
+            });
+        }
+        Ok(Some(TumblrConfig {
+            consumer_key: Secret::from(values[0].clone().expect("checked above")),
+            consumer_secret: Secret::from(values[1].clone().expect("checked above")),
+            oauth_token: Secret::from(values[2].clone().expect("checked above")),
+            oauth_secret: Secret::from(values[3].clone().expect("checked above")),
+        }))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bsky_identifier: String,
     pub bsky_app_password: Secret,
+    /// Tumblr API v2 OAuth 1.0a credentials, when the optional Tumblr likes
+    /// archiver is enabled. `None` (the default) disables Tumblr archiving
+    /// entirely; setting only *some* of the four variables is a startup
+    /// error.
+    pub tumblr: Option<TumblrConfig>,
     pub archive_dir: PathBuf,
     pub database_path: PathBuf,
     pub ui_password: Secret,
@@ -127,6 +187,7 @@ impl AppConfig {
         let bsky_app_password = Secret::from(require_var("BSKY_APP_PASSWORD")?);
         let ui_password = Secret::from(require_var("UI_PASSWORD")?);
         let ui_session_secret = Secret::from(require_var("UI_SESSION_SECRET")?);
+        let tumblr = TumblrConfig::from_env()?;
 
         let archive_dir = optional_var("ARCHIVE_DIR")
             .map(PathBuf::from)
@@ -171,6 +232,7 @@ impl AppConfig {
         Ok(AppConfig {
             bsky_identifier,
             bsky_app_password,
+            tumblr,
             archive_dir,
             database_path,
             ui_password,
@@ -362,7 +424,7 @@ mod tests {
             required.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let _guard = EnvGuard::new(&overrides);
 
-        let config = AppConfig::from_env().expect("config should load with only required vars");
+        let config = AppConfig::build().expect("config should load with only required vars");
 
         assert_eq!(config.bsky_identifier, "alice.bsky.social");
         assert_eq!(config.database_path, dir.join("index.sqlite3"));
@@ -394,7 +456,7 @@ mod tests {
             required.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("missing required var should fail");
+        let err = AppConfig::build().expect_err("missing required var should fail");
         assert_eq!(err, ConfigError::MissingVar("BSKY_APP_PASSWORD"));
         assert_eq!(
             err.to_string(),
@@ -413,7 +475,7 @@ mod tests {
         overrides.push(("UI_PORT", "not-a-port"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("invalid UI_PORT should fail");
+        let err = AppConfig::build().expect_err("invalid UI_PORT should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "UI_PORT"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -431,7 +493,7 @@ mod tests {
         overrides.push(("UI_PORT", "0"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("port 0 should fail");
+        let err = AppConfig::build().expect_err("port 0 should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "UI_PORT"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -449,7 +511,7 @@ mod tests {
         overrides.push(("POLL_INTERVAL_SECONDS", "0"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("zero poll interval should fail");
+        let err = AppConfig::build().expect_err("zero poll interval should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "POLL_INTERVAL_SECONDS"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -467,7 +529,7 @@ mod tests {
         overrides.push(("MEDIA_MAX_CONCURRENT_DOWNLOADS", "-1"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("negative concurrency should fail");
+        let err = AppConfig::build().expect_err("negative concurrency should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => {
                 assert_eq!(var, "MEDIA_MAX_CONCURRENT_DOWNLOADS")
@@ -487,7 +549,7 @@ mod tests {
         overrides.push(("MEDIA_MAX_BYTES", "huge"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("non-numeric media bytes should fail");
+        let err = AppConfig::build().expect_err("non-numeric media bytes should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "MEDIA_MAX_BYTES"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -505,7 +567,7 @@ mod tests {
         overrides.push(("NIGHTLY_SWEEP_LOCAL_HOUR", "24"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("hour 24 should fail");
+        let err = AppConfig::build().expect_err("hour 24 should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "NIGHTLY_SWEEP_LOCAL_HOUR"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -523,7 +585,7 @@ mod tests {
         overrides.push(("NIGHTLY_SWEEP_LOCAL_HOUR", "three-am"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("non-numeric hour should fail");
+        let err = AppConfig::build().expect_err("non-numeric hour should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "NIGHTLY_SWEEP_LOCAL_HOUR"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -541,7 +603,7 @@ mod tests {
         overrides.push(("JETSTREAM_URL", "not a url"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("malformed JETSTREAM_URL should fail");
+        let err = AppConfig::build().expect_err("malformed JETSTREAM_URL should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "JETSTREAM_URL"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -559,7 +621,7 @@ mod tests {
         overrides.push(("JETSTREAM_URL", "https://example.com/subscribe"));
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("http(s) JETSTREAM_URL should fail");
+        let err = AppConfig::build().expect_err("http(s) JETSTREAM_URL should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "JETSTREAM_URL"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -582,7 +644,7 @@ mod tests {
             required.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let _guard = EnvGuard::new(&overrides);
 
-        let err = AppConfig::from_env().expect_err("uncreatable ARCHIVE_DIR should fail");
+        let err = AppConfig::build().expect_err("uncreatable ARCHIVE_DIR should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "ARCHIVE_DIR"),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -601,6 +663,66 @@ mod tests {
     }
 
     #[test]
+    fn tumblr_disabled_when_no_vars_set() {
+        let dir = temp_dir("tumblr-disabled");
+        let required = required_vars(&dir);
+        let overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let _guard = EnvGuard::new(&overrides);
+
+        // `build()` reads only the process environment; `from_env()` would
+        // first load a developer's local `.env` (which may legitimately
+        // carry Tumblr credentials) back over the guard's cleared vars.
+        let config = AppConfig::build().expect("config should load");
+        assert!(config.tumblr.is_none(), "no tumblr vars means disabled");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_tumblr_vars_produce_specific_error() {
+        let dir = temp_dir("tumblr-partial");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TUMBLR_CONSUMER_KEY", "key"));
+        overrides.push(("TUMBLR_OAUTH_TOKEN", "token"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::build().expect_err("partial tumblr vars should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "TUMBLR_CONSUMER_SECRET"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_tumblr_vars_enable_tumblr_config() {
+        let dir = temp_dir("tumblr-full");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TUMBLR_CONSUMER_KEY", "key"));
+        overrides.push(("TUMBLR_CONSUMER_SECRET", "consumer-secret"));
+        overrides.push(("TUMBLR_OAUTH_TOKEN", "token"));
+        overrides.push(("TUMBLR_OAUTH_SECRET", "token-secret"));
+        let _guard = EnvGuard::new(&overrides);
+
+        // `build()`, not `from_env()`: see the comment in
+        // `tumblr_disabled_when_no_vars_set`.
+        let config = AppConfig::build().expect("config should load");
+        let tumblr = config.tumblr.expect("tumblr should be enabled");
+        assert_eq!(tumblr.consumer_key.expose_secret(), "key");
+        assert_eq!(tumblr.consumer_secret.expose_secret(), "consumer-secret");
+        assert_eq!(tumblr.oauth_token.expose_secret(), "token");
+        assert_eq!(tumblr.oauth_secret.expose_secret(), "token-secret");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn app_config_debug_output_redacts_all_secrets() {
         let dir = temp_dir("debug-redaction");
         let required = required_vars(&dir);
@@ -608,7 +730,7 @@ mod tests {
             required.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let _guard = EnvGuard::new(&overrides);
 
-        let config = AppConfig::from_env().expect("config should load");
+        let config = AppConfig::build().expect("config should load");
         let debug_output = format!("{config:?}");
 
         assert!(!debug_output.contains("app-password-secret"));

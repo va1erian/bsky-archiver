@@ -29,6 +29,14 @@ services:
       # JETSTREAM_URL: "wss://jetstream1.us-east.bsky.network/subscribe"
       MEDIA_MAX_CONCURRENT_DOWNLOADS: "4"
       MEDIA_MAX_BYTES: "104857600"
+      # --- optional: Tumblr likes archiver (all four together, or none) ---
+      # Register an app at https://www.tumblr.com/oauth/apps for the
+      # consumer key/secret, then get the OAuth token/secret from the API
+      # console (https://api.tumblr.com/console) with "Show keys".
+      # TUMBLR_CONSUMER_KEY: "your-consumer-key"
+      # TUMBLR_CONSUMER_SECRET: "your-consumer-secret"
+      # TUMBLR_OAUTH_TOKEN: "your-oauth-token"
+      # TUMBLR_OAUTH_SECRET: "your-oauth-secret"
       RUST_LOG: "info"
     volumes:
       # Persists the archived JSON + media + SQLite index across restarts

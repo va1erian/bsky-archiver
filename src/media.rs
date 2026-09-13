@@ -438,6 +438,7 @@ fn map_category(category: PostCategory) -> Category {
         PostCategory::Authored => Category::Post,
         PostCategory::Like => Category::Like,
         PostCategory::Bookmark => Category::Bookmark,
+        PostCategory::TumblrLike => Category::TumblrLike,
     }
 }
 

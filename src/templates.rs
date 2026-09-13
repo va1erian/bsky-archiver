@@ -114,6 +114,7 @@ pub fn category_label(category: Category) -> &'static str {
         Category::Post => "Post",
         Category::Like => "Like",
         Category::Bookmark => "Bookmark",
+        Category::TumblrLike => "Tumblr Like",
     }
 }
 
@@ -122,6 +123,7 @@ pub fn category_badge_class(category: Category) -> &'static str {
         Category::Post => "badge-post",
         Category::Like => "badge-like",
         Category::Bookmark => "badge-bookmark",
+        Category::TumblrLike => "badge-tumblr-like",
     }
 }
 
@@ -140,12 +142,20 @@ pub fn is_video_content_type(content_type: Option<&str>) -> bool {
     content_type.is_some_and(|ct| ct.starts_with("video/"))
 }
 
-/// Extracts non-empty `text` from an AT Proto record JSON value, if any.
+/// Extracts non-empty display text from a record JSON value, if any.
+/// Bluesky records carry `text`; Tumblr posts carry a plain-text `summary`
+/// instead, so both are recognized.
 pub fn record_text(record: &serde_json::Value) -> Option<&str> {
     record
         .get("text")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            record
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
 }
 
 /// Truncates `text` to at most `max_chars` characters (counted, not
@@ -200,6 +210,7 @@ pub fn subsystem_row(name: &'static str, health: &SubsystemHealth) -> SubsystemR
         Status::Connected => ("status-connected", "Connected"),
         Status::Degraded => ("status-degraded", "Degraded"),
         Status::Error => ("status-error", "Error"),
+        Status::Disabled => ("status-disabled", "Disabled"),
     };
     SubsystemRow {
         name,
@@ -218,6 +229,7 @@ pub struct DashboardTemplate {
     pub posts_count: u64,
     pub likes_count: u64,
     pub bookmarks_count: u64,
+    pub tumblr_likes_count: u64,
     pub health: Vec<SubsystemRow>,
     pub recent: Vec<PostRow>,
 }

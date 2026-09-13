@@ -106,9 +106,9 @@ fn build_gallery_sort_options(
 
 /// Parses a gallery/export `category` query value into a [`Category`].
 /// Accepts both the singular tokens the gallery links itself use
-/// (`post`/`like`/`bookmark`) and the plural forms `/posts` uses
-/// (`posts`/`likes`/`bookmarks`); anything else is a `400`, matching the
-/// shape `/posts` returns for an unknown category.
+/// (`post`/`like`/`bookmark`/`tumblr-like`) and the plural forms `/posts`
+/// uses (`posts`/`likes`/`bookmarks`/`tumblr_likes`); anything else is a
+/// `400`, matching the shape `/posts` returns for an unknown category.
 fn parse_gallery_category(raw: Option<&str>) -> Result<Option<Category>, WebError> {
     let category = match raw {
         None => None,
@@ -116,6 +116,7 @@ fn parse_gallery_category(raw: Option<&str>) -> Result<Option<Category>, WebErro
             "post" | "posts" => Category::Post,
             "like" | "likes" => Category::Like,
             "bookmark" | "bookmarks" => Category::Bookmark,
+            "tumblr-like" | "tumblr_likes" => Category::TumblrLike,
             other => {
                 return Err(WebError::BadRequest {
                     message: format!("unknown category {other:?}"),
@@ -133,6 +134,7 @@ fn category_token(category: Category) -> &'static str {
         Category::Post => "post",
         Category::Like => "like",
         Category::Bookmark => "bookmark",
+        Category::TumblrLike => "tumblr-like",
     }
 }
 
@@ -150,6 +152,7 @@ fn build_gallery_category_options(
         (Category::Post, "Posts"),
         (Category::Like, "Likes"),
         (Category::Bookmark, "Bookmarks"),
+        (Category::TumblrLike, "Tumblr Likes"),
     ] {
         options.push(templates::CategoryOption {
             label,
