@@ -43,6 +43,8 @@ async fn test_state() -> (tempfile::TempDir, SharedAppState) {
         media_max_bytes: 104_857_600,
         nightly_sweep_local_hour: 3,
         tumblr_poll_interval_seconds: 300,
+        pixiv_refresh_token: None,
+        pixiv_poll_interval_seconds: 300,
     };
 
     let (_health_tx, health_rx) = health_channel();
@@ -1372,6 +1374,8 @@ async fn test_state_with_bluesky(
         media_max_bytes: 104_857_600,
         nightly_sweep_local_hour: 3,
         tumblr_poll_interval_seconds: 300,
+        pixiv_refresh_token: None,
+        pixiv_poll_interval_seconds: 300,
     };
 
     let (candidate_tx, _candidate_rx) = crate::pipeline::candidate_post_channel(8);

@@ -40,6 +40,9 @@ pub enum PostCategory {
     /// A Tumblr post the configured Tumblr account liked, seen via the
     /// Tumblr likes poller ([`crate::tumblr`]).
     TumblrLike,
+    /// A Pixiv illustration the configured Pixiv account bookmarked, seen
+    /// via the Pixiv bookmarks poller ([`crate::pixiv`]).
+    PixivBookmark,
 }
 
 /// A reference to one piece of media (image or video) attached to a

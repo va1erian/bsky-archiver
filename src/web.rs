@@ -161,6 +161,7 @@ async fn healthz(State(state): State<WebState>) -> Response {
         &snapshot.feed_poller,
         &snapshot.likes_bookmarks,
         &snapshot.tumblr_likes,
+        &snapshot.pixiv_bookmarks,
         &snapshot.nightly_sweep,
         &snapshot.media_downloader,
     ]

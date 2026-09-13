@@ -20,6 +20,9 @@
 //! - [`tumblr`] — the Tumblr API v2 client (OAuth 1.0a signed requests)
 //!   and the Tumblr likes poller, archiving the configured Tumblr
 //!   account's liked posts into the `tumblr_likes` category.
+//! - [`pixiv`] — the Pixiv App API client (OAuth2 refresh-token auth) and
+//!   the Pixiv bookmarks poller, archiving the configured Pixiv account's
+//!   bookmarked illustrations into the `pixiv_bookmarks` category.
 //! - [`sweep`] — the nightly likes/bookmarks deletion sweep: walks both
 //!   lists in full and batch-verifies every archived like/bookmark URI,
 //!   marking posts deleted upstream with a `deleted_at` timestamp.
@@ -49,6 +52,7 @@ pub mod firehose;
 pub mod health;
 pub mod media;
 pub mod pipeline;
+pub mod pixiv;
 pub mod poller;
 pub mod ratelimit;
 pub mod remux;

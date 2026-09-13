@@ -272,7 +272,14 @@ impl MediaDownloader {
             Some(limiter) => Some(limiter.acquire().await),
             None => None,
         };
-        let response = self.http.get(&media.cdn_url).send().await?;
+        let mut request = self.http.get(&media.cdn_url);
+        // Pixiv's CDN (i.pximg.net) rejects requests without a pixiv
+        // referer; other hosts ignore the header entirely, so setting it
+        // unconditionally for pixiv URLs is safe.
+        if is_pixiv_cdn_url(&media.cdn_url) {
+            request = request.header(reqwest::header::REFERER, "https://www.pixiv.net/");
+        }
+        let response = request.send().await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -439,7 +446,25 @@ fn map_category(category: PostCategory) -> Category {
         PostCategory::Like => Category::Like,
         PostCategory::Bookmark => Category::Bookmark,
         PostCategory::TumblrLike => Category::TumblrLike,
+        PostCategory::PixivBookmark => Category::PixivBookmark,
     }
+}
+
+/// Whether `url` points at Pixiv's image CDN, whose hotlink protection
+/// requires a `Referer: https://www.pixiv.net/` header.
+fn is_pixiv_cdn_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.eq_ignore_ascii_case("i.pximg.net"))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn is_pixiv_cdn_url_for_test(url: &str) -> bool {
+    is_pixiv_cdn_url(url)
 }
 
 /// The mimetype without any `;charset=...`-style parameters, for comparing

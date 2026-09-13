@@ -74,6 +74,8 @@ fn test_config(archive_dir: std::path::PathBuf, database_path: std::path::PathBu
         media_max_bytes: 10_000_000,
         nightly_sweep_local_hour: 3,
         tumblr_poll_interval_seconds: 300,
+        pixiv_refresh_token: None,
+        pixiv_poll_interval_seconds: 300,
     }
 }
 
