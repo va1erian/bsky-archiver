@@ -171,6 +171,7 @@ async fn spawn_server(
         media_max_concurrent_downloads: 4,
         media_max_bytes: 100_000_000,
         nightly_sweep_local_hour: 3,
+        tumblr_poll_interval_seconds: 300,
     };
 
     let store = ArchiveStore::open(config.archive_dir.clone(), config.database_path.clone())

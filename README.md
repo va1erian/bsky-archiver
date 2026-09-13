@@ -176,6 +176,7 @@ docker push localhost:5000/bsky-archiver:latest
 | `MEDIA_MAX_BYTES` | `104857600` (100 MiB) | Per-file download size safety cap (for reassembled videos, the cap applies to the whole stream). |
 | `NIGHTLY_SWEEP_LOCAL_HOUR` | `3` | Local hour of day (0-23) at which the nightly likes/bookmarks deletion sweep runs. In a container this is the container's timezone (usually UTC; set `TZ` to shift it). |
 | `TUMBLR_CONSUMER_KEY`, `TUMBLR_CONSUMER_SECRET`, `TUMBLR_OAUTH_TOKEN`, `TUMBLR_OAUTH_SECRET` | *(unset)* | Tumblr OAuth 1.0a credentials enabling the Tumblr likes archiver. All four must be set together (or none, to disable Tumblr archiving). Register an application at <https://www.tumblr.com/oauth/apps> to get the consumer key/secret, then visit the [API console](https://api.tumblr.com/console) with your account and use "Show keys" to get your OAuth token/secret. |
+| `TUMBLR_POLL_INTERVAL_SECONDS` | `300` | Baseline interval for Tumblr likes polling (only used when the Tumblr credentials are set). Deliberately slower than `POLL_INTERVAL_SECONDS`: Tumblr rate-limits its API to 1000 requests/hour and 5000/day, and at the default the steady state uses ~12–24 API calls/hour (~300–600/day). Page fetches within a backfill walk are additionally paced 4s apart, keeping even a sustained full-list walk under the hourly cap. |
 | `RUST_LOG` | `info` | Standard `tracing`/`tracing-subscriber` filter string. |
 
 What the archiver watches is **not** configured via environment variables: the watch

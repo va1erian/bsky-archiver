@@ -535,7 +535,8 @@ async fn poll_survives_shifted_duplicates_at_page_boundaries() {
         tumblr_config(),
     ));
     let poller = TumblrLikesPoller::new(client, store.clone(), tx, Duration::from_secs(60))
-        .with_page_limit(2);
+        .with_page_limit(2)
+        .with_page_delay(Duration::ZERO);
 
     poller.poll_likes().await.expect("poll succeeds");
 
@@ -609,7 +610,8 @@ async fn full_walk_re_ranks_archived_posts_and_walks_to_the_end() {
         tumblr_config(),
     ));
     let poller = TumblrLikesPoller::new(client, store.clone(), tx, Duration::from_secs(60))
-        .with_page_limit(2);
+        .with_page_limit(2)
+        .with_page_delay(Duration::ZERO);
 
     poller.poll_walk(true).await.expect("full walk succeeds");
 
@@ -661,7 +663,8 @@ async fn poll_walks_every_page_when_no_boundary_is_hit() {
     ));
     // A 2-post page size makes the walk continue onto the second page.
     let poller = TumblrLikesPoller::new(client, store.clone(), tx, Duration::from_secs(60))
-        .with_page_limit(2);
+        .with_page_limit(2)
+        .with_page_delay(Duration::ZERO);
 
     poller.poll_likes().await.expect("poll succeeds");
 
@@ -677,6 +680,53 @@ async fn poll_walks_every_page_when_no_boundary_is_hit() {
         .expect("get")
         .expect("archived");
     assert_eq!(record.action_seq, Some(2));
+}
+
+#[tokio::test]
+async fn poll_paces_page_fetches_within_a_walk() {
+    // A multi-page walk sleeps the inter-page delay between fetches (the
+    // Tumblr API rate limit), so a 2-page walk with a 40ms delay takes at
+    // least one delay longer than the requests themselves. At-least
+    // assertions on sleeps are reliable; at-most ones are not.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/user/likes"))
+        .and(query_param("offset", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(likes_response(
+            vec![
+                liked_post(1, "blog-a", 1_700_000_000),
+                liked_post(2, "blog-a", 1_699_000_000),
+            ],
+            3,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/user/likes"))
+        .and(query_param("offset", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(likes_response(
+            vec![liked_post(3, "blog-a", 1_698_000_000)],
+            3,
+        )))
+        .mount(&server)
+        .await;
+
+    let (_dir, store) = open_store().await;
+    let (tx, _rx) = crate::pipeline::candidate_post_channel(8);
+    let client = Arc::new(TumblrClient::new(
+        Url::parse(&server.uri()).unwrap(),
+        tumblr_config(),
+    ));
+    let poller = TumblrLikesPoller::new(client, store.clone(), tx, Duration::from_secs(60))
+        .with_page_limit(2)
+        .with_page_delay(Duration::from_millis(40));
+
+    let started = std::time::Instant::now();
+    poller.poll_likes().await.expect("poll succeeds");
+    assert!(
+        started.elapsed() >= Duration::from_millis(40),
+        "the walk must sleep the inter-page delay between page fetches"
+    );
 }
 
 #[tokio::test]
