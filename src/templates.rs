@@ -42,8 +42,10 @@ pub struct Pagination {
     pub page: u32,
     pub total_pages: u32,
     pub total_items: u64,
+    pub first_href: Option<String>,
     pub prev_href: Option<String>,
     pub next_href: Option<String>,
+    pub last_href: Option<String>,
     pub page_links: Vec<PageLink>,
 }
 
@@ -54,9 +56,9 @@ pub struct PageLink {
     pub current: bool,
 }
 
-/// Builds pagination view data (prev/next links plus a small window of
-/// numbered page links around the current page) from a `page -> href`
-/// builder, so callers can plug in whatever other query params
+/// Builds pagination view data (first/last + prev/next links plus a small
+/// window of numbered page links around the current page) from a `page ->
+/// href` builder, so callers can plug in whatever other query params
 /// (category filter, page size) need to survive across pages.
 pub fn build_pagination(
     page: u32,
@@ -64,8 +66,10 @@ pub fn build_pagination(
     total_items: u64,
     href_for: impl Fn(u32) -> String,
 ) -> Pagination {
+    let first_href = (page > 1).then(|| href_for(1));
     let prev_href = (page > 1).then(|| href_for(page - 1));
     let next_href = (page < total_pages).then(|| href_for(page + 1));
+    let last_href = (page < total_pages).then(|| href_for(total_pages));
 
     const WINDOW: u32 = 2;
     let page_links = if total_pages == 0 {
@@ -86,8 +90,10 @@ pub fn build_pagination(
         page,
         total_pages,
         total_items,
+        first_href,
         prev_href,
         next_href,
+        last_href,
         page_links,
     }
 }
@@ -539,12 +545,16 @@ mod tests {
     #[test]
     fn build_pagination_has_no_prev_on_first_page_no_next_on_last() {
         let p = build_pagination(1, 3, 25, |n| format!("/posts?page={n}"));
+        assert!(p.first_href.is_none());
         assert!(p.prev_href.is_none());
         assert!(p.next_href.is_some());
+        assert!(p.last_href.is_some());
 
         let last = build_pagination(3, 3, 25, |n| format!("/posts?page={n}"));
+        assert!(last.first_href.is_some());
         assert!(last.prev_href.is_some());
         assert!(last.next_href.is_none());
+        assert!(last.last_href.is_none());
     }
 
     #[test]
@@ -559,8 +569,10 @@ mod tests {
     #[test]
     fn build_pagination_with_zero_pages_has_no_links() {
         let p = build_pagination(1, 0, 0, |n| format!("/posts?page={n}"));
+        assert!(p.first_href.is_none());
         assert!(p.prev_href.is_none());
         assert!(p.next_href.is_none());
+        assert!(p.last_href.is_none());
         assert!(p.page_links.is_empty());
     }
 }

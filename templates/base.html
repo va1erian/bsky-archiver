@@ -2,8 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>{% block title %}bsky-archiver{% endblock %}</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#2563eb">
+<link rel="icon" type="image/png" href="/static/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
 <link rel="stylesheet" href="/static/pico.min.css">
 <link rel="stylesheet" href="/static/app.css">
 <script>
@@ -87,53 +91,262 @@
   var nextBtn = document.getElementById("lightbox-next");
   if (!dialog || !content || typeof dialog.showModal !== "function") return;
 
-  // Media links of the current page, re-collected on every open so pages
-  // swapped in by htmx (gallery/post-list pagination) are included.
+  // Media links of the current page, re-collected on every open (and again
+  // after a lightbox-triggered page load) so pages swapped in by htmx
+  // (gallery/post-list pagination) are included.
   var items = [];
   var index = -1;
+  var loadingPage = false;
+  var pageSwapped = false;
+  var loadSeq = 0;
+  var pendingSlide = null;
 
-  function render() {
+  function prefersReducedMotion() {
+    return window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+
+  // The adjacent-page pagination links of the list/grid under the lightbox
+  // (gallery or posts). Absent on the first/last page and on pages with no
+  // pagination (post detail), which is how boundary moves are detected.
+  function pageNavLink(rel) {
+    return document.querySelector('.pagination a[rel="' + rel + '"]');
+  }
+
+  function updateButtons() {
+    prevBtn.disabled = loadingPage || (index <= 0 && !pageNavLink("prev"));
+    nextBtn.disabled =
+      loadingPage || (index >= items.length - 1 && !pageNavLink("next"));
+  }
+
+  function teardownMedia(el) {
+    if (!el) return;
+    // Fully detach a playing video: a <dialog> that merely closes keeps the
+    // <video> alive (audio especially), so the src is dropped and load()ed
+    // away to stop playback and its network fetch.
+    if (el.tagName === "VIDEO") {
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
+    }
+    el.remove();
+  }
+
+  function stopPlayback() {
+    finishPendingSlide();
+    Array.prototype.slice.call(content.children).forEach(teardownMedia);
+    content.innerHTML = "";
+  }
+
+  // Warm the browser cache for the neighbours of the current image so a
+  // swipe or arrow press finds the next media already fetched.
+  function preloadNeighbours() {
+    [index - 1, index + 1].forEach(function (i) {
+      var link = items[i];
+      if (!link || link.getAttribute("data-media-type") === "video") return;
+      var img = new Image();
+      img.src = link.href;
+    });
+  }
+
+  // Finishes any in-flight slide synchronously: both elements jump to their
+  // end state, the outgoing one is torn down, so a fast swipe never leaves
+  // two half-transitioned layers on screen.
+  function finishPendingSlide() {
+    if (!pendingSlide) return;
+    var entry = pendingSlide;
+    pendingSlide = null;
+    if (!entry.settled) {
+      entry.settled = true;
+      entry.anims.forEach(function (anim) {
+        try { anim.finish(); } catch (err) { /* already finished */ }
+      });
+      teardownMedia(entry.oldEl);
+      entry.newEl.style.transform = "";
+    }
+  }
+
+  function beginSlide(entry, direction, distance) {
+    var duration = 220;
+    var easing = "cubic-bezier(0.22, 0.61, 0.36, 1)";
+    try {
+      var oldAnim = entry.oldEl.animate(
+        [{ transform: "translateX(0)" },
+         { transform: "translateX(" + -distance + "%)" }],
+        { duration: duration, easing: easing }
+      );
+      var newAnim = entry.newEl.animate(
+        [{ transform: "translateX(" + distance + "%)" },
+         { transform: "translateX(0)" }],
+        { duration: duration, easing: easing }
+      );
+      entry.anims = [oldAnim, newAnim];
+      Promise.all([oldAnim.finished, newAnim.finished]).then(function () {
+        finishPendingSlide();
+      }, function () {
+        /* cancelled or finished via finishPendingSlide */
+      });
+    } catch (err) {
+      // No Web Animations support: fall back to an instant swap.
+      finishPendingSlide();
+    }
+  }
+
+  // Slides the outgoing and incoming media together, full-width, like a
+  // native photo carousel. direction is 1 (next, from the right) or -1
+  // (prev, from the left).
+  function slideBetween(oldEl, newEl, direction) {
+    finishPendingSlide();
+    if (oldEl.tagName === "VIDEO") oldEl.pause();
+    content.appendChild(newEl);
+    var distance = direction > 0 ? 100 : -100;
+    newEl.style.transform = "translateX(" + distance + "%)";
+    var entry = { oldEl: oldEl, newEl: newEl, anims: [], settled: false, started: false };
+    pendingSlide = entry;
+
+    // Wait (briefly) for the incoming image to be fully decoded so the
+    // slide never reveals a half-painted image; the cap keeps a slow or
+    // failed decode from freezing the transition. Both paths can fire,
+    // so `started` keeps the slide from being kicked off twice.
+    function start() {
+      if (entry.started || entry.settled || pendingSlide !== entry) return;
+      entry.started = true;
+      beginSlide(entry, direction, distance);
+    }
+    if (newEl.tagName === "IMG" && newEl.decode) {
+      newEl.decode().then(start, start);
+      setTimeout(start, 300);
+    } else {
+      start();
+    }
+  }
+
+  // direction: 0 = initial open (no slide), 1 = next, -1 = prev.
+  function render(direction) {
     var link = items[index];
     if (!link) return;
     var isVideo = link.getAttribute("data-media-type") === "video";
     var alt = link.getAttribute("data-alt") || "";
-    stopPlayback();
-    content.innerHTML = isVideo
-      ? "<video src=\"" + link.href + "\" controls autoplay></video>"
-      : "<img src=\"" + link.href + "\" alt=\"" + alt + "\">";
-    counter.textContent = items.length > 1 ? (index + 1) + " / " + items.length : "";
-    prevBtn.disabled = index <= 0;
-    nextBtn.disabled = index >= items.length - 1;
+    counter.textContent =
+      items.length > 1 ? (index + 1) + " / " + items.length : "";
+    updateButtons();
+    preloadNeighbours();
+
+    var newEl = document.createElement(isVideo ? "video" : "img");
+    if (isVideo) {
+      newEl.src = link.href;
+      newEl.controls = true;
+      newEl.autoplay = true;
+      newEl.playsInline = true;
+    } else {
+      newEl.src = link.href;
+      newEl.alt = alt;
+    }
+
+    var oldEl = content.firstElementChild;
+    if (!oldEl || direction === 0 || prefersReducedMotion()) {
+      finishPendingSlide();
+      teardownMedia(oldEl);
+      content.appendChild(newEl);
+      return;
+    }
+    slideBetween(oldEl, newEl, direction);
   }
 
   // A <dialog> that merely closes stays in the DOM: a playing <video>
   // inside it keeps going (audio especially). Tear the media element down
   // so playback and its network fetch actually stop.
-  function stopPlayback() {
-    var media = content.querySelector("video, audio");
-    if (media) {
-      media.pause();
-      media.removeAttribute("src");
-      media.load();
-    }
-    content.innerHTML = "";
-  }
-
-  // Every close path (✕ button, backdrop click, Escape) fires `close`.
   dialog.addEventListener("close", stopPlayback);
 
   // A swap (gallery pagination, …) replaces the page under an open
-  // lightbox; close it rather than leave media playing over new content.
+  // lightbox; close it rather than leave media playing over new content —
+  // unless the swap *is* the lightbox loading an adjacent page, in which
+  // case the loadAdjacentPage continuation takes over. htmx fires
+  // afterSwap before its ajax promise settles, so this flag doubles as
+  // the "the swap really happened" check for loadAdjacentPage.
   document.body.addEventListener("htmx:afterSwap", function () {
+    if (loadingPage) {
+      pageSwapped = true;
+      return;
+    }
     if (dialog.open) dialog.close();
   });
 
-  function show(link) {
+  function collectItems() {
     items = Array.prototype.slice.call(document.querySelectorAll("[data-lightbox]"));
+  }
+
+  function show(link) {
+    collectItems();
     index = items.indexOf(link);
     if (index < 0) return;
-    render();
+    loadingPage = false;
+    loadSeq++; // any in-flight page load from a previous viewing is stale
+    render(0);
     dialog.showModal();
+  }
+
+  // Loads the adjacent gallery/posts page through htmx (same fragment swap
+  // the pagination links perform), then lands on its first (or last) item —
+  // so next past the last image of a page continues into the next page,
+  // and prev before the first image walks back into the previous one.
+  function loadAdjacentPage(rel, pickFromEnd, direction) {
+    if (typeof htmx === "undefined" || loadingPage) return;
+    var link = pageNavLink(rel);
+    if (!link) return;
+    var href = link.getAttribute("href");
+    var seq = ++loadSeq;
+    loadingPage = true;
+    pageSwapped = false;
+    updateButtons();
+    htmx
+      .ajax("GET", href, {
+        target: link.getAttribute("hx-target"),
+        swap: link.getAttribute("hx-swap") || "outerHTML",
+      })
+      .then(
+        function () {
+          if (seq !== loadSeq) return; // superseded
+          // htmx resolves without swapping on an HTTP error status;
+          // only a real swap advances the lightbox.
+          loadingPage = false;
+          if (!pageSwapped) {
+            updateButtons();
+            return;
+          }
+          // Mirror what hx-push-url does on a regular pagination click.
+          if (history && history.pushState) history.pushState(null, "", href);
+          window.scrollTo(0, 0);
+          collectItems();
+          index = pickFromEnd ? items.length - 1 : 0;
+          if (dialog.open) render(direction);
+        },
+        function () {
+          if (seq !== loadSeq) return; // superseded
+          loadingPage = false;
+          updateButtons();
+        }
+      );
+  }
+
+  function goNext() {
+    if (loadingPage) return;
+    if (index < items.length - 1) {
+      index++;
+      render(1);
+      return;
+    }
+    loadAdjacentPage("next", false, 1);
+  }
+
+  function goPrev() {
+    if (loadingPage) return;
+    if (index > 0) {
+      index--;
+      render(-1);
+      return;
+    }
+    loadAdjacentPage("prev", true, -1);
   }
 
   document.addEventListener("click", function (event) {
@@ -143,12 +356,8 @@
     show(link);
   });
 
-  prevBtn.addEventListener("click", function () {
-    if (index > 0) { index--; render(); }
-  });
-  nextBtn.addEventListener("click", function () {
-    if (index < items.length - 1) { index++; render(); }
-  });
+  prevBtn.addEventListener("click", goPrev);
+  nextBtn.addEventListener("click", goNext);
 
   document.getElementById("lightbox-close").addEventListener("click", function () {
     dialog.close();
@@ -157,16 +366,40 @@
     if (event.target === dialog) dialog.close();
   });
 
+  // Swipe navigation: a mostly-horizontal flick moves to the neighbouring
+  // image (or page). Touches that start on a video (its controls) or a
+  // button are left alone, and vertical drags never navigate. A second
+  // finger invalidates the swipe via the touchstart length check.
+  var touchStart = null;
+  dialog.addEventListener("touchstart", function (event) {
+    if (event.touches.length !== 1 || event.target.closest("video, button")) {
+      touchStart = null;
+      return;
+    }
+    var touch = event.touches[0];
+    touchStart = { x: touch.clientX, y: touch.clientY };
+  }, { passive: true });
+  dialog.addEventListener("touchcancel", function () {
+    touchStart = null;
+  }, { passive: true });
+  dialog.addEventListener("touchend", function (event) {
+    if (!touchStart) return;
+    var touch = event.changedTouches[0];
+    var dx = touch.clientX - touchStart.x;
+    var dy = touch.clientY - touchStart.y;
+    touchStart = null;
+    if (Math.abs(dx) < 48 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
+    if (dx < 0) goNext(); else goPrev();
+  }, { passive: true });
+
   document.addEventListener("keydown", function (event) {
     if (!dialog.open) return;
-    if (event.key === "ArrowRight" && index < items.length - 1) {
+    if (event.key === "ArrowRight") {
       event.preventDefault();
-      index++;
-      render();
-    } else if (event.key === "ArrowLeft" && index > 0) {
+      goNext();
+    } else if (event.key === "ArrowLeft") {
       event.preventDefault();
-      index--;
-      render();
+      goPrev();
     }
   });
 })();
