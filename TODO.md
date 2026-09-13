@@ -32,3 +32,27 @@ verification:
   all three widths.
 - **Dark and light mode** — both render correctly (Pico's
   `prefers-color-scheme` handling must not be bypassed).
+
+## htmx 4 client-side verification
+
+The vendored htmx was upgraded from 1.9.12 to 4.0.0. Server-side behavior is
+covered by `cargo test` (fragment vs. full-page branching, history-restore
+carve-out), but the client-side behaviors below need a real browser; once a
+browser e2e suite lands, automate them alongside the viewport tests above:
+
+- **Back/forward after paginating** — on `/gallery` and `/posts`, paginate a
+  few pages, then use the browser back/forward buttons: htmx 4 re-fetches the
+  URL and swaps `<main>` (`[hx-history-elt]`) out of the full page, so the
+  grid/list is restored, the header, accent picker and lightbox script do not
+  re-run, and the URL bar always matches the rendered page.
+- **Lightbox page walk** — arrow/swipe past the last item of a page loads the
+  adjacent page via `outerMorph`, pushes its URL, and lands on the boundary
+  item; closing the lightbox afterwards leaves a consistent grid.
+- **Lightbox auto-close on restore** — with the lightbox open, hitting back
+  closes it (the restore swap fires `htmx:after:swap` on `<body>`).
+- **Forward through lightbox-pushed entries** — a known pre-existing quirk:
+  `loadAdjacentPage` mirrors `hx-push-url` with a bare
+  `history.pushState(null, …)`, so forward through such an entry does not
+  re-render (htmx ignores history entries without its `{htmx: true}` state
+  marker). Passing `push: "true"` to `htmx.ajax()` instead of the manual
+  `pushState` would hand the entry to htmx's history handling.

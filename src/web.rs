@@ -190,8 +190,14 @@ fn clamp_page_size(requested: Option<u32>) -> u32 {
 /// page. Requests without this header (a plain link click, a browser
 /// reload, or JS disabled entirely) always get the full page, which is
 /// what makes pagination work with no JS at all.
+///
+/// History restores are the exception: htmx 4 services back/forward
+/// navigation by re-fetching the URL and swapping the `[hx-history-elt]`
+/// element (`<main>`) out of the response, which only exists in a full
+/// page. Those requests carry `HX-Request` too, so the restore header
+/// carves them back out to the full-page branch.
 fn is_htmx_request(headers: &HeaderMap) -> bool {
-    headers.contains_key("HX-Request")
+    headers.contains_key("HX-Request") && !headers.contains_key("HX-History-Restore-Request")
 }
 
 /// Encodes an `at_uri` for use as a `/posts/:id` or `/media/.../:id/...`
