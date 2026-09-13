@@ -38,6 +38,43 @@ jobs:
       - name: cargo test
         run: cargo test
 
+  browser-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node toolchain (for Playwright)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e-browser/package-lock.json
+
+      - name: Install Playwright suite and Chromium
+        working-directory: e2e-browser
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Run browser e2e suite
+        run: cargo test --test browser -- --nocapture
+
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            e2e-browser/test-results/
+            e2e-browser/playwright-report/
+          if-no-files-found: ignore
+
   docker:
     runs-on: ubuntu-latest
     steps:

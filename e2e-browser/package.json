@@ -1,0 +1,11 @@
+{
+  "name": "bsky-archiver-browser-e2e",
+  "private": true,
+  "description": "Browser e2e suite for the web UI (driven by tests/browser.rs, which spawns the real axum server).",
+  "scripts": {
+    "test": "node node_modules/@playwright/test/cli.js test --reporter=list"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}

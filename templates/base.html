@@ -302,7 +302,12 @@
     htmx
       .ajax("GET", href, {
         target: link.getAttribute("hx-target"),
-        swap: link.getAttribute("hx-swap") || "outerHTML",
+        swap: link.getAttribute("hx-swap") || "outerMorph",
+        // Hand the URL to htmx's own history handling (as hx-push-url does
+        // on a regular pagination click): the entry is pushed with htmx's
+        // {htmx: true} state marker, so back AND forward through
+        // lightbox-driven pages re-render the swapped page.
+        push: "true",
       })
       .then(
         function () {
@@ -314,8 +319,6 @@
             updateButtons();
             return;
           }
-          // Mirror what hx-push-url does on a regular pagination click.
-          if (history && history.pushState) history.pushState(null, "", href);
           window.scrollTo(0, 0);
           collectItems();
           index = pickFromEnd ? items.length - 1 : 0;
