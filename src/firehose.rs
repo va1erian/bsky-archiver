@@ -438,8 +438,8 @@ impl FirehoseConsumer {
 }
 
 /// Extracts [`MediaRef`]s from a post record's `embed`, mirroring
-/// [`has_archivable_media`]'s recognized shapes (direct image/video embeds,
-/// and media nested in `recordWithMedia`).
+/// [`has_archivable_media`]'s recognized shapes (direct image/video/gallery
+/// embeds, and media nested in `recordWithMedia`).
 fn extract_media(record: &Value, author_did: &str) -> Vec<MediaRef> {
     record
         .get("embed")
@@ -469,6 +469,17 @@ fn media_from_embed(embed: &Value, author_did: &str) -> Vec<MediaRef> {
             .and_then(|blob| video_media_ref(blob, author_did))
             .into_iter()
             .collect(),
+        "app.bsky.embed.gallery" => embed
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("image"))
+                    .filter_map(|blob| image_media_ref(blob, author_did))
+                    .collect()
+            })
+            .unwrap_or_default(),
         "app.bsky.embed.recordWithMedia" => embed
             .get("media")
             .map(|media| media_from_embed(media, author_did))
@@ -596,6 +607,49 @@ mod tests {
                             "mimeType": "video/mp4",
                             "size": 99999
                         }
+                    }
+                }
+            }
+        })
+    }
+
+    fn gallery_post(did: &str) -> Value {
+        json!({
+            "did": did,
+            "time_us": 1_700_000_000_300_000i64,
+            "kind": "commit",
+            "commit": {
+                "rev": "rev4",
+                "operation": "create",
+                "collection": "app.bsky.feed.post",
+                "rkey": "gal123",
+                "cid": "cid-4",
+                "record": {
+                    "text": "a gallery post",
+                    "embed": {
+                        "$type": "app.bsky.embed.gallery",
+                        "items": [
+                            {
+                                "$type": "app.bsky.embed.gallery#image",
+                                "alt": "",
+                                "image": {
+                                    "$type": "blob",
+                                    "ref": {"$link": "bafygal1"},
+                                    "mimeType": "image/jpeg",
+                                    "size": 1234
+                                }
+                            },
+                            {
+                                "$type": "app.bsky.embed.gallery#image",
+                                "alt": "",
+                                "image": {
+                                    "$type": "blob",
+                                    "ref": {"$link": "bafygal2"},
+                                    "mimeType": "image/jpeg",
+                                    "size": 2345
+                                }
+                            }
+                        ]
                     }
                 }
             }
@@ -796,6 +850,46 @@ mod tests {
             .expect("candidate received in time")
             .expect("channel open");
         assert!(candidate.media[0].cdn_url.contains("playlist.m3u8"));
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = std::fs::remove_file(&cursor_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_post_is_detected_as_media() {
+        let did = "did:plc:bob";
+        let (_server, _seen) = spawn_mock_server(vec![vec![gallery_post(did)]]).await;
+        let addr = _server.addr;
+
+        let url = Url::parse(&format!("ws://{addr}/subscribe")).unwrap();
+        let (candidate_tx, mut candidate_rx) = candidate_post_channel(8);
+        let (health_tx, _health_rx) = connection_health_channel(ConnectionHealth::Disabled);
+        let cursor_path = std::env::temp_dir().join(format!("bsky-firehose-cursor-{}", uuid()));
+        let store = test_store().await;
+
+        let mut consumer = FirehoseConsumer::new(
+            url,
+            cursor_path.clone(),
+            candidate_tx,
+            health_tx,
+            account_roster(&[did]),
+            store,
+        )
+        .with_backoff(test_backoff());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            consumer.run(shutdown_rx).await;
+        });
+
+        let candidate = tokio::time::timeout(Duration::from_secs(2), candidate_rx.recv())
+            .await
+            .expect("candidate received in time")
+            .expect("channel open");
+        assert_eq!(candidate.media.len(), 2);
+        assert!(candidate.media[0].cdn_url.contains("bafygal1"));
+        assert!(candidate.media[1].cdn_url.contains("bafygal2"));
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;

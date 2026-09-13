@@ -11,6 +11,50 @@ async fn open_store() -> (tempfile::TempDir, ArchiveStore) {
     (dir, store)
 }
 
+/// Multi-media posts download their files concurrently, so two
+/// `save_media` calls for the same post race the record envelope's
+/// read-modify-write: without serialization, each call reads the same
+/// pre-append snapshot and the record loses all but the last writer's
+/// media entry (the SQLite rows survive, but a reindex rebuilds the index
+/// from the envelopes and would drop the lost files for good).
+#[tokio::test]
+async fn concurrent_save_media_calls_all_land_in_the_record() {
+    let (_dir, store) = open_store().await;
+    let at_uri = "at://did:plc:alice/app.bsky.feed.post/1";
+    store
+        .save_post(Category::Post, at_uri, "cid-1", json!({}))
+        .await
+        .unwrap();
+
+    let (first, second) = tokio::join!(
+        store.save_media(
+            Category::Post,
+            at_uri,
+            "000.jpg",
+            Some("image/jpeg".to_string()),
+            b"one".to_vec(),
+        ),
+        store.save_media(
+            Category::Post,
+            at_uri,
+            "001.jpg",
+            Some("image/jpeg".to_string()),
+            b"two".to_vec(),
+        ),
+    );
+    first.unwrap();
+    second.unwrap();
+
+    let record = store
+        .get_post(Category::Post, at_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut filenames: Vec<&str> = record.media.iter().map(|m| m.filename.as_str()).collect();
+    filenames.sort_unstable();
+    assert_eq!(filenames, ["000.jpg", "001.jpg"]);
+}
+
 #[tokio::test]
 async fn save_then_list_round_trip() {
     let (_dir, store) = open_store().await;

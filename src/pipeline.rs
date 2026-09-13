@@ -154,9 +154,10 @@ pub fn connection_health_channel(
 /// [`CandidatePost`] if this returns `true`.
 ///
 /// Recognizes direct `app.bsky.embed.images` / `app.bsky.embed.video`
-/// embeds, and media wrapped in `app.bsky.embed.recordWithMedia` (a quote
-/// post with attached media). Any other, missing, or malformed embed shape
-/// returns `false` rather than panicking.
+/// embeds, `app.bsky.embed.gallery` (multi-image gallery posts), and media
+/// wrapped in `app.bsky.embed.recordWithMedia` (a quote post with attached
+/// media). Any other, missing, or malformed embed shape returns `false`
+/// rather than panicking.
 pub fn has_archivable_media(record: &serde_json::Value) -> bool {
     match record.get("embed") {
         Some(embed) => embed_has_media(embed),
@@ -172,6 +173,7 @@ fn embed_has_media(embed: &serde_json::Value) -> bool {
     match embed_type {
         "app.bsky.embed.images" | "app.bsky.embed.images#view" => true,
         "app.bsky.embed.video" | "app.bsky.embed.video#view" => true,
+        "app.bsky.embed.gallery" | "app.bsky.embed.gallery#view" => true,
         "app.bsky.embed.recordWithMedia" | "app.bsky.embed.recordWithMedia#view" => {
             embed.get("media").map(embed_has_media).unwrap_or(false)
         }
@@ -203,6 +205,43 @@ mod tests {
             "embed": {
                 "$type": "app.bsky.embed.video",
                 "video": {"ref": "bafy..."}
+            }
+        });
+        assert!(has_archivable_media(&record));
+    }
+
+    #[test]
+    fn gallery_embed_is_archivable() {
+        let record = json!({
+            "text": "a gallery post",
+            "embed": {
+                "$type": "app.bsky.embed.gallery",
+                "items": [{
+                    "$type": "app.bsky.embed.gallery#image",
+                    "alt": "",
+                    "image": {
+                        "$type": "blob",
+                        "ref": {"$link": "bafy..."},
+                        "mimeType": "image/jpeg",
+                        "size": 1234
+                    }
+                }]
+            }
+        });
+        assert!(has_archivable_media(&record));
+    }
+
+    #[test]
+    fn gallery_embed_view_is_archivable() {
+        let record = json!({
+            "text": "a gallery post, hydrated",
+            "embed": {
+                "$type": "app.bsky.embed.gallery#view",
+                "items": [{
+                    "$type": "app.bsky.embed.gallery#viewImage",
+                    "alt": "",
+                    "fullsize": "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:x/bafy..."
+                }]
             }
         });
         assert!(has_archivable_media(&record));
