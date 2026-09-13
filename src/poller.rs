@@ -715,8 +715,8 @@ async fn drain_feed_items(
 /// Extracts downloadable media from a hydrated embed *view* (as returned
 /// alongside `post.record` by `getAuthorFeed`/`getFeed`, distinct from the raw
 /// record's blob-reference embed that [`has_archivable_media`] checks).
-/// Recognizes the same three shapes `has_archivable_media` does, walking
-/// into `recordWithMedia#view`'s nested `media`.
+/// Recognizes the same shapes `has_archivable_media` does, walking into
+/// `recordWithMedia#view`'s nested `media`.
 fn extract_media_from_view(embed: &serde_json::Value) -> Vec<MediaRef> {
     let Some(embed_type) = embed.get("$type").and_then(|v| v.as_str()) else {
         return Vec::new();
@@ -749,6 +749,23 @@ fn extract_media_from_view(embed: &serde_json::Value) -> Vec<MediaRef> {
                     declared_mime_type: Some("application/vnd.apple.mpegurl".to_string()),
                     declared_size_bytes: None,
                 }]
+            })
+            .unwrap_or_default(),
+        "app.bsky.embed.gallery#view" => embed
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let cdn_url = item.get("fullsize").and_then(|v| v.as_str())?;
+                        Some(MediaRef {
+                            cdn_url: cdn_url.to_string(),
+                            declared_mime_type: None,
+                            declared_size_bytes: None,
+                        })
+                    })
+                    .collect()
             })
             .unwrap_or_default(),
         "app.bsky.embed.recordWithMedia#view" => embed
@@ -1208,6 +1225,23 @@ fn extract_media_refs(embed: &serde_json::Value) -> Vec<MediaRef> {
                     declared_mime_type: Some("application/vnd.apple.mpegurl".to_string()),
                     declared_size_bytes: None,
                 }]
+            })
+            .unwrap_or_default(),
+        "app.bsky.embed.gallery#view" | "app.bsky.embed.gallery" => embed
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let cdn_url = item.get("fullsize").and_then(|v| v.as_str())?;
+                        Some(MediaRef {
+                            cdn_url: cdn_url.to_string(),
+                            declared_mime_type: Some("image/jpeg".to_string()),
+                            declared_size_bytes: None,
+                        })
+                    })
+                    .collect()
             })
             .unwrap_or_default(),
         "app.bsky.embed.recordWithMedia#view" | "app.bsky.embed.recordWithMedia" => embed

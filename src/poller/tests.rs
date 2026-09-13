@@ -1101,6 +1101,155 @@ fn extract_media_refs_ignores_unknown_embed() {
     assert!(extract_media_refs(&embed).is_empty());
 }
 
+#[test]
+fn extract_media_refs_handles_gallery_view() {
+    let embed = json!({
+        "$type": "app.bsky.embed.gallery#view",
+        "items": [
+            {
+                "$type": "app.bsky.embed.gallery#viewImage",
+                "fullsize": "https://cdn.example.com/img1",
+            },
+            {
+                "$type": "app.bsky.embed.gallery#viewImage",
+                "fullsize": "https://cdn.example.com/img2",
+            },
+        ],
+    });
+    let refs = extract_media_refs(&embed);
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[0].cdn_url, "https://cdn.example.com/img1");
+    assert_eq!(refs[1].cdn_url, "https://cdn.example.com/img2");
+}
+
+#[test]
+fn extract_media_from_view_handles_gallery_view() {
+    let embed = json!({
+        "$type": "app.bsky.embed.gallery#view",
+        "items": [
+            {
+                "$type": "app.bsky.embed.gallery#viewImage",
+                "fullsize": "https://cdn.example.com/img1",
+            },
+            {
+                "$type": "app.bsky.embed.gallery#viewImage",
+                "alt": "no fullsize; skipped",
+            },
+        ],
+    });
+    let refs = extract_media_from_view(&embed);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].cdn_url, "https://cdn.example.com/img1");
+}
+
+/// Regression test: a bookmarked post using the newer
+/// `app.bsky.embed.gallery` embed (multi-image gallery posts) is archived
+/// with all of its images downloaded, same as the classic images embed —
+/// otherwise the post exists in the index but never shows up in the
+/// media-driven gallery.
+#[tokio::test]
+async fn gallery_embedded_bookmarked_post_archives_all_images() {
+    let server = MockServer::start().await;
+    mock_session(&server).await;
+
+    let (_dir, store) = open_store().await;
+    let uri = "at://did:plc:carol/app.bsky.feed.post/gal";
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bookmarks": [{
+                "subject": {"uri": uri, "cid": "cid-gal"},
+                "item": {
+                    "uri": uri,
+                    "cid": "cid-gal",
+                    "author": {"did": "did:plc:carol"},
+                    "record": {
+                        "text": "gallery",
+                        "embed": {
+                            "$type": "app.bsky.embed.gallery",
+                            "items": [
+                                {
+                                    "$type": "app.bsky.embed.gallery#image",
+                                    "alt": "",
+                                    "image": {
+                                        "$type": "blob",
+                                        "ref": {"$link": "bafygal1"},
+                                        "mimeType": "image/jpeg",
+                                        "size": 4
+                                    }
+                                },
+                                {
+                                    "$type": "app.bsky.embed.gallery#image",
+                                    "alt": "",
+                                    "image": {
+                                        "$type": "blob",
+                                        "ref": {"$link": "bafygal2"},
+                                        "mimeType": "image/jpeg",
+                                        "size": 4
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "embed": {
+                        "$type": "app.bsky.embed.gallery#view",
+                        "items": [
+                            {
+                                "$type": "app.bsky.embed.gallery#viewImage",
+                                "fullsize": format!("{}/img/plain/bafygal1", server.uri()),
+                            },
+                            {
+                                "$type": "app.bsky.embed.gallery#viewImage",
+                                "fullsize": format!("{}/img/plain/bafygal2", server.uri()),
+                            },
+                        ],
+                    },
+                },
+            }],
+            "cursor": null,
+        })))
+        .mount(&server)
+        .await;
+    for blob in ["bafygal1", "bafygal2"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/img/plain/{blob}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/jpeg")
+                    .set_body_bytes(vec![0xffu8, 0xd8, 0xff, 0xe0]),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let (tx, mut rx) = candidate_post_channel(8);
+    let poller = LikesBookmarksPoller::new(
+        make_client(&server),
+        store.clone(),
+        tx,
+        "did:plc:alice".to_string(),
+        Duration::from_secs(60),
+    );
+    poller.poll_bookmarks().await.expect("poll bookmarks");
+
+    // The downloader consumes the candidate the walk queued; dropping the
+    // poller closes the channel so `run` can finish.
+    drop(poller);
+    crate::media::MediaDownloader::new(store.clone(), 4, 5_000_000)
+        .run(&mut rx)
+        .await;
+
+    let record = store
+        .get_post(Category::Bookmark, uri)
+        .await
+        .expect("get_post")
+        .expect("gallery bookmark archived");
+    assert_eq!(record.media.len(), 2, "both gallery images stored");
+    assert_eq!(record.media[0].content_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(record.media[1].content_type.as_deref(), Some("image/jpeg"));
+}
+
 // ---------------------------------------------------------------------
 // Feed poller + live-roster reload behavior
 // ---------------------------------------------------------------------

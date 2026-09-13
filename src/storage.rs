@@ -876,6 +876,13 @@ impl ArchiveStore {
                 return Err(StorageError::NotFound(at_uri.clone()));
             }
 
+            // The envelope update below is a read-modify-write of the record
+            // file, and multi-media posts download their files concurrently:
+            // hold the store-wide lock across the whole critical section so
+            // two parallel `save_media` calls can't each read the same
+            // pre-append snapshot and lose all but the last writer's entry.
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+
             let media_path = media_dir(&archive_dir, category, &at_uri).join(&filename);
             let size_bytes = bytes.len() as u64;
             if !media_path.exists() {
@@ -895,7 +902,6 @@ impl ArchiveStore {
             }
 
             let indexed_at = now_rfc3339();
-            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR IGNORE INTO media
                     (post_at_uri, category, filename, content_type, size_bytes, indexed_at)
