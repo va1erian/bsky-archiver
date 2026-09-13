@@ -42,6 +42,14 @@ pub const DEFAULT_TUMBLR_BASE_URL: &str = "https://api.tumblr.com";
 /// maximum.
 pub const PAGE_LIMIT: u32 = 20;
 
+/// Delay inserted between consecutive `/user/likes` page fetches within a
+/// single walk. Tumblr rate-limits its API to 1000 requests/hour and
+/// 5000/day; a sustained backfill paced 4s per page stays under the hourly
+/// cap (~900 requests/hour) no matter how large the like list is.
+/// Steady-state polling — 1–2 pages per cycle at the much longer
+/// `TUMBLR_POLL_INTERVAL_SECONDS` — is nowhere near either limit.
+const PAGE_DELAY: Duration = Duration::from_secs(4);
+
 // ---------------------------------------------------------------------
 // OAuth 1.0a signing (RFC 5849, HMAC-SHA1)
 // ---------------------------------------------------------------------
@@ -357,6 +365,9 @@ pub struct TumblrLikesPoller {
     /// Posts requested per `/user/likes` page. [`PAGE_LIMIT`] in
     /// production; tests shrink it to exercise multi-page walks cheaply.
     page_limit: u32,
+    /// Delay between consecutive page fetches within one walk
+    /// ([`PAGE_DELAY`] in production; tests zero it out).
+    page_delay: Duration,
     /// Whether the next poll pass should walk the entire list with the
     /// dedup boundary disabled. `true` for the first pass after startup, so
     /// a backfill interrupted by a restart (or by the walk failing
@@ -378,6 +389,7 @@ impl TumblrLikesPoller {
             sender,
             base_interval,
             page_limit: PAGE_LIMIT,
+            page_delay: PAGE_DELAY,
             first_pass: true,
         }
     }
@@ -387,6 +399,14 @@ impl TumblrLikesPoller {
     #[cfg(test)]
     pub(crate) fn with_page_limit(mut self, page_limit: u32) -> Self {
         self.page_limit = page_limit;
+        self
+    }
+
+    /// Overrides the inter-page delay (test-only knob; production callers
+    /// use [`PAGE_DELAY`] via [`Self::new`]).
+    #[cfg(test)]
+    pub(crate) fn with_page_delay(mut self, page_delay: Duration) -> Self {
+        self.page_delay = page_delay;
         self
     }
 
@@ -529,6 +549,10 @@ impl TumblrLikesPoller {
             if page.liked_count > 0 && offset >= page.liked_count {
                 return Ok(());
             }
+
+            // Pace multi-page walks: another fetch is coming, so wait out
+            // the inter-page delay first (see [`PAGE_DELAY`]).
+            tokio::time::sleep(self.page_delay).await;
         }
     }
 

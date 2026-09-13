@@ -37,6 +37,7 @@ services:
       # TUMBLR_CONSUMER_SECRET: "your-consumer-secret"
       # TUMBLR_OAUTH_TOKEN: "your-oauth-token"
       # TUMBLR_OAUTH_SECRET: "your-oauth-secret"
+      # TUMBLR_POLL_INTERVAL_SECONDS: "300"
       RUST_LOG: "info"
     volumes:
       # Persists the archived JSON + media + SQLite index across restarts

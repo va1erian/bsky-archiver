@@ -16,6 +16,7 @@ const ALL_VARS: &[&str] = &[
     "TUMBLR_CONSUMER_SECRET",
     "TUMBLR_OAUTH_TOKEN",
     "TUMBLR_OAUTH_SECRET",
+    "TUMBLR_POLL_INTERVAL_SECONDS",
     "ARCHIVE_DIR",
     "DATABASE_PATH",
     "UI_PASSWORD",
@@ -36,6 +37,7 @@ mod defaults {
     pub const MEDIA_MAX_CONCURRENT_DOWNLOADS: usize = 4;
     pub const MEDIA_MAX_BYTES: u64 = 104_857_600;
     pub const NIGHTLY_SWEEP_LOCAL_HOUR: u32 = 3;
+    pub const TUMBLR_POLL_INTERVAL_SECONDS: u64 = 300;
 }
 
 /// A secret string value (app password, UI password, session signing key).
@@ -162,6 +164,11 @@ pub struct AppConfig {
     /// Local hour of day (0-23) at which the nightly likes/bookmarks
     /// deletion sweep runs. See [`crate::sweep`].
     pub nightly_sweep_local_hour: u32,
+    /// Baseline interval for the Tumblr likes poller. Deliberately separate
+    /// from (and slower than) [`Self::poll_interval_seconds`]: Tumblr
+    /// rate-limits its API to 1000 requests/hour and 5000/day, and the
+    /// Tumblr poll has no firehose to share the load with.
+    pub tumblr_poll_interval_seconds: u64,
 }
 
 impl AppConfig {
@@ -229,6 +236,11 @@ impl AppConfig {
             None => defaults::NIGHTLY_SWEEP_LOCAL_HOUR,
         };
 
+        let tumblr_poll_interval_seconds = match optional_var("TUMBLR_POLL_INTERVAL_SECONDS") {
+            Some(raw) => parse_positive_u64("TUMBLR_POLL_INTERVAL_SECONDS", &raw)?,
+            None => defaults::TUMBLR_POLL_INTERVAL_SECONDS,
+        };
+
         Ok(AppConfig {
             bsky_identifier,
             bsky_app_password,
@@ -243,6 +255,7 @@ impl AppConfig {
             media_max_concurrent_downloads,
             media_max_bytes,
             nightly_sweep_local_hour,
+            tumblr_poll_interval_seconds,
         })
     }
 }
@@ -443,6 +456,10 @@ mod tests {
             config.nightly_sweep_local_hour,
             defaults::NIGHTLY_SWEEP_LOCAL_HOUR
         );
+        assert_eq!(
+            config.tumblr_poll_interval_seconds,
+            defaults::TUMBLR_POLL_INTERVAL_SECONDS
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -588,6 +605,26 @@ mod tests {
         let err = AppConfig::build().expect_err("non-numeric hour should fail");
         match err {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, "NIGHTLY_SWEEP_LOCAL_HOUR"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_tumblr_poll_interval_produces_specific_error() {
+        let dir = temp_dir("invalid-tumblr-poll-interval");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TUMBLR_POLL_INTERVAL_SECONDS", "0"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::build().expect_err("zero tumblr poll interval should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => {
+                assert_eq!(var, "TUMBLR_POLL_INTERVAL_SECONDS")
+            }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
 

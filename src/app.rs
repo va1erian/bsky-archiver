@@ -274,7 +274,7 @@ pub async fn serve(started: Started) {
                 tumblr_client,
                 state.store.clone(),
                 candidate_tx.clone(),
-                Duration::from_secs(config.poll_interval_seconds),
+                Duration::from_secs(config.tumblr_poll_interval_seconds),
                 health_tx.clone(),
                 shutdown_rx.clone(),
             ))
@@ -737,6 +737,7 @@ mod tests {
             media_max_concurrent_downloads: 4,
             media_max_bytes: 104_857_600,
             nightly_sweep_local_hour: 3,
+            tumblr_poll_interval_seconds: 300,
         }
     }
 
