@@ -295,6 +295,13 @@
   white-space: nowrap;
 }
 
+/* Values are unbreakable strings (file paths, DIDs, handles); without an
+   anywhere-wrap rule they force the auto-layout table, and with it the whole
+   document, wider than the viewport on narrow screens. */
+.config-table td:not(:first-child) {
+  overflow-wrap: anywhere;
+}
+
 .redacted {
   font-style: italic;
   color: var(--pico-muted-color);
