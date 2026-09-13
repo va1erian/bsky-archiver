@@ -203,7 +203,9 @@
 /* The lightbox is a true full-screen viewer: the dialog fills the whole
    viewport (100dvw/100dvh, so mobile browser chrome doesn't clip it), the
    media letterboxes with object-fit, and the close button, prev/next
-   arrows, and counter are overlaid on top. */
+   arrows, and counter are overlaid on top. overflow hidden clips the
+   outgoing/incoming layers while they slide across; touch-action keeps
+   horizontal swipes for the viewer while leaving vertical panning alone. */
 #lightbox {
   padding: 0;
   border: none;
@@ -212,6 +214,8 @@
   width: 100dvw;
   height: 100dvh;
   background: transparent;
+  overflow: hidden;
+  touch-action: pan-y;
 }
 
 #lightbox article {
@@ -222,6 +226,7 @@
   margin: 0;
   background: transparent;
   box-shadow: none;
+  overflow: hidden;
 }
 
 #lightbox img,
@@ -239,8 +244,8 @@
 
 .close-lightbox {
   position: absolute;
-  top: 0.5rem;
-  right: 0.5rem;
+  top: max(0.5rem, env(safe-area-inset-top));
+  right: max(0.5rem, env(safe-area-inset-right));
   width: 2.75rem;
   height: 2.75rem;
   line-height: 1;
@@ -261,11 +266,11 @@
 }
 
 .lightbox-nav[data-nav="prev"] {
-  left: 0.5rem;
+  left: max(0.5rem, env(safe-area-inset-left));
 }
 
 .lightbox-nav[data-nav="next"] {
-  right: 0.5rem;
+  right: max(0.5rem, env(safe-area-inset-right));
 }
 
 .lightbox-nav[disabled] {
@@ -275,7 +280,7 @@
 
 .lightbox-counter {
   position: absolute;
-  bottom: 0.75rem;
+  bottom: max(0.75rem, env(safe-area-inset-bottom));
   left: 50%;
   transform: translateX(-50%);
   color: #fff;
