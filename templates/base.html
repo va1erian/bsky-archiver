@@ -302,7 +302,7 @@
     htmx
       .ajax("GET", href, {
         target: link.getAttribute("hx-target"),
-        swap: link.getAttribute("hx-swap") || "outerMorph",
+        swap: link.getAttribute("hx-swap") || "outerHTML",
         // Hand the URL to htmx's own history handling (as hx-push-url does
         // on a regular pagination click): the entry is pushed with htmx's
         // {htmx: true} state marker, so back AND forward through

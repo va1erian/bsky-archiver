@@ -37,9 +37,22 @@
 <script>
 (function () {
   var select = document.getElementById("gallery-sort");
-  if (!select) return;
-  select.addEventListener("change", function () {
-    if (select.value) window.location.href = select.value;
+  if (select) {
+    select.addEventListener("change", function () {
+      if (select.value) window.location.href = select.value;
+    });
+  }
+
+  // A pagination click swaps #gallery-grid in place; without this the
+  // viewport stays wherever it was (usually down at the pagination row) and
+  // the new page's images start off-screen. The lightbox's own page walk
+  // scrolls to the top too, so this only ever duplicates that. Back/forward
+  // history restores swap <main>, not #gallery-grid, and keep their scroll.
+  document.body.addEventListener("htmx:after:swap", function (event) {
+    var ctx = (event.detail || {}).ctx || {};
+    var target = ctx.target;
+    if (typeof target === "string") target = document.querySelector(target);
+    if (target && target.id === "gallery-grid") window.scrollTo(0, 0);
   });
 })();
 </script>

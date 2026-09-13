@@ -4,8 +4,9 @@
 // from the /media/ routes).
 //
 // Covers the two behavior groups recorded in TODO.md before this suite
-// existed: the htmx 4 client-side behaviors (morph pagination swaps,
-// fetch-based back/forward history restore, lightbox page walk) and the
+// existed: the htmx 4 client-side behaviors (pagination swaps without a
+// page reload, fetch-based back/forward history restore, lightbox page walk)
+// and the
 // responsive viewport checks (layout, nav disclosure, table reflow, touch
 // targets, dark/light) from the responsive-layout work.
 import { test, expect } from "@playwright/test";
@@ -87,7 +88,7 @@ test("posts list renders cards with loadable thumbnails", async ({ page }) => {
 // htmx 4 client-side behavior
 // ---------------------------------------------------------------------
 
-test("pagination swaps morph the grid in place without a page reload", async ({
+test("pagination swaps replace the grid without a page reload and replay the card animation", async ({
   page,
 }) => {
   await login(page);
@@ -98,9 +99,26 @@ test("pagination swaps morph the grid in place without a page reload", async ({
   await expect(page.locator(".pagination .item-meta")).toContainText("Page 2 of 3");
   await expect(page).toHaveURL(/page=2/);
   expect(await reloadProbe(page)).toBe(42); // no full page reload
-  expect(await gridIsSameNode(page)).toBe(true); // outerMorph kept the node
+  // outerHTML replaces the grid wholesale; the fresh nodes are what replays
+  // the card-in load-in animation on every page change (morphing kept the
+  // old nodes and silently dropped the animation).
+  expect(await gridIsSameNode(page)).toBe(false);
+  expect(
+    await page.evaluate(
+      () =>
+        getComputedStyle(document.querySelector(".gallery-grid .gallery-item"))
+          .animationName,
+    ),
+  ).toBe("card-in");
 
-  // The pagination links themselves morph with the grid: clicking First
+  // A page switch puts the viewport back at the top of the gallery: scroll
+  // down to the pagination row, click Next, and the page is back at the top.
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.locator(".pagination a[rel=next]").click();
+  await expect(page.locator(".pagination .item-meta")).toContainText("Page 3 of 3");
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+
+  // The pagination links live inside the swapped grid: clicking First
   // returns to page 1 over the same target.
   await page.locator(".pagination a[rel=first]").click();
   await expect(page.locator(".pagination .item-meta")).toContainText("Page 1 of 3");
