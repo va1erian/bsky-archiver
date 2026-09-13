@@ -19,12 +19,12 @@
 
 <nav class="pagination" aria-label="Pagination">
 {% if let Some(href) = pagination.first_href %}
-<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerMorph" hx-push-url="true" rel="first">&laquo; First</a>
+<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="first">&laquo; First</a>
 {% else %}
 <span class="disabled">&laquo; First</span>
 {% endif %}
 {% if let Some(href) = pagination.prev_href %}
-<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerMorph" hx-push-url="true" rel="prev">Previous</a>
+<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="prev">Previous</a>
 {% else %}
 <span class="disabled">Previous</span>
 {% endif %}
@@ -32,16 +32,16 @@
 {% if link.current %}
 <span class="current">{{ link.number }}</span>
 {% else %}
-<a href="{{ link.href }}" hx-get="{{ link.href }}" hx-target="#gallery-grid" hx-swap="outerMorph" hx-push-url="true">{{ link.number }}</a>
+<a href="{{ link.href }}" hx-get="{{ link.href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true">{{ link.number }}</a>
 {% endif %}
 {% endfor %}
 {% if let Some(href) = pagination.next_href %}
-<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerMorph" hx-push-url="true" rel="next">Next</a>
+<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="next">Next</a>
 {% else %}
 <span class="disabled">Next</span>
 {% endif %}
 {% if let Some(href) = pagination.last_href %}
-<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerMorph" hx-push-url="true" rel="last">Last &raquo;</a>
+<a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="last">Last &raquo;</a>
 {% else %}
 <span class="disabled">Last &raquo;</span>
 {% endif %}

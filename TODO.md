@@ -20,13 +20,15 @@ Formerly-manual checks now asserted by the suite:
   tables wide); ~44px touch targets on pagination and category filters at
   360px; lightbox open/close at all widths; dark and light color schemes both
   style the page.
-- **htmx 4 client-side behavior**: gallery/posts pagination swaps morph in
-  place (`outerMorph`, target node identity asserted) without a page reload
-  and push canonical URLs; back/forward restore `<main>` from a re-fetched
+- **htmx 4 client-side behavior**: gallery/posts pagination swaps replace
+  the grid/list in place (`outerHTML` — fresh nodes, so the card load-in
+  animation replays on every page change) without a page reload and push
+  canonical URLs; a page switch scrolls the viewport back to the top of the
+  gallery; back/forward restore `<main>` from a re-fetched
   full page (reload probe proves the shell never re-executes); the lightbox
-  walks across page boundaries forward and back via `outerMorph` and lands on
-  the boundary item with correct URL; back navigation with the lightbox open
-  closes it and restores the underlying page; forward through a
+  walks across page boundaries forward and back via the same swaps and lands
+  on the boundary item with correct URL; back navigation with the lightbox
+  open closes it and restores the underlying page; forward through a
   lightbox-pushed history entry re-renders (regression test for handing the
   pushed URL to htmx's own history handling instead of a bare
   `history.pushState`).

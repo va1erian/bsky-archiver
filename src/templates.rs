@@ -71,12 +71,19 @@ pub fn build_pagination(
     let next_href = (page < total_pages).then(|| href_for(page + 1));
     let last_href = (page < total_pages).then(|| href_for(total_pages));
 
-    const WINDOW: u32 = 2;
+    // The numbered window is fixed-width (5 when there are enough pages)
+    // rather than shrinking at the range edges: a centred window would go
+    // 3-4-5 links wide as you page, resizing the switcher on every click.
+    // The start is clamped twice so the window slides up against the last
+    // page instead of overrunning it.
+    const PAGE_LINK_WINDOW: u32 = 5;
     let page_links = if total_pages == 0 {
         Vec::new()
     } else {
-        let start = page.saturating_sub(WINDOW).max(1);
-        let end = page.saturating_add(WINDOW).min(total_pages);
+        let window = PAGE_LINK_WINDOW.min(total_pages);
+        let start = page.saturating_sub(window / 2).max(1);
+        let end = (start + window - 1).min(total_pages);
+        let start = (end + 1).saturating_sub(window).max(1);
         (start..=end)
             .map(|n| PageLink {
                 number: n,
@@ -574,5 +581,26 @@ mod tests {
         assert!(p.next_href.is_none());
         assert!(p.last_href.is_none());
         assert!(p.page_links.is_empty());
+    }
+
+    #[test]
+    fn build_pagination_page_window_is_fixed_width() {
+        let numbers = |page: u32, total: u32| -> Vec<u32> {
+            build_pagination(page, total, 1_000, |n| format!("/posts?page={n}"))
+                .page_links
+                .into_iter()
+                .map(|link| link.number)
+                .collect()
+        };
+        // Five links on every page once there are five pages: flush at the
+        // edges, centred in the middle, never resizing between clicks.
+        assert_eq!(numbers(1, 10), vec![1, 2, 3, 4, 5]);
+        assert_eq!(numbers(3, 10), vec![1, 2, 3, 4, 5]);
+        assert_eq!(numbers(5, 10), vec![3, 4, 5, 6, 7]);
+        assert_eq!(numbers(8, 10), vec![6, 7, 8, 9, 10]);
+        assert_eq!(numbers(10, 10), vec![6, 7, 8, 9, 10]);
+        // Fewer pages than the window: show all of them.
+        assert_eq!(numbers(2, 3), vec![1, 2, 3]);
+        assert_eq!(numbers(1, 1), vec![1]);
     }
 }
