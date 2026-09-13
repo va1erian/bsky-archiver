@@ -50,7 +50,7 @@
 </details>
 </nav>
 </header>
-<main class="container">
+<main class="container" hx-history-elt>
 {% block content %}{% endblock %}
 </main>
 <footer class="app-footer container">
@@ -262,9 +262,9 @@
   // lightbox; close it rather than leave media playing over new content —
   // unless the swap *is* the lightbox loading an adjacent page, in which
   // case the loadAdjacentPage continuation takes over. htmx fires
-  // afterSwap before its ajax promise settles, so this flag doubles as
+  // after:swap before its ajax promise settles, so this flag doubles as
   // the "the swap really happened" check for loadAdjacentPage.
-  document.body.addEventListener("htmx:afterSwap", function () {
+  document.body.addEventListener("htmx:after:swap", function () {
     if (loadingPage) {
       pageSwapped = true;
       return;
