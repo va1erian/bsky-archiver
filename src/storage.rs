@@ -12,11 +12,15 @@
 //!   likes/{shard}/{id}/media/{filename}
 //!   bookmarks/{shard}/{id}/record.json
 //!   bookmarks/{shard}/{id}/media/{filename}
+//!   tumblr_likes/{shard}/{id}/record.json
+//!   tumblr_likes/{shard}/{id}/media/{filename}
 //! ```
 //!
-//! `{id}` is the hex-encoded SHA-256 digest of the item's AT URI (the
-//! dedup key), and `{shard}` is its first two hex characters, so a single
-//! directory never has to hold every archived item. Hashing the AT URI
+//! `{id}` is the hex-encoded SHA-256 digest of the item's dedup key — its
+//! AT URI for Bluesky items, a `tumblr:{blog}/{post-id}` key for Tumblr
+//! likes (the dedup key, whatever its shape, is simply hashed). `{shard}`
+//! is its first two hex characters, so a single directory never has to
+//! hold every archived item. Hashing the key
 //! (rather than using it verbatim as a path) sidesteps path-separator and
 //! length issues in DIDs/rkeys while keeping the mapping deterministic:
 //! re-archiving the same `at_uri` always resolves to the same directory,
@@ -38,22 +42,33 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// The three top-level categories of archived item.
+/// The top-level categories of archived item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Category {
     Post,
     Like,
     Bookmark,
+    /// A Tumblr post the configured Tumblr account liked (archived by
+    /// [`crate::tumblr`]). Its item id is a `tumblr:{blog}/{post-id}` key
+    /// rather than an AT URI; everything else (record.json envelope, media
+    /// layout, index rows) works identically.
+    TumblrLike,
 }
 
 impl Category {
-    const ALL: [Category; 3] = [Category::Post, Category::Like, Category::Bookmark];
+    const ALL: [Category; 4] = [
+        Category::Post,
+        Category::Like,
+        Category::Bookmark,
+        Category::TumblrLike,
+    ];
 
     fn as_dir(self) -> &'static str {
         match self {
             Category::Post => "posts",
             Category::Like => "likes",
             Category::Bookmark => "bookmarks",
+            Category::TumblrLike => "tumblr_likes",
         }
     }
 }
@@ -72,6 +87,7 @@ impl std::str::FromStr for Category {
             "posts" => Ok(Category::Post),
             "likes" => Ok(Category::Like),
             "bookmarks" => Ok(Category::Bookmark),
+            "tumblr_likes" => Ok(Category::TumblrLike),
             other => Err(StorageError::InvalidCategory(other.to_string())),
         }
     }
@@ -600,13 +616,32 @@ fn migrate_v4_to_v5(conn: &Connection) -> Result<(), StorageError> {
 
 /// Extracts the RFC 3339 timestamp a record self-reports under `createdAt`
 /// (posts under every category carry one), for the `record_created_at`
-/// mirror used by the gallery's created-time sorting.
+/// mirror used by the gallery's created-time sorting. Tumblr post records
+/// have no `createdAt`; their equivalent is `post_date`, in Tumblr's
+/// `"YYYY-MM-DD HH:MM:SS GMT"` format, which is normalized to RFC 3339 so
+/// the column stays uniformly sortable.
 fn record_created_at_from(record: &serde_json::Value) -> Option<String> {
-    record
+    if let Some(created_at) = record
         .get("createdAt")
         .and_then(|value| value.as_str())
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    {
+        return Some(created_at.to_string());
+    }
+    record
+        .get("post_date")
+        .and_then(|value| value.as_str())
+        .and_then(tumblr_post_date_to_rfc3339)
+}
+
+/// Converts Tumblr's `"YYYY-MM-DD HH:MM:SS GMT"` `post_date` format to
+/// RFC 3339 (UTC). `None` for anything that doesn't parse — the mirror
+/// column just stays `None` for that row.
+fn tumblr_post_date_to_rfc3339(raw: &str) -> Option<String> {
+    use time::macros::format_description;
+    let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second] GMT");
+    let dt = time::PrimitiveDateTime::parse(raw, format).ok()?;
+    dt.assume_utc().format(&Rfc3339).ok()
 }
 
 /// Number of `posts` rows still missing their mirrored `record_created_at`.

@@ -8,6 +8,9 @@ A self-hosted daemon + web UI that watches a set of Bluesky sources and archives
 4. Any watched custom feeds (`app.bsky.feed.generator`) — poll-only, since
    Jetstream carries raw repo commits and there is no firehose path for an
    algorithmic feed.
+5. Optionally, the liked posts of a configured Tumblr account (see the
+   `TUMBLR_*` environment variables below) — poll-only, via Tumblr's
+   official API.
 
 What's watched — the **watch list** of accounts (handle or DID) and feeds — is
 managed from the web UI's `/config` page (the "Watched sources" panel) and
@@ -50,6 +53,7 @@ plain `docker compose`.
 | `bluesky` | The `com.atproto.*` / `app.bsky.*` REST (XRPC) client: session auth (with automatic re-login when the access token expires — either a 401 or the AppView's 400 `ExpiredToken` convention), `getAuthorFeed`, `getFeed`, `getActorLikes`, `getBookmarks`, and handle resolution. |
 | `firehose` | The Jetstream websocket consumer: real-time capture of the watched accounts' authored posts with media, filtered by DID from the live roster, with reconnect/backoff, a persisted cursor so a restart resumes roughly where it left off, and an immediate reconnect when the watched-account set changes. |
 | `poller` | The REST-polling fallback for authored posts (active whenever the firehose is down), the feed poller (algorithm/custom feeds, which are never on the firehose), and the periodic likes/bookmarks poller. All use adaptive intervals with jittered exponential backoff. The bookmarks poller also detects deletions: a bookmark whose post comes back as `notFound` was deleted upstream, and its archived copy is marked with a `deleted_at` timestamp (a `blocked` post still exists and is never marked). |
+| `tumblr` | The Tumblr API v2 client (OAuth 1.0a HMAC-SHA1-signed requests) and the Tumblr likes poller, which archives the configured Tumblr account's liked posts into the `tumblr_likes` category on the same adaptive polling cadence. Only runs when the `TUMBLR_*` credentials are configured. |
 | `sweep` | The likes/bookmarks deletion sweeper. It runs once at startup (so a deploy immediately catches up on anything the previous process missed and re-ranks the whole list) and then nightly at a fixed local hour (`NIGHTLY_SWEEP_LOCAL_HOUR`). It walks the entire bookmark and like lists (archiving anything the periodic pollers missed, re-ranking every item with its current position in Bluesky's list, and re-downloading stored media that carries a pre-fix corruption signature), then batch-verifies (`app.bsky.feed.getPosts`, 25 URIs per call) every URI already archived under those categories and marks the ones the API reports as gone. This is what catches deleted liked/bookmarked posts — including for authors not on the watch list, whom the firehose delete-op path never sees — and deletions that happened while the service was down. Marking only touches the index: the on-disk record and its media are always kept. |
 | `pipeline` | The shared `CandidatePost` channel and the `has_archivable_media` predicate connecting every producer (firehose, REST fallback, feed poller, likes/bookmarks poller) to the one consumer (the media downloader). |
 | `media` | Concurrency-limited, size-capped media downloading: streams each file, aborts if it exceeds `MEDIA_MAX_BYTES`, retries transient failures, and never leaves a partial file on disk. Videos arrive from Bluesky's CDN as HLS playlists whose segments are MPEG-TS; the TS segments are demuxed and remuxed into a single self-contained, playable `.mp4` (fMP4-based streams concatenate directly), capped in total by `MEDIA_MAX_BYTES`. |
@@ -171,6 +175,7 @@ docker push localhost:5000/bsky-archiver:latest
 | `MEDIA_MAX_CONCURRENT_DOWNLOADS` | `4` | Cap on simultaneous media downloads. |
 | `MEDIA_MAX_BYTES` | `104857600` (100 MiB) | Per-file download size safety cap (for reassembled videos, the cap applies to the whole stream). |
 | `NIGHTLY_SWEEP_LOCAL_HOUR` | `3` | Local hour of day (0-23) at which the nightly likes/bookmarks deletion sweep runs. In a container this is the container's timezone (usually UTC; set `TZ` to shift it). |
+| `TUMBLR_CONSUMER_KEY`, `TUMBLR_CONSUMER_SECRET`, `TUMBLR_OAUTH_TOKEN`, `TUMBLR_OAUTH_SECRET` | *(unset)* | Tumblr OAuth 1.0a credentials enabling the Tumblr likes archiver. All four must be set together (or none, to disable Tumblr archiving). Register an application at <https://www.tumblr.com/oauth/apps> to get the consumer key/secret, then visit the [API console](https://api.tumblr.com/console) with your account and use "Show keys" to get your OAuth token/secret. |
 | `RUST_LOG` | `info` | Standard `tracing`/`tracing-subscriber` filter string. |
 
 What the archiver watches is **not** configured via environment variables: the watch

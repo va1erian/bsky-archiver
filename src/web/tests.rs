@@ -31,6 +31,7 @@ async fn test_state() -> (tempfile::TempDir, SharedAppState) {
     let config = AppConfig {
         bsky_identifier: "alice.bsky.social".to_string(),
         bsky_app_password: Secret::from("bsky-app-password-secret".to_string()),
+        tumblr: None,
         archive_dir,
         database_path: dir.path().join("index.sqlite3"),
         ui_password: Secret::from("correct horse battery staple".to_string()),
@@ -1358,6 +1359,7 @@ async fn test_state_with_bluesky(
     let config = AppConfig {
         bsky_identifier: "alice.bsky.social".to_string(),
         bsky_app_password: Secret::from("bsky-app-password-secret".to_string()),
+        tumblr: None,
         archive_dir,
         database_path: dir.path().join("index.sqlite3"),
         ui_password: Secret::from("correct horse battery staple".to_string()),

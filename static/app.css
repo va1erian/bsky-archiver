@@ -26,6 +26,10 @@
   background: #059669;
 }
 
+.badge-tumblr-like {
+  background: #001935;
+}
+
 .badge-account {
   background: #7c3aed;
 }
@@ -86,6 +90,10 @@
 
 .status-error {
   background: #dc2626;
+}
+
+.status-disabled {
+  background: #6b7280;
 }
 
 .card-grid {
