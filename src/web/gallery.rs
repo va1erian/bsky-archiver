@@ -117,6 +117,7 @@ fn parse_gallery_category(raw: Option<&str>) -> Result<Option<Category>, WebErro
             "like" | "likes" => Category::Like,
             "bookmark" | "bookmarks" => Category::Bookmark,
             "tumblr-like" | "tumblr_likes" => Category::TumblrLike,
+            "pixiv-bookmark" | "pixiv_bookmarks" => Category::PixivBookmark,
             other => {
                 return Err(WebError::BadRequest {
                     message: format!("unknown category {other:?}"),
@@ -135,6 +136,7 @@ fn category_token(category: Category) -> &'static str {
         Category::Like => "like",
         Category::Bookmark => "bookmark",
         Category::TumblrLike => "tumblr-like",
+        Category::PixivBookmark => "pixiv-bookmark",
     }
 }
 
@@ -153,6 +155,7 @@ fn build_gallery_category_options(
         (Category::Like, "Likes"),
         (Category::Bookmark, "Bookmarks"),
         (Category::TumblrLike, "Tumblr Likes"),
+        (Category::PixivBookmark, "Pixiv Bookmarks"),
     ] {
         options.push(templates::CategoryOption {
             label,

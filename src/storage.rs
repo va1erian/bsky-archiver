@@ -14,11 +14,14 @@
 //!   bookmarks/{shard}/{id}/media/{filename}
 //!   tumblr_likes/{shard}/{id}/record.json
 //!   tumblr_likes/{shard}/{id}/media/{filename}
+//!   pixiv_bookmarks/{shard}/{id}/record.json
+//!   pixiv_bookmarks/{shard}/{id}/media/{filename}
 //! ```
 //!
 //! `{id}` is the hex-encoded SHA-256 digest of the item's dedup key — its
 //! AT URI for Bluesky items, a `tumblr:{blog}/{post-id}` key for Tumblr
-//! likes (the dedup key, whatever its shape, is simply hashed). `{shard}`
+//! likes, a `pixiv:{user-id}/{illust-id}` key for Pixiv bookmarks (the
+//! dedup key, whatever its shape, is simply hashed). `{shard}`
 //! is its first two hex characters, so a single directory never has to
 //! hold every archived item. Hashing the key
 //! (rather than using it verbatim as a path) sidesteps path-separator and
@@ -53,14 +56,19 @@ pub enum Category {
     /// rather than an AT URI; everything else (record.json envelope, media
     /// layout, index rows) works identically.
     TumblrLike,
+    /// A Pixiv illustration the configured Pixiv account bookmarked
+    /// (archived by [`crate::pixiv`]). Its item id is a
+    /// `pixiv:{user-id}/{illust-id}` key rather than an AT URI.
+    PixivBookmark,
 }
 
 impl Category {
-    const ALL: [Category; 4] = [
+    const ALL: [Category; 5] = [
         Category::Post,
         Category::Like,
         Category::Bookmark,
         Category::TumblrLike,
+        Category::PixivBookmark,
     ];
 
     fn as_dir(self) -> &'static str {
@@ -69,6 +77,7 @@ impl Category {
             Category::Like => "likes",
             Category::Bookmark => "bookmarks",
             Category::TumblrLike => "tumblr_likes",
+            Category::PixivBookmark => "pixiv_bookmarks",
         }
     }
 }
@@ -88,6 +97,7 @@ impl std::str::FromStr for Category {
             "likes" => Ok(Category::Like),
             "bookmarks" => Ok(Category::Bookmark),
             "tumblr_likes" => Ok(Category::TumblrLike),
+            "pixiv_bookmarks" => Ok(Category::PixivBookmark),
             other => Err(StorageError::InvalidCategory(other.to_string())),
         }
     }

@@ -41,6 +41,9 @@ use crate::pipeline::{
     CandidatePostReceiver, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver,
     ConnectionHealthSender, candidate_post_channel, connection_health_channel, weak_from_sender,
 };
+use crate::pixiv::{
+    DEFAULT_PIXIV_APP_BASE_URL, DEFAULT_PIXIV_OAUTH_BASE_URL, PixivBookmarksPoller, PixivClient,
+};
 use crate::poller::{FeedPoller, LikesBookmarksPoller, PollerConfig, RestFallbackPoller};
 use crate::ratelimit::RequestLimiter;
 use crate::state::{AppState, SharedAppState};
@@ -58,6 +61,17 @@ pub const DEFAULT_BLUESKY_BASE_URL: &str = "https://bsky.social";
 /// poller. Only used when Tumblr credentials are configured.
 fn tumblr_base_url() -> Url {
     Url::parse(DEFAULT_TUMBLR_BASE_URL).expect("default tumblr base url is valid")
+}
+
+/// The production Pixiv App API entryway, parsed once for the Pixiv
+/// bookmarks poller. Only used when a Pixiv refresh token is configured.
+fn pixiv_app_base_url() -> Url {
+    Url::parse(DEFAULT_PIXIV_APP_BASE_URL).expect("default pixiv app base url is valid")
+}
+
+/// The production Pixiv OAuth token endpoint, parsed once.
+fn pixiv_oauth_base_url() -> Url {
+    Url::parse(DEFAULT_PIXIV_OAUTH_BASE_URL).expect("default pixiv oauth base url is valid")
 }
 
 /// Process-wide soft cap on outbound Bluesky-related HTTP requests in
@@ -285,6 +299,31 @@ pub async fn serve(started: Started) {
         }
     };
 
+    // The Pixiv bookmarks poller only runs when a Pixiv refresh token is
+    // configured; otherwise its health entry is marked Disabled so the
+    // dashboard reports the absence honestly instead of a stuck "starting
+    // up".
+    let pixiv_bookmarks_handle = match state.config.pixiv_refresh_token.clone() {
+        Some(refresh_token) => {
+            let pixiv_client = Arc::new(
+                PixivClient::new(pixiv_app_base_url(), pixiv_oauth_base_url(), refresh_token)
+                    .with_request_limiter(Arc::clone(&request_limiter)),
+            );
+            Some(spawn_pixiv_bookmarks(
+                pixiv_client,
+                state.store.clone(),
+                candidate_tx.clone(),
+                Duration::from_secs(config.pixiv_poll_interval_seconds),
+                health_tx.clone(),
+                shutdown_rx.clone(),
+            ))
+        }
+        None => {
+            health_tx.send_modify(|s| s.pixiv_bookmarks = SubsystemHealth::disabled());
+            None
+        }
+    };
+
     let nightly_sweep_handle = spawn_nightly_sweep(
         Arc::clone(&bluesky_client),
         state.store.clone(),
@@ -368,6 +407,9 @@ pub async fn serve(started: Started) {
     );
     if let Some(tumblr_likes_handle) = tumblr_likes_handle {
         let _ = tumblr_likes_handle.await;
+    }
+    if let Some(pixiv_bookmarks_handle) = pixiv_bookmarks_handle {
+        let _ = pixiv_bookmarks_handle.await;
     }
 
     match tokio::time::timeout(Duration::from_secs(30), media_handle).await {
@@ -519,6 +561,35 @@ fn spawn_tumblr_likes(
         |snapshot, health| snapshot.tumblr_likes = health,
         move || {
             let poller = TumblrLikesPoller::new(
+                Arc::clone(&client),
+                store.clone(),
+                candidate_tx.clone(),
+                base_interval,
+            );
+            async move { poller.run().await }
+        },
+    ))
+}
+
+/// Spawns the Pixiv bookmarks poller under the same supervisor as every
+/// other background task. Only called when a Pixiv refresh token is
+/// configured.
+#[allow(clippy::too_many_arguments)]
+fn spawn_pixiv_bookmarks(
+    client: Arc<PixivClient>,
+    store: ArchiveStore,
+    candidate_tx: CandidatePostSender,
+    base_interval: Duration,
+    health_tx: HealthSender,
+    shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(supervise(
+        "pixiv_bookmarks",
+        shutdown_rx,
+        health_tx,
+        |snapshot, health| snapshot.pixiv_bookmarks = health,
+        move || {
+            let poller = PixivBookmarksPoller::new(
                 Arc::clone(&client),
                 store.clone(),
                 candidate_tx.clone(),
@@ -780,6 +851,8 @@ mod tests {
             media_max_bytes: 104_857_600,
             nightly_sweep_local_hour: 3,
             tumblr_poll_interval_seconds: 300,
+            pixiv_refresh_token: None,
+            pixiv_poll_interval_seconds: 300,
         }
     }
 

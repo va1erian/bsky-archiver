@@ -38,6 +38,11 @@ services:
       # TUMBLR_OAUTH_TOKEN: "your-oauth-token"
       # TUMBLR_OAUTH_SECRET: "your-oauth-secret"
       # TUMBLR_POLL_INTERVAL_SECONDS: "300"
+      # --- optional: Pixiv bookmarks archiver ---
+      # Get a refresh token once via the PKCE login flow (see README);
+      # access tokens are refreshed automatically.
+      # PIXIV_REFRESH_TOKEN: "your-refresh-token"
+      # PIXIV_POLL_INTERVAL_SECONDS: "300"
       RUST_LOG: "info"
     volumes:
       # Persists the archived JSON + media + SQLite index across restarts

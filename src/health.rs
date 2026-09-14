@@ -77,6 +77,7 @@ pub struct HealthSnapshot {
     pub feed_poller: SubsystemHealth,
     pub likes_bookmarks: SubsystemHealth,
     pub tumblr_likes: SubsystemHealth,
+    pub pixiv_bookmarks: SubsystemHealth,
     pub nightly_sweep: SubsystemHealth,
     pub media_downloader: SubsystemHealth,
 }
@@ -91,6 +92,7 @@ impl Default for HealthSnapshot {
             feed_poller: starting.clone(),
             likes_bookmarks: starting.clone(),
             tumblr_likes: starting.clone(),
+            pixiv_bookmarks: starting.clone(),
             nightly_sweep: starting.clone(),
             media_downloader: starting,
         }
@@ -123,6 +125,7 @@ mod tests {
         assert_eq!(snapshot.feed_poller.status, Status::Degraded);
         assert_eq!(snapshot.likes_bookmarks.status, Status::Degraded);
         assert_eq!(snapshot.tumblr_likes.status, Status::Degraded);
+        assert_eq!(snapshot.pixiv_bookmarks.status, Status::Degraded);
         assert_eq!(snapshot.nightly_sweep.status, Status::Degraded);
         assert_eq!(snapshot.media_downloader.status, Status::Degraded);
     }

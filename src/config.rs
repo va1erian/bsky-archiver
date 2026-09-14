@@ -17,6 +17,8 @@ const ALL_VARS: &[&str] = &[
     "TUMBLR_OAUTH_TOKEN",
     "TUMBLR_OAUTH_SECRET",
     "TUMBLR_POLL_INTERVAL_SECONDS",
+    "PIXIV_REFRESH_TOKEN",
+    "PIXIV_POLL_INTERVAL_SECONDS",
     "ARCHIVE_DIR",
     "DATABASE_PATH",
     "UI_PASSWORD",
@@ -38,6 +40,7 @@ mod defaults {
     pub const MEDIA_MAX_BYTES: u64 = 104_857_600;
     pub const NIGHTLY_SWEEP_LOCAL_HOUR: u32 = 3;
     pub const TUMBLR_POLL_INTERVAL_SECONDS: u64 = 300;
+    pub const PIXIV_POLL_INTERVAL_SECONDS: u64 = 300;
 }
 
 /// A secret string value (app password, UI password, session signing key).
@@ -169,6 +172,16 @@ pub struct AppConfig {
     /// rate-limits its API to 1000 requests/hour and 5000/day, and the
     /// Tumblr poll has no firehose to share the load with.
     pub tumblr_poll_interval_seconds: u64,
+    /// Pixiv App API refresh token, when the optional Pixiv bookmarks
+    /// archiver is enabled. `None` (the default) disables Pixiv archiving.
+    /// Refresh tokens are long-lived; access tokens are refreshed
+    /// automatically from it.
+    pub pixiv_refresh_token: Option<Secret>,
+    /// Baseline interval for the Pixiv bookmarks poller. Deliberately
+    /// separate from (and slower than) [`Self::poll_interval_seconds`]: the
+    /// unofficial App API has no documented rate limit but tolerates only
+    /// ~1 request/second.
+    pub pixiv_poll_interval_seconds: u64,
 }
 
 impl AppConfig {
@@ -241,6 +254,12 @@ impl AppConfig {
             None => defaults::TUMBLR_POLL_INTERVAL_SECONDS,
         };
 
+        let pixiv_refresh_token = optional_var("PIXIV_REFRESH_TOKEN").map(Secret::from);
+        let pixiv_poll_interval_seconds = match optional_var("PIXIV_POLL_INTERVAL_SECONDS") {
+            Some(raw) => parse_positive_u64("PIXIV_POLL_INTERVAL_SECONDS", &raw)?,
+            None => defaults::PIXIV_POLL_INTERVAL_SECONDS,
+        };
+
         Ok(AppConfig {
             bsky_identifier,
             bsky_app_password,
@@ -256,6 +275,8 @@ impl AppConfig {
             media_max_bytes,
             nightly_sweep_local_hour,
             tumblr_poll_interval_seconds,
+            pixiv_refresh_token,
+            pixiv_poll_interval_seconds,
         })
     }
 }
@@ -460,6 +481,14 @@ mod tests {
             config.tumblr_poll_interval_seconds,
             defaults::TUMBLR_POLL_INTERVAL_SECONDS
         );
+        assert!(
+            config.pixiv_refresh_token.is_none(),
+            "no PIXIV_REFRESH_TOKEN means disabled"
+        );
+        assert_eq!(
+            config.pixiv_poll_interval_seconds,
+            defaults::PIXIV_POLL_INTERVAL_SECONDS
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -627,6 +656,48 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_pixiv_poll_interval_produces_specific_error() {
+        let dir = temp_dir("invalid-pixiv-poll-interval");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("PIXIV_POLL_INTERVAL_SECONDS", "0"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::build().expect_err("zero pixiv poll interval should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => {
+                assert_eq!(var, "PIXIV_POLL_INTERVAL_SECONDS")
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pixiv_refresh_token_enables_pixiv_config() {
+        let dir = temp_dir("pixiv-enabled");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("PIXIV_REFRESH_TOKEN", "refresh-token-secret"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let config = AppConfig::build().expect("config should load");
+        assert_eq!(
+            config
+                .pixiv_refresh_token
+                .as_ref()
+                .expect("pixiv should be enabled")
+                .expose_secret(),
+            "refresh-token-secret"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
