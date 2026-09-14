@@ -514,6 +514,142 @@ impl BlueskyClient {
             .await
     }
 
+    /// Creates a like record (`app.bsky.feed.like`) on the authenticated
+    /// account's repo, referencing `post_ref`. Like records are ordinary
+    /// repo data (`com.atproto.repo.createRecord`), not an AppView call;
+    /// the caller owns deduplication via the buttons' done state.
+    pub async fn like_post(&self, post_ref: &StrongRef) -> Result<(), BlueskyError> {
+        let record = serde_json::json!({
+            "subject": { "uri": post_ref.uri, "cid": post_ref.cid },
+            "createdAt": self.now_iso8601()?,
+        });
+        self.create_record("app.bsky.feed.like", &record).await?;
+        Ok(())
+    }
+
+    /// Creates the private bookmark (`app.bsky.bookmark.createBookmark`,
+    /// an AppView procedure rather than a repo record) for `post_ref`.
+    /// Per the lexicon the endpoint is idempotent: bookmarking an already
+    /// bookmarked post succeeds without creating a duplicate.
+    pub async fn bookmark_post(&self, post_ref: &StrongRef) -> Result<(), BlueskyError> {
+        self.post_authenticated(
+            "app.bsky.bookmark.createBookmark",
+            Some(&serde_json::json!({
+                "uri": post_ref.uri,
+                "cid": post_ref.cid,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `com.atproto.repo.createRecord` against the authenticated account's
+    /// own repo. The record key is left server-assigned; the response
+    /// carries the created record's URI.
+    async fn create_record(
+        &self,
+        collection: &str,
+        record: &serde_json::Value,
+    ) -> Result<serde_json::Value, BlueskyError> {
+        let did = self.own_did().await?;
+        let body = serde_json::json!({
+            "repo": did,
+            "collection": collection,
+            "record": record,
+        });
+        self.post_authenticated("com.atproto.repo.createRecord", Some(&body))
+            .await
+    }
+
+    /// The authenticated account's DID, logging in first when there is no
+    /// session yet (writes need the repo DID in the request body, which
+    /// `access_token` alone doesn't surface).
+    async fn own_did(&self) -> Result<String, BlueskyError> {
+        self.access_token().await?;
+        self.session
+            .read()
+            .await
+            .as_ref()
+            .map(|session| session.did.clone())
+            .ok_or_else(|| BlueskyError::Auth("session vanished".to_string()))
+    }
+
+    /// Authenticated POST to an XRPC procedure, retrying once with a fresh
+    /// session on the same expired-token statuses the GET path retries on.
+    /// `body` is sent as JSON; `None` sends an empty body.
+    async fn post_authenticated(
+        &self,
+        method: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, BlueskyError> {
+        let url = self.xrpc_url(method);
+        let mut access_token = self.access_token().await?;
+        let mut response = Some(self.send_post(&url, &access_token, body).await?);
+
+        // Same expired-token convention the GET path retries on: the
+        // first body-reading status signals a possible stale session, and
+        // a 401 means re-authenticate and try the same POST once more.
+        let first_status = response.as_ref().expect("just sent").status();
+        if reads_body_before_error(first_status)
+            && first_status == reqwest::StatusCode::UNAUTHORIZED
+        {
+            let sent = response.take().expect("response present");
+            // Drain the body so the connection is reusable before the
+            // re-auth request is issued.
+            let _ = sent.text().await;
+            tracing::info!(%method, "bluesky access token expired; re-authenticating");
+            access_token = self.login().await?;
+            response = Some(self.send_post(&url, &access_token, body).await?);
+        }
+
+        let response = response.expect("response present unless consumed above");
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(BlueskyError::Api {
+                status: status.as_u16(),
+                body: body_text,
+                retry_after: None,
+            });
+        }
+        if body_text.is_empty() {
+            Ok(serde_json::Value::Null)
+        } else {
+            serde_json::from_str(&body_text).map_err(|err| {
+                BlueskyError::Auth(format!("malformed response from {method}: {err}"))
+            })
+        }
+    }
+
+    /// Sends one authenticated POST attempt with a JSON body.
+    async fn send_post(
+        &self,
+        url: &url::Url,
+        access_token: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response, BlueskyError> {
+        let _permit = self.throttle().await;
+        let mut request = self
+            .http
+            .post(url.clone())
+            .bearer_auth(access_token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        request = match body {
+            Some(value) => request.json(value),
+            None => request,
+        };
+        Ok(request.send().await?)
+    }
+
+    /// Current UTC time as the ISO-8601 profile the lexicons expect, for
+    /// record `createdAt` stamps.
+    fn now_iso8601(&self) -> Result<String, BlueskyError> {
+        use time::format_description::well_known::Rfc3339;
+        let now = time::OffsetDateTime::now_utc();
+        now.format(&Rfc3339)
+            .map_err(|err| BlueskyError::Auth(format!("failed to format createdAt: {err}")))
+    }
+
     /// Hydrates a batch of posts by URI (`app.bsky.feed.getPosts`). The
     /// endpoint accepts at most 25 `uris` per call; callers must chunk.
     /// Posts that fail to resolve come back in `not_found_posts`/

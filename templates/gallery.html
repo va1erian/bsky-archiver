@@ -49,6 +49,9 @@
   // scrolls to the top too, so this only ever duplicates that. Back/forward
   // history restores swap <main>, not #gallery-grid, and keep their scroll.
   document.body.addEventListener("htmx:after:swap", function (event) {
+    // The fill top-up re-renders the grid without moving pages; don't
+    // yank the viewport (e.g. on a resize-triggered alignment top-up).
+    if (window.__fillSkipScroll) return;
     var ctx = (event.detail || {}).ctx || {};
     var target = ctx.target;
     if (typeof target === "string") target = document.querySelector(target);

@@ -76,6 +76,8 @@ pub fn router(app: SharedAppState) -> Router {
             "/browser/saved/:id",
             axum::routing::post(browser::remove_saved_account),
         )
+        .route("/browser/like", axum::routing::post(browser::like_post))
+        .route("/browser/bookmark", axum::routing::post(browser::bookmark_post))
         .route("/gallery/account", get(browser::gallery_account_redirect))
         .route("/config", get(config::config_view))
         .route("/media/:category/:id/:filename", get(media::media_file))

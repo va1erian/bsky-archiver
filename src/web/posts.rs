@@ -152,9 +152,9 @@ pub(super) async fn post_detail(
         author: templates::author_did_from_at_uri(&at_uri).to_string(),
         bluesky_url: templates::bluesky_post_url(&at_uri),
         text,
-        indexed_at: record.indexed_at.clone(),
-        action_at: record.action_at.clone(),
-        deleted_at: record.deleted_at.clone(),
+        indexed_at: templates::display_time(&record.indexed_at),
+        action_at: record.action_at.as_deref().map(templates::display_time),
+        deleted_at: record.deleted_at.as_deref().map(templates::display_time),
         media,
         raw_json,
     };
