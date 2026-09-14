@@ -184,6 +184,139 @@ fn embed_has_media(embed: &serde_json::Value) -> bool {
     }
 }
 
+/// How many media files (images/videos) a raw post record declares across
+/// its recognized embed shapes. Used to detect archived posts whose media
+/// downloads didn't all make it to disk (see the nightly sweeper's
+/// missing-media heal).
+pub fn count_record_media(record: &serde_json::Value) -> usize {
+    record.get("embed").map(count_embed_media).unwrap_or(0)
+}
+
+fn count_embed_media(embed: &serde_json::Value) -> usize {
+    let Some(embed_type) = embed.get("$type").and_then(|v| v.as_str()) else {
+        return 0;
+    };
+
+    let count_array = |key: &str| -> usize {
+        embed
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| items.len())
+            .unwrap_or(0)
+    };
+
+    match embed_type {
+        "app.bsky.embed.images" | "app.bsky.embed.images#view" => count_array("images"),
+        "app.bsky.embed.video" | "app.bsky.embed.video#view" => 1,
+        "app.bsky.embed.gallery" | "app.bsky.embed.gallery#view" => count_array("items"),
+        "app.bsky.embed.recordWithMedia" | "app.bsky.embed.recordWithMedia#view" => {
+            embed.get("media").map(count_embed_media).unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+/// Extracts [`MediaRef`]s from a *raw* post record's `embed` (blob
+/// references, as stored in record.json and delivered by the firehose),
+/// building the CDN URLs each blob is fetchable at. Mirrors
+/// [`has_archivable_media`]'s recognized shapes, recursing into
+/// `recordWithMedia`'s nested `media`.
+pub fn extract_media_from_record(record: &serde_json::Value, author_did: &str) -> Vec<MediaRef> {
+    record
+        .get("embed")
+        .map(|embed| media_from_embed(embed, author_did))
+        .unwrap_or_default()
+}
+
+fn media_from_embed(embed: &serde_json::Value, author_did: &str) -> Vec<MediaRef> {
+    let Some(embed_type) = embed.get("$type").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+
+    match embed_type {
+        "app.bsky.embed.images" => embed
+            .get("images")
+            .and_then(|v| v.as_array())
+            .map(|images| {
+                images
+                    .iter()
+                    .filter_map(|image| image.get("image"))
+                    .filter_map(|blob| image_media_ref(blob, author_did))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "app.bsky.embed.video" => embed
+            .get("video")
+            .and_then(|blob| video_media_ref(blob, author_did))
+            .into_iter()
+            .collect(),
+        "app.bsky.embed.gallery" => embed
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("image"))
+                    .filter_map(|blob| image_media_ref(blob, author_did))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "app.bsky.embed.recordWithMedia" => embed
+            .get("media")
+            .map(|media| media_from_embed(media, author_did))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn blob_cid(blob: &serde_json::Value) -> Option<String> {
+    blob.get("ref")
+        .and_then(|r| r.get("$link"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn image_media_ref(blob: &serde_json::Value, author_did: &str) -> Option<MediaRef> {
+    let cid = blob_cid(blob)?;
+    let mime = blob
+        .get("mimeType")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let size = blob.get("size").and_then(|v| v.as_u64());
+    let ext = mime
+        .as_deref()
+        .and_then(image_extension_for_mime)
+        .unwrap_or("jpeg");
+    Some(MediaRef {
+        cdn_url: format!("https://cdn.bsky.app/img/feed_fullsize/plain/{author_did}/{cid}@{ext}"),
+        declared_mime_type: mime,
+        declared_size_bytes: size,
+    })
+}
+
+fn video_media_ref(blob: &serde_json::Value, author_did: &str) -> Option<MediaRef> {
+    let cid = blob_cid(blob)?;
+    let mime = blob
+        .get("mimeType")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let size = blob.get("size").and_then(|v| v.as_u64());
+    Some(MediaRef {
+        cdn_url: format!("https://video.bsky.app/watch/{author_did}/{cid}/playlist.m3u8"),
+        declared_mime_type: mime,
+        declared_size_bytes: size,
+    })
+}
+
+fn image_extension_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/jpeg" => Some("jpeg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +465,124 @@ mod tests {
     fn unknown_embed_type_returns_false_not_panic() {
         let record = json!({"embed": {"$type": "app.bsky.embed.somethingNew"}});
         assert!(!has_archivable_media(&record));
+    }
+
+    #[test]
+    fn count_record_media_counts_every_recognized_shape() {
+        assert_eq!(count_record_media(&json!({"text": "no embed"})), 0);
+        assert_eq!(
+            count_record_media(&json!({
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{}, {}, {}],
+                }
+            })),
+            3
+        );
+        assert_eq!(
+            count_record_media(&json!({
+                "embed": {
+                    "$type": "app.bsky.embed.video",
+                    "video": {"ref": {"$link": "bafy"}},
+                }
+            })),
+            1
+        );
+        assert_eq!(
+            count_record_media(&json!({
+                "embed": {
+                    "$type": "app.bsky.embed.gallery",
+                    "items": [{}, {}],
+                }
+            })),
+            2
+        );
+        assert_eq!(
+            count_record_media(&json!({
+                "embed": {
+                    "$type": "app.bsky.embed.recordWithMedia",
+                    "record": {"record": {}},
+                    "media": {
+                        "$type": "app.bsky.embed.images",
+                        "images": [{}, {}],
+                    },
+                }
+            })),
+            2
+        );
+        // Malformed/unknown shapes count as zero, never panic.
+        assert_eq!(count_record_media(&json!({"embed": "junk"})), 0);
+        assert_eq!(
+            count_record_media(&json!({"embed": {"$type": "app.bsky.embed.external"}})),
+            0
+        );
+    }
+
+    #[test]
+    fn extract_media_from_record_builds_cdn_urls_from_blob_refs() {
+        let record = json!({
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [
+                    {"image": {"ref": {"$link": "bafyimg1"}, "mimeType": "image/jpeg", "size": 10}},
+                    {"image": {"ref": {"$link": "bafyimg2"}, "mimeType": "image/png", "size": 20}},
+                ],
+            }
+        });
+        let refs = extract_media_from_record(&record, "did:plc:alice");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(
+            refs[0].cdn_url,
+            "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:alice/bafyimg1@jpeg"
+        );
+        assert_eq!(refs[0].declared_mime_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(
+            refs[1].cdn_url,
+            "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:alice/bafyimg2@png"
+        );
+    }
+
+    #[test]
+    fn extract_media_from_record_handles_video_gallery_and_record_with_media() {
+        let video = json!({
+            "embed": {
+                "$type": "app.bsky.embed.video",
+                "video": {"ref": {"$link": "bafyvid"}, "mimeType": "video/mp4"},
+            }
+        });
+        let refs = extract_media_from_record(&video, "did:plc:alice");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].cdn_url,
+            "https://video.bsky.app/watch/did:plc:alice/bafyvid/playlist.m3u8"
+        );
+
+        let gallery = json!({
+            "embed": {
+                "$type": "app.bsky.embed.gallery",
+                "items": [{"image": {"ref": {"$link": "bafyg"}}}],
+            }
+        });
+        assert_eq!(extract_media_from_record(&gallery, "did:plc:x").len(), 1);
+
+        let quoted = json!({
+            "embed": {
+                "$type": "app.bsky.embed.recordWithMedia",
+                "record": {"record": {}},
+                "media": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{"image": {"ref": {"$link": "bafyq"}}}],
+                },
+            }
+        });
+        assert_eq!(extract_media_from_record(&quoted, "did:plc:x").len(), 1);
+
+        // No embed, or an unrecognized one: empty, never a panic.
+        assert!(extract_media_from_record(&json!({}), "did:plc:x").is_empty());
+        assert!(
+            extract_media_from_record(&json!({"embed": {"$type": "app.bsky.embed.external"}}), "d")
+                .is_empty()
+        );
     }
 
     #[test]

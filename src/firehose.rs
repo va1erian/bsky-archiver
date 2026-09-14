@@ -31,8 +31,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use url::Url;
 
 use crate::pipeline::{
-    CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthSender, MediaRef,
-    PostCategory, has_archivable_media,
+    CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthSender, PostCategory,
+    extract_media_from_record, has_archivable_media,
 };
 use crate::storage::{ArchiveStore, SourceKind, WatchedSource};
 
@@ -416,7 +416,7 @@ impl FirehoseConsumer {
         };
 
         if has_archivable_media(&record) {
-            let media = extract_media(&record, &event.did);
+            let media = extract_media_from_record(&record, &event.did);
             let candidate = CandidatePost {
                 at_uri: format!("at://{}/{}/{}", event.did, commit.collection, commit.rkey),
                 cid: commit.cid.unwrap_or_default(),
@@ -434,105 +434,6 @@ impl FirehoseConsumer {
         if let Err(err) = self.cursor_store.save(event.time_us) {
             tracing::warn!(error = %err, "failed to persist jetstream cursor");
         }
-    }
-}
-
-/// Extracts [`MediaRef`]s from a post record's `embed`, mirroring
-/// [`has_archivable_media`]'s recognized shapes (direct image/video/gallery
-/// embeds, and media nested in `recordWithMedia`).
-fn extract_media(record: &Value, author_did: &str) -> Vec<MediaRef> {
-    record
-        .get("embed")
-        .map(|embed| media_from_embed(embed, author_did))
-        .unwrap_or_default()
-}
-
-fn media_from_embed(embed: &Value, author_did: &str) -> Vec<MediaRef> {
-    let Some(embed_type) = embed.get("$type").and_then(|v| v.as_str()) else {
-        return Vec::new();
-    };
-
-    match embed_type {
-        "app.bsky.embed.images" => embed
-            .get("images")
-            .and_then(|v| v.as_array())
-            .map(|images| {
-                images
-                    .iter()
-                    .filter_map(|image| image.get("image"))
-                    .filter_map(|blob| image_media_ref(blob, author_did))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        "app.bsky.embed.video" => embed
-            .get("video")
-            .and_then(|blob| video_media_ref(blob, author_did))
-            .into_iter()
-            .collect(),
-        "app.bsky.embed.gallery" => embed
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("image"))
-                    .filter_map(|blob| image_media_ref(blob, author_did))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        "app.bsky.embed.recordWithMedia" => embed
-            .get("media")
-            .map(|media| media_from_embed(media, author_did))
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn blob_cid(blob: &Value) -> Option<String> {
-    blob.get("ref")
-        .and_then(|r| r.get("$link"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-}
-
-fn image_media_ref(blob: &Value, author_did: &str) -> Option<MediaRef> {
-    let cid = blob_cid(blob)?;
-    let mime = blob
-        .get("mimeType")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let size = blob.get("size").and_then(|v| v.as_u64());
-    let ext = mime
-        .as_deref()
-        .and_then(image_extension_for_mime)
-        .unwrap_or("jpeg");
-    Some(MediaRef {
-        cdn_url: format!("https://cdn.bsky.app/img/feed_fullsize/plain/{author_did}/{cid}@{ext}"),
-        declared_mime_type: mime,
-        declared_size_bytes: size,
-    })
-}
-
-fn video_media_ref(blob: &Value, author_did: &str) -> Option<MediaRef> {
-    let cid = blob_cid(blob)?;
-    let mime = blob
-        .get("mimeType")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let size = blob.get("size").and_then(|v| v.as_u64());
-    Some(MediaRef {
-        cdn_url: format!("https://video.bsky.app/watch/{author_did}/{cid}/playlist.m3u8"),
-        declared_mime_type: mime,
-        declared_size_bytes: size,
-    })
-}
-
-fn image_extension_for_mime(mime: &str) -> Option<&'static str> {
-    match mime {
-        "image/jpeg" => Some("jpeg"),
-        "image/png" => Some("png"),
-        "image/webp" => Some("webp"),
-        _ => None,
     }
 }
 

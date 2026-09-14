@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Account gallery – bsky-archiver{% endblock %}
+{% block content %}
+<h1>Account gallery</h1>
+<p>Browse the pictures an account posted on Bluesky, live — archived or not.</p>
+<form method="get" action="/gallery/account" class="account-viewer-form">
+<label for="account-actor">Bluesky handle</label>
+<input type="text" id="account-actor" name="actor" value="{{ actor }}" placeholder="alice.bsky.social" autocomplete="off" {% if actor.is_empty() %}required{% endif %}>
+<label class="account-viewer-reposts">
+<input type="checkbox" name="skip_reposts" value="on" {% if skip_reposts %}checked{% endif %}>
+Skip images from reposts
+</label>
+<button type="submit">Browse</button>
+</form>
+{% if let Some(error) = error %}
+<p class="account-viewer-error" role="alert">{{ error }}</p>
+{% endif %}
+{% if !actor.is_empty() %}
+<h2>Pictures posted by {{ actor }}</h2>
+{% include "account_gallery_grid.html" %}
+{% endif %}
+
+<script>
+(function () {
+  // Same contract as the archive gallery: an "older posts" click swaps the
+  // grid in place, so scroll back to the top of the new page.
+  document.body.addEventListener("htmx:after:swap", function (event) {
+    var ctx = (event.detail || {}).ctx || {};
+    var target = ctx.target;
+    if (typeof target === "string") target = document.querySelector(target);
+    if (target && target.id === "account-gallery-grid") window.scrollTo(0, 0);
+  });
+})();
+</script>
+
+{% endblock %}

@@ -651,6 +651,23 @@ enum DrainOutcome {
     Continue(usize),
 }
 
+/// The `reason` type `getAuthorFeed`/`getFeed` attach to a feed item that
+/// is a repost: the wrapped `post` belongs to the *original* author, not
+/// the watched account.
+const REASON_REPOST_TYPE: &str = "app.bsky.feed.defs#reasonRepost";
+
+/// Whether a feed item (a `feedViewPost` from `getAuthorFeed`/`getFeed`)
+/// is a repost. Reposts are never archived as authored posts: the account
+/// didn't author the wrapped post, and treating one as the dedup boundary
+/// would stop a walk early (a repost of a long-archived post sits at the
+/// very top of the feed).
+pub(crate) fn is_repost_item(item: &serde_json::Value) -> bool {
+    item.get("reason")
+        .and_then(|reason| reason.get("$type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t == REASON_REPOST_TYPE)
+}
+
 /// Drains one page of `feed` items (as returned by `getAuthorFeed`/
 /// `getFeed`), sending archive-worthy posts to `sender` and deferring to the
 /// caller once the first already-archived post (the dedup boundary) is
@@ -662,6 +679,10 @@ async fn drain_feed_items(
     mut new_count: usize,
 ) -> Result<DrainOutcome, PollHandleError> {
     for item in feed {
+        if is_repost_item(item) {
+            debug!("poller skipping repost (not an authored post)");
+            continue;
+        }
         let Some(post) = item.get("post") else {
             continue;
         };

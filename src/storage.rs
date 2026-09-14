@@ -229,6 +229,18 @@ pub struct PostSummary {
     pub deleted_at: Option<String>,
 }
 
+/// An authored post whose on-disk record declares more media than the
+/// index holds: at least one download failed or was interrupted, so the
+/// archive is missing pictures the post actually has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingMediaPost {
+    pub at_uri: String,
+    pub cid: String,
+    /// The post's raw record, carrying the blob references the media
+    /// downloader re-queues from.
+    pub record: serde_json::Value,
+}
+
 /// How rows are ordered for the gallery view. The media index stores the
 /// archive time (`indexed_at`); the record's own `createdAt` is mirrored
 /// into the posts table (`record_created_at`) so the original post/edit
@@ -1482,6 +1494,64 @@ impl ArchiveStore {
             Ok(uris)
         })
         .await;
+        join_result(result)
+    }
+
+    /// Lists every authored post ([`Category::Post`], not deleted) whose
+    /// stored media count is lower than the count its record declares.
+    /// Reads each candidate's `record.json` from disk (the index doesn't
+    /// store embeds), so this is a filesystem scan — meant for the nightly
+    /// sweeper's self-heal pass, not per-request paths.
+    pub async fn list_posts_with_missing_media(
+        &self,
+    ) -> Result<Vec<MissingMediaPost>, StorageError> {
+        let archive_dir = self.archive_dir.clone();
+        let db = Arc::clone(&self.db);
+
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<MissingMediaPost>, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(
+                    "SELECT p.at_uri, p.cid, p.record_path,
+                            (SELECT COUNT(*) FROM media m
+                             WHERE m.category = p.category AND m.post_at_uri = p.at_uri)
+                     FROM posts p
+                     WHERE p.category = 'posts' AND p.deleted_at IS NULL",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)? as usize,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(stmt);
+
+                let mut missing = Vec::new();
+                for (at_uri, cid, record_path, stored) in rows {
+                    // Best effort: an unreadable/corrupt record just can't be
+                    // assessed here (the sweeper logs nothing for it).
+                    let Ok(bytes) = std::fs::read(archive_dir.join(&record_path)) else {
+                        continue;
+                    };
+                    let Ok(archived) = serde_json::from_slice::<ArchivedRecord>(&bytes) else {
+                        continue;
+                    };
+                    let declared = crate::pipeline::count_record_media(&archived.record);
+                    if declared > stored {
+                        missing.push(MissingMediaPost {
+                            at_uri,
+                            cid,
+                            record: archived.record,
+                        });
+                    }
+                }
+                Ok(missing)
+            })
+            .await;
         join_result(result)
     }
 
