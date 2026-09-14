@@ -117,6 +117,7 @@ pub fn category_label(category: Category) -> &'static str {
         Category::Like => "Like",
         Category::Bookmark => "Bookmark",
         Category::TumblrLike => "Tumblr Like",
+        Category::TelegramChannel => "Telegram",
     }
 }
 
@@ -126,6 +127,7 @@ pub fn category_badge_class(category: Category) -> &'static str {
         Category::Like => "badge-like",
         Category::Bookmark => "badge-bookmark",
         Category::TumblrLike => "badge-tumblr-like",
+        Category::TelegramChannel => "badge-telegram",
     }
 }
 
@@ -232,6 +234,7 @@ pub struct DashboardTemplate {
     pub likes_count: u64,
     pub bookmarks_count: u64,
     pub tumblr_likes_count: u64,
+    pub telegram_channels_count: u64,
     pub health: Vec<SubsystemRow>,
     pub recent: Vec<PostRow>,
 }

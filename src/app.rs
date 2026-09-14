@@ -46,6 +46,7 @@ use crate::ratelimit::RequestLimiter;
 use crate::state::{AppState, SharedAppState};
 use crate::storage::{ArchiveStore, SourceKind, StorageError};
 use crate::sweep::NightlySweeper;
+use crate::telegram::TelegramError;
 use crate::tumblr::{DEFAULT_TUMBLR_BASE_URL, TumblrClient, TumblrLikesPoller};
 use crate::watchlist::Watchlist;
 
@@ -101,6 +102,48 @@ pub async fn run() -> Result<(), StartupError> {
     let started = init(config, base_url).await?;
     serve(started).await;
     Ok(())
+}
+
+/// The `telegram-login` subcommand: loads the Telegram config from the
+/// environment and performs the one-time interactive account login,
+/// persisting the session at `<ARCHIVE_DIR>/telegram.session` for the
+/// service to reuse. Fails with non-zero exit (via [`main`][crate::main])
+/// when Telegram is not configured or the login fails; a clean run exits
+/// successfully.
+pub async fn run_telegram_login() -> Result<(), crate::telegram::TelegramError> {
+    // Unlike the service, logging in requires only the Telegram
+    // credentials: an install may legitimately exist just to archive a
+    // Telegram channel, with no Bluesky account in play at all. `.env`
+    // loading matches `AppConfig::from_env`'s developer convenience.
+    match dotenvy::dotenv() {
+        Ok(_) | Err(dotenvy::Error::Io(_)) => {}
+        Err(err) => tracing::warn!(error = %err, ".env file present but failed to load"),
+    }
+    let Some(telegram) = crate::config::TelegramConfig::from_env().map_err(login_config_error)?
+    else {
+        tracing::error!(
+            "telegram-login requires TELEGRAM_API_ID, TELEGRAM_API_HASH, and \
+             TELEGRAM_CHANNELS to be set (see the README's Telegram section)"
+        );
+        return Err(crate::telegram::TelegramError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Telegram is not configured (set TELEGRAM_API_ID, TELEGRAM_API_HASH, \
+             TELEGRAM_CHANNELS)",
+        )));
+    };
+
+    let archive_dir = std::env::var("ARCHIVE_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(crate::config::defaults_archive_dir()));
+    let session_path = telegram_session_path(&archive_dir);
+    crate::telegram::interactive_login(&session_path, &telegram).await
+}
+
+fn login_config_error(err: crate::config::ConfigError) -> crate::telegram::TelegramError {
+    eprintln!("{err}");
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()).into()
 }
 
 /// The startup sequence: open storage (self-healing the SQLite index if
@@ -285,6 +328,32 @@ pub async fn serve(started: Started) {
         }
     };
 
+    // The Telegram archiver only runs when Telegram credentials are
+    // configured; otherwise its health entry is marked Disabled so the
+    // dashboard reports the absence honestly instead of a stuck "starting
+    // up". Runs in its own retry loop (see `run_telegram_supervised`) so a
+    // missing/unauthorized session reports `Error` with actionable detail
+    // instead of being restarted forever.
+    let telegram_config = state.config.telegram.clone();
+    let telegram_handle = match telegram_config {
+        Some(telegram_config) => {
+            let session_path = telegram_session_path(&config.archive_dir);
+            Some(spawn_telegram(
+                session_path,
+                telegram_config,
+                state.store.clone(),
+                config.media_max_bytes,
+                config.media_max_concurrent_downloads,
+                health_tx.clone(),
+                shutdown_rx.clone(),
+            ))
+        }
+        None => {
+            health_tx.send_modify(|s| s.telegram_archiver = SubsystemHealth::disabled());
+            None
+        }
+    };
+
     let nightly_sweep_handle = spawn_nightly_sweep(
         Arc::clone(&bluesky_client),
         state.store.clone(),
@@ -368,6 +437,9 @@ pub async fn serve(started: Started) {
     );
     if let Some(tumblr_likes_handle) = tumblr_likes_handle {
         let _ = tumblr_likes_handle.await;
+    }
+    if let Some(telegram_handle) = telegram_handle {
+        let _ = telegram_handle.await;
     }
 
     match tokio::time::timeout(Duration::from_secs(30), media_handle).await {
@@ -527,6 +599,131 @@ fn spawn_tumblr_likes(
             async move { poller.run().await }
         },
     ))
+}
+
+/// The Telegram session file lives inside the archive (durable state that
+/// already mounts properly in every deployment), next to the SQLite index.
+pub fn telegram_session_path(archive_dir: &std::path::Path) -> std::path::PathBuf {
+    archive_dir.join("telegram.session")
+}
+
+/// Spawns the Telegram channel-media archiver under supervision. Backed by
+/// a user account session (see [`crate::telegram`]), whose absence is not
+/// retryable from within the process: if the session file is missing or
+/// unauthorized, the health entry becomes `Error` with the exact fix and
+/// the task ends until next restart.
+#[allow(clippy::too_many_arguments)]
+fn spawn_telegram(
+    session_path: PathBuf,
+    config: crate::config::TelegramConfig,
+    store: ArchiveStore,
+    max_bytes: u64,
+    download_concurrency: usize,
+    health_tx: HealthSender,
+    shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_telegram_supervised(
+        session_path,
+        config,
+        store,
+        max_bytes,
+        download_concurrency,
+        health_tx,
+        shutdown_rx,
+    ))
+}
+
+/// Drives the Telegram archiver through reconnect attempts: connect +
+/// resolve channels on every attempt (the session's peer cache may update
+/// in between), a permanent health error when the session cannot be used,
+/// and exponential restart backoff otherwise.
+async fn run_telegram_supervised(
+    session_path: PathBuf,
+    config: crate::config::TelegramConfig,
+    store: ArchiveStore,
+    max_bytes: u64,
+    download_concurrency: usize,
+    health_tx: HealthSender,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
+        health_tx.send_modify(|s| s.telegram_archiver = SubsystemHealth::connected());
+        let outcome = AssertUnwindSafe(crate::telegram::run_archiver(
+            &session_path,
+            &config,
+            &store,
+            max_bytes,
+            download_concurrency,
+        ))
+        .catch_unwind()
+        .await;
+
+        match outcome {
+            Ok(Ok(())) => {
+                // Cannot happen from `run_archiver`'s loops, but treat a
+                // clean end like any other unexpected exit.
+                health_tx.send_modify(|s| {
+                    s.telegram_archiver =
+                        SubsystemHealth::degraded("exited unexpectedly; restarting")
+                });
+            }
+            Ok(Err(TelegramError::Session(_) | TelegramError::AuthCheck(_))) => {
+                health_tx.send_modify(|s| {
+                    s.telegram_archiver = SubsystemHealth::error(
+                        "telegram session missing or unauthorized; run \
+                         `bsky-archiver telegram-login` once",
+                    )
+                });
+                return;
+            }
+            Ok(Err(TelegramError::UnresolvableChannel(name))) => {
+                health_tx.send_modify(|s| {
+                    s.telegram_archiver = SubsystemHealth::error(format!(
+                        "channel {name:?} could not be resolved (not public, or not \
+                         visible to the account); fix TELEGRAM_CHANNELS and restart"
+                    ))
+                });
+                return;
+            }
+            Ok(Err(err)) => {
+                tracing::error!(
+                    subsystem = "telegram_archiver",
+                    error = %err,
+                    "telegram archiver failed; restarting"
+                );
+                health_tx.send_modify(|s| {
+                    s.telegram_archiver =
+                        SubsystemHealth::degraded(format!("restarting after failure: {err}"))
+                });
+            }
+            Err(_panic) => {
+                tracing::error!(subsystem = "telegram_archiver", "task panicked; restarting");
+                health_tx.send_modify(|s| {
+                    s.telegram_archiver = SubsystemHealth::degraded("restarting after panic")
+                });
+            }
+        }
+
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
+        attempt = attempt.saturating_add(1);
+        let delay = restart_backoff(attempt);
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Spawns the nightly likes/bookmarks deletion sweeper under the same
@@ -769,6 +966,7 @@ mod tests {
             bsky_identifier: "alice.bsky.social".to_string(),
             bsky_app_password: Secret::from("app-password".to_string()),
             tumblr: None,
+            telegram: None,
             archive_dir,
             database_path,
             ui_password: Secret::from("ui-password".to_string()),

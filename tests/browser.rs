@@ -161,6 +161,7 @@ async fn spawn_server(
         bsky_identifier: "browser-e2e.bsky.social".to_string(),
         bsky_app_password: Secret::from("browser-e2e-app-password".to_string()),
         tumblr: None,
+        telegram: None,
         archive_dir,
         database_path,
         ui_password: Secret::from("e2e-ui-password".to_string()),

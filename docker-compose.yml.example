@@ -38,6 +38,18 @@ services:
       # TUMBLR_OAUTH_TOKEN: "your-oauth-token"
       # TUMBLR_OAUTH_SECRET: "your-oauth-secret"
       # TUMBLR_POLL_INTERVAL_SECONDS: "300"
+      # --- optional: Telegram channel media archiver (all three together, or none) ---
+      # Get api_id/api_hash at https://my.telegram.org/apps (they identify
+      # the application, any developer account works). Then, from the same
+      # environment (ARCHIVE_DIR especially), run once:
+      #   docker compose run --rm bsky-archiver telegram-login
+      # which writes the account session to <ARCHIVE_DIR>/telegram.session
+      # (kept durable by the volume below; run it once, ever).
+      # TELEGRAM_API_ID: "1234567"
+      # TELEGRAM_API_HASH: "your-api-hash"
+      # TELEGRAM_CHANNELS: "@channel_one,@channel_two"
+      # TELEGRAM_POLL_INTERVAL_SECONDS: "120"
+      # TELEGRAM_BACKFILL_LIMIT: "2000"
       RUST_LOG: "info"
     volumes:
       # Persists the archived JSON + media + SQLite index across restarts

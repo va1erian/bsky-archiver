@@ -53,14 +53,21 @@ pub enum Category {
     /// rather than an AT URI; everything else (record.json envelope, media
     /// layout, index rows) works identically.
     TumblrLike,
+    /// A message with media posted in one of the watched Telegram channels
+    /// (archived by [`crate::telegram`]). Its item id is a
+    /// `telegram:{channel}/{message-id}` key rather than an AT URI;
+    /// everything else (record.json envelope, media layout, index rows)
+    /// works identically to the Bluesky categories.
+    TelegramChannel,
 }
 
 impl Category {
-    const ALL: [Category; 4] = [
+    const ALL: [Category; 5] = [
         Category::Post,
         Category::Like,
         Category::Bookmark,
         Category::TumblrLike,
+        Category::TelegramChannel,
     ];
 
     fn as_dir(self) -> &'static str {
@@ -69,6 +76,7 @@ impl Category {
             Category::Like => "likes",
             Category::Bookmark => "bookmarks",
             Category::TumblrLike => "tumblr_likes",
+            Category::TelegramChannel => "telegram_channels",
         }
     }
 }
@@ -88,6 +96,7 @@ impl std::str::FromStr for Category {
             "likes" => Ok(Category::Like),
             "bookmarks" => Ok(Category::Bookmark),
             "tumblr_likes" => Ok(Category::TumblrLike),
+            "telegram_channels" => Ok(Category::TelegramChannel),
             other => Err(StorageError::InvalidCategory(other.to_string())),
         }
     }

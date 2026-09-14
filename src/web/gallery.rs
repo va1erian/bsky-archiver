@@ -117,6 +117,7 @@ fn parse_gallery_category(raw: Option<&str>) -> Result<Option<Category>, WebErro
             "like" | "likes" => Category::Like,
             "bookmark" | "bookmarks" => Category::Bookmark,
             "tumblr-like" | "tumblr_likes" => Category::TumblrLike,
+            "telegram" | "telegram_channels" => Category::TelegramChannel,
             other => {
                 return Err(WebError::BadRequest {
                     message: format!("unknown category {other:?}"),
@@ -135,6 +136,7 @@ fn category_token(category: Category) -> &'static str {
         Category::Like => "like",
         Category::Bookmark => "bookmark",
         Category::TumblrLike => "tumblr-like",
+        Category::TelegramChannel => "telegram",
     }
 }
 
