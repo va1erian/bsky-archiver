@@ -4,7 +4,8 @@
 //! in [`crate::templates`] (askama templates + their view models) so this
 //! file stays about *what data* each route needs, not how it's marked up.
 //! Handlers are grouped into submodules by page/concern ([`assets`],
-//! [`dashboard`], [`posts`], [`gallery`], [`media`], [`config`]); this root
+//! [`dashboard`], [`posts`], [`gallery`], [`browser`], [`media`],
+//! [`config`]); this root
 //! module keeps the router, the session gate, the health probe, and the
 //! shared error/helper vocabulary the submodules build on.
 
@@ -22,6 +23,7 @@ use crate::state::SharedAppState;
 use crate::storage::StorageError;
 
 mod assets;
+mod browser;
 mod config;
 mod dashboard;
 mod gallery;
@@ -63,8 +65,17 @@ pub fn router(app: SharedAppState) -> Router {
         .route("/posts", get(posts::list_posts))
         .route("/posts/:id", get(posts::post_detail))
         .route("/gallery", get(gallery::gallery))
-        .route("/gallery/account", get(gallery::gallery_account))
         .route("/gallery/export", get(gallery::gallery_export))
+        .route("/browser", get(browser::browser))
+        .route(
+            "/browser/saved",
+            axum::routing::post(browser::add_saved_account),
+        )
+        .route(
+            "/browser/saved/:id",
+            axum::routing::post(browser::remove_saved_account),
+        )
+        .route("/gallery/account", get(browser::gallery_account_redirect))
         .route("/config", get(config::config_view))
         .route("/media/:category/:id/:filename", get(media::media_file))
         .route("/sources", axum::routing::post(config::add_source))

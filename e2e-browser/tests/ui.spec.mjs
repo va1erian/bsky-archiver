@@ -65,6 +65,10 @@ test("gallery renders three real pages of loadable images", async ({ page }) => 
   for (const [i, ok] of states.entries()) {
     expect(ok, `gallery image ${i} must decode`).toBe(true);
   }
+  // The account viewer moved to its own page: the gallery links there instead
+  // of embedding the form itself.
+  await expect(page.locator("#gallery-account-actor")).toHaveCount(0);
+  await expect(page.locator('nav.main-nav a[href="/browser"]')).toBeVisible();
 });
 
 test("posts list renders cards with loadable thumbnails", async ({ page }) => {
@@ -244,6 +248,58 @@ test("posts list pagination works the same way", async ({ page }) => {
 });
 
 // ---------------------------------------------------------------------
+// Browser page (account viewer + saved favorites)
+// ---------------------------------------------------------------------
+
+test("browser page shows its handle form and its saved-accounts panel", async ({
+  page,
+}) => {
+  await login(page);
+  await page.goto("/browser");
+  await expect(page.locator("main h1")).toHaveText("Browser");
+  await expect(page.locator("#account-actor")).toBeVisible();
+  await expect(page.locator("#saved-accounts-panel")).toBeVisible();
+  await expect(page.locator("#saved-accounts-panel")).toContainText(
+    "No saved accounts yet",
+  );
+
+  // The old /gallery/account URL lands on the browser page.
+  await page.goto("/gallery/account?actor=bob.bsky.social");
+  await expect(page).toHaveURL(/\/browser\?actor=/);
+  await expect(page.locator("main h1")).toHaveText("Browser");
+  // No network in the e2e environment, so the browse fails inline.
+  await expect(page.locator("[role=alert]").last()).toContainText(
+    "could not load",
+  );
+});
+
+test("saving and removing a favorite account through the UI round-trips", async ({
+  page,
+}) => {
+  await login(page);
+  await page.goto("/browser");
+
+  // Save via the panel form (htmx swap; no page reload).
+  await plantReloadProbe(page, "#saved-accounts-panel");
+  await page.fill("#saved-account-handle", "bob.bsky.social");
+  await page.click("#saved-accounts-panel form.source-add-form button");
+  const panel = page.locator("#saved-accounts-panel");
+  await expect(panel).toContainText("bob.bsky.social");
+  expect(await reloadProbe(page)).toBe(42);
+
+  // Re-save (No-JS path is the same form; a duplicate stays one row).
+  await page.fill("#saved-account-handle", "bob.bsky.social");
+  await page.click("#saved-accounts-panel form.source-add-form button");
+  await expect(panel.locator("td", { hasText: "bob.bsky.social" })).toHaveCount(1);
+
+  // Remove: the panel empties again.
+  await page.locator(
+    "#saved-accounts-panel td form[action*='/browser/saved/'] button",
+  ).first().click();
+  await expect(panel).toContainText("No saved accounts yet");
+});
+
+// ---------------------------------------------------------------------
 // Login gate
 // ---------------------------------------------------------------------
 
@@ -284,13 +340,13 @@ for (const [width, height] of [
       .locator(".card-grid .item-card a", { hasText: "View post" })
       .first()
       .getAttribute("href");
-    const urls = ["/", detailHref, "/posts?page_size=10", GALLERY, "/config"];
+    const urls = ["/", detailHref, "/posts?page_size=10", GALLERY, "/browser", "/config"];
 
     for (const path of urls) {
       await page.goto(path);
       await expect(page.locator("main")).toBeVisible();
 
-      const configTableOnly = path.startsWith("/config");
+      const configTableOnly = path.startsWith("/config") || path.startsWith("/browser");
       let offenders = [];
       const scroll = await page.evaluate(() => ({
         scrollWidth: document.scrollingElement.scrollWidth,
@@ -327,11 +383,13 @@ for (const [width, height] of [
         await expect(galleryLink).toBeHidden();
         await summary.click();
         await expect(galleryLink).toBeVisible();
+        await expect(page.locator('nav.main-nav a[href="/browser"]')).toBeVisible();
         await expect(page.locator('nav.main-nav a[href="/posts"]')).toBeVisible();
         await expect(page.locator('nav.main-nav a[href="/config"]')).toBeVisible();
       } else {
         await expect(summary).toBeHidden();
         await expect(galleryLink).toBeVisible();
+        await expect(page.locator('nav.main-nav a[href="/browser"]')).toBeVisible();
       }
 
       // Touch targets on the paginated paths at phone width: the CSS media

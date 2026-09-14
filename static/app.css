@@ -215,6 +215,31 @@
   color: var(--pico-color, inherit);
 }
 
+/* Saved-accounts (favorites) panel on the Browser page. Reuses the add-form
+   and table-reflow patterns of the config page's sources panel; only the
+   input sizing differs from the generic sources form. */
+#saved-accounts-panel h2 {
+  margin-bottom: 0.25rem;
+}
+
+.source-add-form [for="saved-account-handle"] {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0;
+}
+
+#saved-account-handle {
+  width: auto;
+  min-width: 16rem;
+  max-width: 24rem;
+  margin: 0;
+}
+
+.saved-account-browse-form {
+  margin: 0;
+}
+
 .pagination {
   display: flex;
   flex-wrap: wrap;
@@ -709,6 +734,20 @@ a.gallery-item-thumb {
     font-size: 0.8rem;
     min-height: 0;
     width: auto;
+  }
+
+  /* Saved-accounts panel on the Browser page: buttons reach the same ~44px
+     touch minimum as the other action buttons; the saved-handle input stays
+     wide enough to type into on a phone. */
+  .saved-account-browse-form button,
+  #saved-accounts-panel td form button {
+    min-height: 44px;
+  }
+
+  #saved-account-handle {
+    min-width: 0;
+    width: 100%;
+    max-width: none;
   }
 }
 

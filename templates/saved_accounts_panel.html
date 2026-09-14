@@ -1,0 +1,41 @@
+<section id="saved-accounts-panel">
+<div class="sources-header">
+<h2>Saved accounts</h2>
+<p>Favorites for quick access: save a handle once, browse it with one click. Saved accounts are private to this archiver's database.</p>
+</div>
+<div id="saved-accounts-error" role="alert">{% if let Some(error) = error %}<p class="error-message">{{ error }}</p>{% endif %}</div>
+
+{% if saved.is_empty() %}
+<p class="source-empty">No saved accounts yet. Browse someone below, then save their handle here.</p>
+{% else %}
+<table class="config-table">
+<thead><tr><th>Handle</th><th>Saved</th><th></th><th></th></tr></thead>
+<tbody>
+{% for account in saved %}
+<tr>
+<td data-label="Handle"><code>{{ account.handle }}</code></td>
+<td data-label="Saved">{{ account.added_at }}</td>
+<td data-label="Browse">
+<form method="get" action="/browser" class="saved-account-browse-form">
+<input type="hidden" name="actor" value="{{ account.handle }}">
+<button type="submit" class="secondary outline">Browse</button>
+</form>
+</td>
+<td data-label="Remove">
+<form method="post" action="/browser/saved/{{ account.id }}" hx-post="/browser/saved/{{ account.id }}" hx-target="#saved-accounts-panel" hx-swap="outerHTML">
+<button type="submit" class="secondary outline">Remove</button>
+</form>
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+<form method="post" action="/browser/saved" class="source-add-form" hx-post="/browser/saved" hx-target="#saved-accounts-panel" hx-swap="outerHTML">
+<label for="saved-account-handle">Handle
+<input id="saved-account-handle" type="text" name="handle" required placeholder="alice.bsky.social" autocomplete="off">
+</label>
+<button type="submit">Save account</button>
+</form>
+</section>
