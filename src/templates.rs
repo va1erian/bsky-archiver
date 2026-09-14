@@ -233,6 +233,18 @@ pub struct DashboardTemplate {
     pub bookmarks_count: u64,
     pub tumblr_likes_count: u64,
     pub health: Vec<SubsystemRow>,
+    /// Recent-activity rows rendered excerpt-less; the grid self-refreshes
+    /// from `/recent` via htmx after load.
+    pub recent: Vec<PostRow>,
+}
+
+/// The deferred recent-activity grid served by `/recent`: identical card
+/// markup to the dashboard's fast-path grid (the dashboard deliberately
+/// renders excerpt-less rows so boosted navigation lands instantly), plus
+/// the excerpts the fragment swap provides.
+#[derive(Template)]
+#[template(path = "recent_grid.html")]
+pub struct RecentGridTemplate {
     pub recent: Vec<PostRow>,
 }
 
@@ -250,7 +262,9 @@ pub struct PostRow {
     pub category_label: &'static str,
     pub category_badge_class: &'static str,
     pub author: String,
-    pub excerpt: String,
+    /// Item text as an excerpt (index-only lists show none: the text lives in
+    /// the record file, read separately by the deferred fragment).
+    pub excerpt: Option<String>,
     pub detail_href: String,
     pub indexed_at: String,
     pub media_count: u32,
@@ -258,17 +272,16 @@ pub struct PostRow {
     pub deleted_at: Option<String>,
 }
 
-/// Builds a [`PostRow`] from an index-layer [`PostSummary`] plus the
-/// item's text (fetched separately by the caller, best-effort, since the
-/// index deliberately doesn't store full record bodies).
+/// Builds a [`PostRow`] from an index-layer [`PostSummary`] plus the item's
+/// text (fetched separately by the caller — batched and deferred now — since
+/// the index deliberately doesn't store full record bodies). `None` renders
+/// the row without an excerpt, which is also the skeleton-row fast path.
 pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
     PostRow {
         category_label: category_label(summary.category),
         category_badge_class: category_badge_class(summary.category),
         author: author_did_from_at_uri(&summary.at_uri).to_string(),
-        excerpt: text
-            .map(|t| excerpt(t, MAX_EXCERPT_CHARS))
-            .unwrap_or_default(),
+        excerpt: text.map(|t| excerpt(t, MAX_EXCERPT_CHARS)),
         detail_href: format!("/posts/{}", crate::web::encode_post_id(&summary.at_uri)),
         indexed_at: summary.indexed_at.clone(),
         media_count: summary.media_count,
@@ -310,6 +323,10 @@ pub struct PostsTemplate {
     pub rows: Vec<PostRow>,
     pub pagination: Pagination,
     pub category_options: Vec<CategoryOption>,
+    /// Same field as [`PostsListTemplate::self_refresh`]: the full page
+    /// embeds the excerpt-less list, which re-fetches this URL as a
+    /// fragment after load.
+    pub self_refresh: Option<String>,
 }
 
 #[derive(Template)]
@@ -317,6 +334,10 @@ pub struct PostsTemplate {
 pub struct PostsListTemplate {
     pub rows: Vec<PostRow>,
     pub pagination: Pagination,
+    /// When set, the list renders as the fast path (excerpt-less rows) and
+    /// re-fetches this URL as an excerpted fragment after load. `None` on
+    /// the htmx fragment responses themselves so they don't loop.
+    pub self_refresh: Option<String>,
 }
 
 pub struct PostMedia {

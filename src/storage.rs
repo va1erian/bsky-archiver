@@ -1109,6 +1109,86 @@ impl ArchiveStore {
         join_result(result)
     }
 
+    /// Batched variant of [`ArchiveStore::get_post`] for the excerpt-
+    /// building paths: one blocking task reads every requested record file
+    /// instead of one task (and one `spawn_blocking` hop) per item, and the
+    /// index is deliberately not consulted, so no database lock is taken —
+    /// callers that only need record text already have `deleted_at` from
+    /// [`PostSummary`]. Per-item read/parse failures become `None`, matching
+    /// the best-effort contract [`crate::web::dashboard::fetch_excerpts`]
+    /// previously had with `get_post`: one unreadable record never fails the
+    /// whole page.
+    pub async fn get_records_batch(
+        &self,
+        entries: Vec<(Category, String)>,
+    ) -> Result<Vec<Option<ArchivedRecord>>, StorageError> {
+        let archive_dir = self.archive_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            Ok(entries
+                .into_iter()
+                .map(|(category, at_uri)| {
+                    let path = record_path(&archive_dir, category, &at_uri);
+                    std::fs::read(path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                })
+                .collect())
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Fetches a single archived record by `at_uri` regardless of category,
+    /// probing the record paths in the same order the web layer's old detail
+    /// handler did (Post, Like, Bookmark, TumblrLike). Collapses what used to
+    /// be one `spawn_blocking` + one filesystem probe + one database
+    /// round-trip per category into a single blocking task with exactly one
+    /// index lookup (for `deleted_at`) once a record is found. Returns the
+    /// owning category alongside the record.
+    pub async fn get_post_any(
+        &self,
+        at_uri: &str,
+    ) -> Result<Option<(Category, ArchivedRecord)>, StorageError> {
+        let archive_dir = self.archive_dir.clone();
+        let db = Arc::clone(&self.db);
+        let at_uri = at_uri.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<_, StorageError> {
+            let mut found = None;
+            let mut found_category = None;
+            for category in [
+                Category::Post,
+                Category::Like,
+                Category::Bookmark,
+                Category::TumblrLike,
+            ] {
+                let path = record_path(&archive_dir, category, &at_uri);
+                if path.exists() {
+                    let bytes = std::fs::read(&path)?;
+                    found = Some(serde_json::from_slice::<ArchivedRecord>(&bytes)?);
+                    found_category = Some(category);
+                    break;
+                }
+            }
+            let Some(mut record) = found else {
+                return Ok(None);
+            };
+            let category = found_category.expect("record implies category");
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let deleted_at: Option<String> = conn
+                .query_row(
+                    "SELECT deleted_at FROM posts WHERE category = ?1 AND at_uri = ?2",
+                    params![category.as_dir(), &at_uri],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            record.deleted_at = deleted_at;
+            Ok(Some((category, record)))
+        })
+        .await;
+        join_result(result)
+    }
+
     /// Lists posts (optionally filtered by category) newest-first, via
     /// the SQLite index.
     pub async fn list_posts(

@@ -550,9 +550,23 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
         .unwrap();
     assert_eq!(posts_list_response.status(), StatusCode::OK);
     let posts_list_body = body_string(posts_list_response).await;
-    assert!(posts_list_body.contains("an e2e authored post with media"));
-    assert!(posts_list_body.contains("an e2e liked post with media"));
-    assert!(posts_list_body.contains("an e2e bookmarked post with media"));
+    // Excerpts live in the deferred htmx fragment, not the fast full page.
+    let posts_fragment = app
+        .clone()
+        .oneshot(
+            Request::get("/posts")
+                .header(header::COOKIE, cookie.clone())
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(posts_fragment.status(), StatusCode::OK);
+    let posts_fragment_body = body_string(posts_fragment).await;
+    assert!(posts_fragment_body.contains("an e2e authored post with media"));
+    assert!(posts_fragment_body.contains("an e2e liked post with media"));
+    assert!(posts_fragment_body.contains("an e2e bookmarked post with media"));
     assert!(posts_list_body.contains("badge-post"));
     assert!(posts_list_body.contains("badge-like"));
     assert!(posts_list_body.contains("badge-bookmark"));

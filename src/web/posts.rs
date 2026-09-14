@@ -40,24 +40,39 @@ pub(super) async fn list_posts(
         .store
         .list_posts(category, page, page_size)
         .await?;
-    let texts = fetch_excerpts(&state.app.store, &result.items).await;
-    let rows = result
-        .items
-        .iter()
-        .zip(texts)
-        .map(|(summary, text)| templates::post_row(summary, text.as_deref()))
-        .collect();
-
     let category_param = query.category.clone();
+    let self_href = posts_href(query.category.as_deref(), result.page, page_size);
+
     let pagination =
         templates::build_pagination(result.page, result.total_pages, result.total_items, |n| {
             posts_href(category_param.as_deref(), n, page_size)
         });
 
     if is_htmx_request(&headers) {
-        let fragment = templates::PostsListTemplate { rows, pagination };
+        // Fragment swap: the excerpt reads (one batched record-file scan
+        // across the page's items) happen here, after the fast full page
+        // has already shown skeleton rows.
+        let texts = fetch_excerpts(&state.app.store, &result.items).await;
+        let rows = result
+            .items
+            .iter()
+            .zip(texts)
+            .map(|(summary, text)| templates::post_row(summary, text.as_deref()))
+            .collect();
+        let fragment = templates::PostsListTemplate {
+            rows,
+            pagination,
+            self_refresh: None,
+        };
         Ok(askama_axum::into_response(&fragment))
     } else {
+        // Full page fast path: rows straight from the index, no excerpt
+        // reads — the skeleton list re-fetches itself via htmx after load.
+        let rows = result
+            .items
+            .iter()
+            .map(|summary| templates::post_row(summary, None))
+            .collect();
         let category_options = build_category_options(query.category.as_deref());
         let template = templates::PostsTemplate {
             version: templates::APP_VERSION,
@@ -66,6 +81,7 @@ pub(super) async fn list_posts(
             rows,
             pagination,
             category_options,
+            self_refresh: Some(self_href),
         };
         Ok(askama_axum::into_response(&template))
     }
@@ -103,47 +119,44 @@ pub(super) async fn post_detail(
     Path(id): Path<String>,
 ) -> Result<Response, WebError> {
     let at_uri = id;
-    for category in [
-        Category::Post,
-        Category::Like,
-        Category::Bookmark,
-        Category::TumblrLike,
-    ] {
-        if let Some(record) = state.app.store.get_post(category, &at_uri).await? {
-            let text = templates::record_text(&record.record).map(str::to_string);
-            let media = record
-                .media
-                .iter()
-                .map(|m| templates::PostMedia {
-                    url: templates::media_url(category, &at_uri, &m.filename),
-                    is_video: templates::is_video_content_type(m.content_type.as_deref()),
-                    content_type: m
-                        .content_type
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    alt: format!("{} media", templates::category_label(category)),
-                })
-                .collect();
-            let raw_json = serde_json::to_string_pretty(&record.record)
-                .unwrap_or_else(|_| "<invalid json>".to_string());
+    // Single batched probe across the categories (one blocking task, one
+    // filesystem hit, one index lookup) instead of the old sequential
+    // get_post loop, which paid a spawn_blocking hop plus a filesystem probe
+    // and a database round-trip per category.
+    let Some((category, record)) = state.app.store.get_post_any(&at_uri).await? else {
+        return Err(WebError::NotFound);
+    };
+    let text = templates::record_text(&record.record).map(str::to_string);
+    let media = record
+        .media
+        .iter()
+        .map(|m| templates::PostMedia {
+            url: templates::media_url(category, &at_uri, &m.filename),
+            is_video: templates::is_video_content_type(m.content_type.as_deref()),
+            content_type: m
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            alt: format!("{} media", templates::category_label(category)),
+        })
+        .collect();
+    let raw_json = serde_json::to_string_pretty(&record.record)
+        .unwrap_or_else(|_| "<invalid json>".to_string());
 
-            let template = templates::PostDetailTemplate {
-                version: templates::APP_VERSION,
-                git_revision: templates::GIT_REVISION,
-                build_date: templates::BUILD_DATE,
-                category_label: templates::category_label(category),
-                category_badge_class: templates::category_badge_class(category),
-                author: templates::author_did_from_at_uri(&at_uri).to_string(),
-                bluesky_url: templates::bluesky_post_url(&at_uri),
-                text,
-                indexed_at: record.indexed_at.clone(),
-                action_at: record.action_at.clone(),
-                deleted_at: record.deleted_at.clone(),
-                media,
-                raw_json,
-            };
-            return Ok(askama_axum::into_response(&template));
-        }
-    }
-    Err(WebError::NotFound)
+    let template = templates::PostDetailTemplate {
+        version: templates::APP_VERSION,
+        git_revision: templates::GIT_REVISION,
+        build_date: templates::BUILD_DATE,
+        category_label: templates::category_label(category),
+        category_badge_class: templates::category_badge_class(category),
+        author: templates::author_did_from_at_uri(&at_uri).to_string(),
+        bluesky_url: templates::bluesky_post_url(&at_uri),
+        text,
+        indexed_at: record.indexed_at.clone(),
+        action_at: record.action_at.clone(),
+        deleted_at: record.deleted_at.clone(),
+        media,
+        raw_json,
+    };
+    Ok(askama_axum::into_response(&template))
 }

@@ -1,0 +1,27 @@
+{# The deferred recent-activity grid re-fetched from `/recent`: identical card
+   markup to the dashboard's fast-path grid, with the excerpt text the dashboard
+   leaves out so the page renders instantly. #}
+<div id="recent-grid">
+{% if recent.is_empty() %}
+<p>Nothing archived yet.</p>
+{% else %}
+<div class="card-grid">
+{% for row in recent %}
+<article class="item-card">
+{% if let Some(thumb) = row.thumbnail %}
+{% if thumb.is_video %}
+<video class="thumb" src="{{ thumb.url }}" muted preload="metadata"></video>
+{% else %}
+<img class="thumb" src="{{ thumb.url }}" alt="{{ thumb.alt }}" loading="lazy">
+{% endif %}
+{% endif %}
+<span class="badge {{ row.category_badge_class }}">{{ row.category_label }}</span>
+{% if let Some(deleted) = row.deleted_at %}<span class="badge badge-deleted">Deleted</span>{% endif %}
+{% if let Some(excerpt) = row.excerpt %}<p class="excerpt">{{ excerpt }}</p>{% endif %}
+<p class="item-meta">{{ row.author }} · {{ row.indexed_at }}</p>
+<a href="{{ row.detail_href }}">View</a>
+</article>
+{% endfor %}
+</div>
+</div>
+{% endif %}

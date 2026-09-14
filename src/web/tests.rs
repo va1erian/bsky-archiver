@@ -513,9 +513,10 @@ async fn dashboard_renders_counts_health_and_recent_activity() {
     let cookie = login(&app).await;
 
     let response = app
+        .clone()
         .oneshot(
             Request::get("/")
-                .header(header::COOKIE, cookie)
+                .header(header::COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -524,19 +525,39 @@ async fn dashboard_renders_counts_health_and_recent_activity() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
 
-    assert!(body.contains("a photo post"), "post excerpt missing");
+    // The dashboard's fast path renders the recent grid excerpt-less and
+    // self-refreshes it via htmx after load.
     assert!(
         body.contains("Connected") || body.contains("Degraded"),
         "health status missing"
     );
     assert!(body.contains("badge-post"), "category badge missing");
     assert!(
-        body.contains("<img") && body.contains("alt="),
-        "image thumbnail missing alt"
-    );
-    assert!(
         body.contains(&format!("bsky-archiver v{}", env!("CARGO_PKG_VERSION"))),
         "version footer missing"
+    );
+
+    let fragment = app
+        .clone()
+        .oneshot(
+            Request::get("/recent")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fragment.status(), StatusCode::OK);
+    let fragment_body = body_string(fragment).await;
+    assert!(
+        fragment_body.contains("a photo post"),
+        "post excerpt missing from /recent fragment"
+    );
+    assert!(
+        fragment_body.contains("badge-post")
+            && fragment_body.contains("<img")
+            && fragment_body.contains("alt="),
+        "fragment cards/badges/thumbnails missing"
     );
 }
 
@@ -548,9 +569,10 @@ async fn posts_list_renders_cards_badges_thumbnails_and_pagination() {
     let cookie = login(&app).await;
 
     let response = app
+        .clone()
         .oneshot(
             Request::get("/posts")
-                .header(header::COOKIE, cookie)
+                .header(header::COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -559,8 +581,12 @@ async fn posts_list_renders_cards_badges_thumbnails_and_pagination() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
 
-    assert!(body.contains("a photo post"));
-    assert!(body.contains("a liked video"));
+    // Fast path: skeleton rows without excerpts; the excerpted list arrives
+    // via the self-refresh htmx fragment.
+    assert!(
+        body.contains("hx-get=\"/") && body.contains("hx-trigger=\"load\""),
+        "posts list self-refresh markers missing"
+    );
     assert!(body.contains("badge-post") && body.contains("badge-like"));
     assert!(body.contains("<img") && body.contains("alt="));
     assert!(body.contains("<video"));
@@ -572,6 +598,29 @@ async fn posts_list_renders_cards_badges_thumbnails_and_pagination() {
     assert!(body.contains("Last &raquo;"));
     assert!(body.contains("rel=\"manifest\""));
     assert!(body.contains("name=\"theme-color\""));
+
+    // The htmx fragment swap carries the excerpts.
+    let fragment = app
+        .clone()
+        .oneshot(
+            Request::get("/posts")
+                .header(header::COOKIE, &cookie)
+                .header(header::HeaderName::from_static("hx-request"), "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fragment.status(), StatusCode::OK);
+    let fragment_body = body_string(fragment).await;
+    assert!(
+        fragment_body.contains("a photo post") && fragment_body.contains("a liked video"),
+        "post excerpts missing from fragment"
+    );
+    assert!(
+        fragment_body.contains("badge-post") && fragment_body.contains("badge-like"),
+        "fragment badges missing"
+    );
 }
 
 #[tokio::test]
