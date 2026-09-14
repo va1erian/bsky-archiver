@@ -1884,7 +1884,8 @@ async fn account_viewer_sort_reverses_the_page_and_survives_pagination() {
 
     // Default (newest) keeps the API order: post 1's first image precedes
     // its second.
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             Request::get("/browser?actor=bob.bsky.social&skip_reposts=on")
                 .header(header::COOKIE, cookie.clone())
@@ -1896,7 +1897,9 @@ async fn account_viewer_sort_reverses_the_page_and_survives_pagination() {
     let body = body_string(response).await;
     assert!(body.find("f1.jpg") < body.find("f2.jpg"));
     assert!(
-        body.contains("<option value=\"/browser?actor=bob%2Ebsky%2Esocial&amp;skip_reposts=on\" selected>"),
+        body.contains(
+            "<option value=\"/browser?actor=bob%2Ebsky%2Esocial&amp;skip_reposts=on\" selected>"
+        ),
         "the default run marks 'newest first' selected"
     );
 
@@ -1961,20 +1964,19 @@ async fn like_and_bookmark_actions_create_records_with_the_post_ref() {
 
     let post = |endpoint: &str| {
         let cookie = cookie.clone();
-        app.clone()
-            .oneshot(
-                Request::post(endpoint)
-                    .header(header::COOKIE, cookie)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({
-                            "uri": "at://did:plc:bob/app.bsky.feed.post/1",
-                            "cid": "cid-1",
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
+        app.clone().oneshot(
+            Request::post(endpoint)
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "uri": "at://did:plc:bob/app.bsky.feed.post/1",
+                        "cid": "cid-1",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
     };
 
     let response = post("/browser/like").await.unwrap();
@@ -1995,7 +1997,9 @@ async fn like_and_bookmark_actions_create_records_with_the_post_ref() {
             Request::post("/browser/like")
                 .header(header::COOKIE, cookie)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({"uri": "not-a-uri", "cid": ""}).to_string()))
+                .body(Body::from(
+                    json!({"uri": "not-a-uri", "cid": ""}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
