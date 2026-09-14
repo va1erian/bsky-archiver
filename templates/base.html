@@ -58,6 +58,113 @@
 <p>bsky-archiver v{{ version }} · rev {{ git_revision }} · built {{ build_date }}</p>
 </footer>
 <script>
+// Fill-to-columns top-up: server-side the item count per page is fixed
+// while the *column* count depends on the viewport, so the last row would
+// end in blank cells. After render this measures how many grid columns
+// actually fit and, when the item count isn't a multiple of that, re-requests
+// the same selection with the page size (gallery: `page_size`; live
+// browser: the feed `limit`) raised to the next multiple. The swap is the
+// same htmx fragment pattern pagination uses, so links, the counter and
+// the lightbox contract stay intact; and because the raise happens for
+// the SAME page/cursor it cannot duplicate items. Without JS nothing
+// changes (default counts). If the source is exhausted before a multiple
+// can be fetched, the grid falls back to stretched flex items for that
+// page (see .cannot-fill in app.css).
+(function () {
+  var MIN_COLUMN_PX = 144; // .gallery-grid column floor (9rem)
+  var MAX_TARGET = 100; // both server ceilings: page size and feed limit
+  var inflight = false;
+  var attempted = null;
+
+  function columnsThatFit(grid) {
+    var style = window.getComputedStyle(grid);
+    var gap = parseFloat(style.columnGap) || 0;
+    var width = grid.clientWidth;
+    return Math.max(1, Math.floor((width + gap) / (MIN_COLUMN_PX + gap)));
+  }
+
+  function fill() {
+    if (inflight || typeof htmx === "undefined") return;
+    // An open lightbox is mid walk: a swap now would tear its content
+    // down (the dialog's swap handler closes it), so leave it alone.
+    var dialog = document.getElementById("lightbox");
+    if (dialog && dialog.open) return;
+
+    var wrapper = document.querySelector("[data-fill-param]");
+    if (!wrapper) return;
+    var grid = wrapper.querySelector(".gallery-grid");
+    var param = wrapper.getAttribute("data-fill-param");
+    if (!grid || !param) return;
+
+    var current = parseInt(wrapper.getAttribute("data-fill-current"), 10) || 0;
+    var cols = columnsThatFit(grid);
+    var items = grid.children.length;
+    if (!cols || !items) return;
+    var target = Math.min(Math.ceil(items / cols) * cols, MAX_TARGET);
+    var params = new URLSearchParams(window.location.search);
+    // A previous top-up (or a hand-typed URL) may already request the
+    // aligned count; catch that without a refetch. Remaining gaps then
+    // reflect filtering or a short source the server can't top up.
+    if (target <= (parseInt(params.get(param), 10) || current)) return;
+
+    var href = window.location.pathname + "?" + params.toString();
+    if (attempted === href) {
+      // Already tried to fill to this exact shape and got shorted (feed
+      // exhausted, end-of-list page): fall back to flex-stretched items.
+      grid.classList.add("cannot-fill");
+      return;
+    }
+    attempted = href;
+    inflight = true;
+    // Set while the top-up is in flight so the per-page after:swap
+    // handlers that force the viewport to the top skip this swap; reset
+    // in the continuation, which htmx resolves strictly after the
+    // after:swap dispatch has finished.
+    window.__fillSkipScroll = true;
+    htmx
+      .ajax("GET", href, {
+        target: "#" + wrapper.id,
+        swap: "outerHTML",
+        push: "true",
+      })
+      .then(
+        function () {
+          inflight = false;
+          window.__fillSkipScroll = false;
+        },
+        function () {
+          inflight = false;
+          window.__fillSkipScroll = false;
+          grid.classList.add("cannot-fill");
+        }
+      );
+  }
+
+  var resizeTimer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(fill, 250);
+  });
+
+  // Run once at ready: the first paint renders the server default
+  // (20/50), so a viewport whose column count divides it badly gets the
+  // aligned count right away.
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", fill);
+  } else {
+    fill();
+  }
+
+  // Any htmx swap may have brought a fresh grid in (pagination click,
+  // boosted nav, history restore). Our own top-up swap re-enters here
+  // too — the `attempted` guard makes that a no-op unless a different
+  // (e.g. resize-widened) target is worth trying.
+  document.body.addEventListener("htmx:after:swap", function () {
+    if (!window.__fillSkipScroll) fill();
+  });
+})();
+</script>
+<script>
 (function(){
   var select = document.getElementById('accent-select');
   var stored = localStorage.getItem('accent') || 'blue';
@@ -76,6 +183,16 @@
 <dialog id="lightbox" aria-modal="true">
 <article>
 <button aria-label="Close" id="lightbox-close" class="close-lightbox">&times;</button>
+<div class="lightbox-actions">
+<button class="lightbox-action" id="lightbox-like" aria-label="Like" title="Like" aria-pressed="false" hidden>
+<svg class="icon-action" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" width="19" height="19"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.49-2.74-2-4-2a5.5 5.5 0 0 0-6.5 5.5c0 2.29 1.51 4.04 3 5.5l6.99 7Z"/></svg>
+<svg class="icon-done" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" width="19" height="19"><path d="M20 6 9 17l-5-5"/></svg>
+</button>
+<button class="lightbox-action" id="lightbox-bookmark" aria-label="Bookmark" title="Bookmark" aria-pressed="false" hidden>
+<svg class="icon-action" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" width="19" height="19"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+<svg class="icon-done" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" width="19" height="19"><path d="M20 6 9 17l-5-5"/></svg>
+</button>
+</div>
 <button aria-label="Previous" class="lightbox-nav" data-nav="prev" id="lightbox-prev">&#10094;</button>
 <button aria-label="Next" class="lightbox-nav" data-nav="next" id="lightbox-next">&#10095;</button>
 <span id="lightbox-counter" class="lightbox-counter" aria-live="polite"></span>
@@ -231,6 +348,7 @@
     counter.textContent =
       items.length > 1 ? (index + 1) + " / " + items.length : "";
     updateButtons();
+    updateActionButtons();
     preloadNeighbours();
 
     var newEl = document.createElement(isVideo ? "video" : "img");
@@ -286,6 +404,96 @@
     render(0);
     dialog.showModal();
   }
+
+  // -------------------------------------------------------------------
+  // Like / bookmark actions. Only the browser grid's links carry
+  // data-post-uri/data-post-cid (archive posts are the archiver's local
+  // index, nothing to write back to), so the buttons stay hidden on every
+  // other page. Each post's outcome is remembered for the tab's lifetime
+  // so revisiting media shows the done state without a server round trip.
+  var likeBtn = document.getElementById("lightbox-like");
+  var bookmarkBtn = document.getElementById("lightbox-bookmark");
+  var actedOn = {};
+
+  function postAction(endpoint, link, button, doneLabel) {
+    // An in-flight request guards itself: a second click is a no-op until
+    // the response (or a failure) restores the button.
+    if (button.disabled) return;
+    button.disabled = true;
+    fetch("/browser/" + endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        uri: link.getAttribute("data-post-uri"),
+        cid: link.getAttribute("data-post-cid"),
+      }),
+    })
+      .then(function (response) {
+        return response.json().catch(function () { return {}; }).then(function (body) {
+          if (!response.ok || !body.ok) {
+            throw new Error((body && body.message) || "request failed (" + response.status + ")");
+          }
+        });
+      })
+      .then(function () {
+        var uri = link.getAttribute("data-post-uri");
+        actedOn[uri] = actedOn[uri] || {};
+        actedOn[uri][endpoint] = true;
+        markDone(button, doneLabel);
+      })
+      .catch(function (err) {
+        // Brief inline feedback beats vanishing silently; the button stays
+        // armed so the same click can simply be retried.
+        var message = document.createElement("span");
+        message.className = "lightbox-action-error";
+        message.setAttribute("role", "alert");
+        message.textContent = err && err.message ? err.message : "failed";
+        button.parentElement.appendChild(message);
+        setTimeout(function () { message.remove(); }, 4000);
+      })
+      .then(function () {
+        button.disabled = false;
+      });
+  }
+
+  // Marks a button permanently acted: aria-pressed flips, the Lucide check
+  // glyph replaces the icon glyph, and the label reflects the new state.
+  function markDone(button, label) {
+    button.classList.add("done");
+    button.setAttribute("aria-pressed", "true");
+    button.setAttribute("aria-label", label);
+    button.title = label;
+  }
+
+  function updateActionButtons() {
+    var link = items[index];
+    var uri = link ? link.getAttribute("data-post-uri") : null;
+    var cid = link ? link.getAttribute("data-post-cid") : null;
+    var actionable = !!(uri && cid);
+    [[likeBtn, "like", "Liked"], [bookmarkBtn, "bookmark", "Bookmarked"]].forEach(
+      function (entry) {
+        var button = entry[0];
+        button.hidden = !actionable;
+        button.disabled = false;
+        button.classList.remove("done");
+        button.setAttribute("aria-pressed", "false");
+        button.setAttribute("aria-label", entry[1] === "like" ? "Like" : "Bookmark");
+        button.title = entry[1];
+        if (actionable && actedOn[uri] && actedOn[uri][entry[1]]) {
+          markDone(button, entry[2]);
+        }
+      }
+    );
+  }
+
+  likeBtn.addEventListener("click", function () {
+    if (likeBtn.classList.contains("done")) return;
+    postAction("like", items[index], likeBtn, "Liked");
+  });
+  bookmarkBtn.addEventListener("click", function () {
+    if (bookmarkBtn.classList.contains("done")) return;
+    postAction("bookmark", items[index], bookmarkBtn, "Bookmarked");
+  });
 
   // Loads the adjacent gallery/posts page through htmx (same fragment swap
   // the pagination links perform), then lands on its first (or last) item —

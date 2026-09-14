@@ -1,11 +1,11 @@
-<div id="account-gallery-grid">
+<div id="account-gallery-grid" data-fill-param="limit" data-fill-current="{{ limit }}" data-fill-max="100">
 {% if let Some(error) = error %}
 <p class="account-viewer-error" role="alert">{{ error }}</p>
 {% endif %}
-<div class="gallery-grid">
+<div class="gallery-grid{% if fill_fallback %} cannot-fill{% endif %}">
 {% for item in items %}
 <figure class="item-card">
-<a class="gallery-item" href="{{ item.full_url }}" data-lightbox data-media-type="image" data-alt="{{ item.alt }}">
+<a class="gallery-item" href="{{ item.full_url }}" data-lightbox data-media-type="image" data-alt="{{ item.alt }}" data-post-uri="{{ item.post_uri }}" data-post-cid="{{ item.post_cid }}">
 <img src="{{ item.thumb_url }}" alt="{{ item.alt }}" loading="lazy">
 </a>
 <figcaption><a href="{{ item.post_href }}">View post</a></figcaption>

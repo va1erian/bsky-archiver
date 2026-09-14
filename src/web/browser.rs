@@ -8,18 +8,29 @@
 //! across), same htmx fragment swaps on pagination.
 
 use axum::Form;
+use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
 use super::{WebError, WebState, is_htmx_request};
 use crate::templates;
 
-/// How many feed items to request per API page in the browser. With the
-/// `posts_with_media` filter every item carries media, so one page fills a
-/// grid comfortably without chaining requests per view.
+/// How many feed items to request per API page by default in the browser.
+/// With the `posts_with_media` filter every item carries media, so one
+/// page fills a grid comfortably without chaining requests per view.
 const ACCOUNT_GALLERY_PAGE_LIMIT: u32 = 50;
+
+/// Hard ceiling for the `limit` query param (the client-side fill top-up
+/// raises it); above this the API rejects the request outright.
+const ACCOUNT_GALLERY_MAX_LIMIT: u32 = 100;
+
+/// Normalizes the `limit` query param into the 1..=100 range the feed
+/// API accepts.
+fn clamp_feed_limit(limit: u32) -> u32 {
+    limit.clamp(1, ACCOUNT_GALLERY_MAX_LIMIT)
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct BrowserQuery {
@@ -27,17 +38,65 @@ pub(super) struct BrowserQuery {
     pub(super) cursor: Option<String>,
     /// `on`/`1`/`true` (the checkbox's value) skips images from reposts.
     pub(super) skip_reposts: Option<String>,
+    /// `newest` (default, the API's own order) / `oldest` (the page
+    /// reversed). Anything else falls back to `newest`.
+    pub(super) sort: Option<String>,
+    /// How many feed items per request (the API page size). The client-side
+    /// fill top-up raises this to a multiple of the measured column count;
+    /// absent means the default below.
+    pub(super) limit: Option<u32>,
+}
+
+/// One offer of the browser's sort picker: the label, and whether it
+/// reverses the page (hrefs and selection are built from these two).
+#[derive(Debug, Clone)]
+struct BrowserSort {
+    label: &'static str,
+    oldest: bool,
+}
+
+const BROWSER_SORTS: [BrowserSort; 2] = [
+    BrowserSort {
+        label: "Newest first",
+        oldest: false,
+    },
+    BrowserSort {
+        label: "Oldest first",
+        oldest: true,
+    },
+];
+
+/// Parses a browser `sort` query value; unknown tokens behave as `newest`.
+fn parse_browser_sort(raw: Option<&str>) -> bool {
+    raw == Some("oldest")
 }
 
 /// Builds `/browser` hrefs carrying every active filter (actor, repost
-/// preference, cursor) so the "older" link continues the same browse.
-fn browser_href(actor: &str, skip_reposts: bool, cursor: Option<&str>) -> String {
+/// preference, sort, feed page limit, cursor) so the "older" link
+/// continues the same browse.
+fn browser_href(
+    actor: &str,
+    skip_reposts: bool,
+    oldest: bool,
+    limit: Option<u32>,
+    cursor: Option<&str>,
+) -> String {
     let mut href = format!(
         "/browser?actor={}",
         percent_encoding::utf8_percent_encode(actor, percent_encoding::NON_ALPHANUMERIC)
     );
     if skip_reposts {
         href.push_str("&skip_reposts=on");
+    }
+    // `sort=newest` is the default, so only the non-default sort is
+    // emitted, mirroring how the archive gallery builds its links.
+    if oldest {
+        href.push_str("&sort=oldest");
+    }
+    // Ditto the default page limit: only carry the param once the
+    // client-side fill top-up (or the user) has put one in the URL.
+    if let Some(limit) = limit {
+        href.push_str(&format!("&limit={limit}"));
     }
     if let Some(cursor) = cursor {
         href.push_str("&cursor=");
@@ -89,12 +148,20 @@ fn embed_images(embed: &serde_json::Value, out: &mut Vec<(String, String, String
 
 /// Flattens one page of feed items into gallery items: reposts optionally
 /// skipped, each post's images expanded into a thumbnail/fullsize pair
-/// linking back to the post on bsky.app.
+/// linking back to the post on bsky.app. Every image carries its post's
+/// strong ref so the lightbox can like/bookmark the post it came from.
+/// `oldest` reverses the page's order (Bluesky feeds are newest-first
+/// cursors; there is no server-side ascending traversal without walking
+/// every page, so oldest-first reverses each fetched page).
 fn account_gallery_items(
     feed: &[serde_json::Value],
     actor: &str,
     skip_reposts: bool,
+    oldest: bool,
 ) -> Vec<templates::GalleryItem> {
+    // Only image-bearing *posts of this page* take part in the reversal —
+    // repost-filtering and embed-shapes decide membership first; ordering
+    // is applied to the flattened result.
     let mut items = Vec::new();
     for entry in feed {
         if skip_reposts && crate::poller::is_repost_item(entry) {
@@ -106,6 +173,11 @@ fn account_gallery_items(
         let Some(at_uri) = post.get("uri").and_then(|v| v.as_str()) else {
             continue;
         };
+        let post_cid = post
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         let Some(embed) = post.get("embed") else {
             continue;
         };
@@ -128,9 +200,14 @@ fn account_gallery_items(
                 full_url: fullsize,
                 is_video: false,
                 post_href: post_href.clone(),
+                post_uri: at_uri.to_string(),
+                post_cid: post_cid.clone(),
                 alt,
             });
         }
+    }
+    if oldest {
+        items.reverse();
     }
     items
 }
@@ -150,28 +227,35 @@ pub(super) async fn browser(
         query.skip_reposts.as_deref(),
         Some("on") | Some("1") | Some("true")
     );
+    let oldest = parse_browser_sort(query.sort.as_deref());
+    let api_limit = query.limit.map(clamp_feed_limit);
+    let effective_limit = api_limit.unwrap_or(ACCOUNT_GALLERY_PAGE_LIMIT);
+    // Only the *explicit* choice lands in links, so a default browse emits
+    // no `limit` noise and a top-up-raised selection keeps its alignment.
+    let limit_filter = api_limit;
 
     let (items, pagination, error) = match actor.as_deref() {
         None => (Vec::new(), None, None),
         Some(actor) => match state
             .app
             .bluesky
-            .get_author_feed_media(actor, query.cursor.as_deref(), ACCOUNT_GALLERY_PAGE_LIMIT)
+            .get_author_feed_media(actor, query.cursor.as_deref(), effective_limit)
             .await
         {
             Ok(page) => {
-                let items = account_gallery_items(&page.feed, actor, skip_reposts);
+                let items = account_gallery_items(&page.feed, actor, skip_reposts, oldest);
                 // The cursor link only when the API offers one AND the page
                 // wasn't filtered down to nothing — otherwise "older" would
                 // dead-end through empty page after empty page.
                 let next = page
                     .cursor
                     .filter(|_| !items.is_empty())
-                    .map(|cursor| browser_href(actor, skip_reposts, Some(&cursor)));
-                let start = query
-                    .cursor
-                    .as_deref()
-                    .map(|_| browser_href(actor, skip_reposts, None));
+                    .map(|cursor| {
+                        browser_href(actor, skip_reposts, oldest, limit_filter, Some(&cursor))
+                    });
+                let start = query.cursor.as_deref().map(|_| {
+                    browser_href(actor, skip_reposts, oldest, limit_filter, None)
+                });
                 (
                     items,
                     Some(templates::CursorPagination {
@@ -198,16 +282,36 @@ pub(super) async fn browser(
         start_href: None,
         next_href: None,
     });
+    // Fewer images than the feed limit: either repost filtering or the
+    // account simply running out — either way the top-up has nothing to
+    // raise (a same-cursor fetch at a higher limit would just re-walk this
+    // page), so render upfront with the stretched-flex fallback.
+    let fill_fallback = items.len() < effective_limit as usize;
 
     if actor.is_some() && is_htmx_request(&headers) {
         let fragment = templates::AccountGalleryGridTemplate {
             items,
             pagination,
             error,
+            limit: effective_limit,
+            fill_fallback,
         };
         Ok(askama_axum::into_response(&fragment))
     } else {
         let saved = saved_rows(&state).await;
+        let sort_options = BROWSER_SORTS
+            .iter()
+            .map(|sort| templates::SortOption {
+                label: sort.label,
+                href: actor
+                    .as_deref()
+                    .map(|actor| {
+                        browser_href(actor, skip_reposts, sort.oldest, limit_filter, None)
+                    })
+                    .unwrap_or_else(|| "/browser".to_string()),
+                selected: sort.oldest == oldest,
+            })
+            .collect();
         let template = templates::BrowserTemplate {
             version: templates::APP_VERSION,
             git_revision: templates::GIT_REVISION,
@@ -218,6 +322,9 @@ pub(super) async fn browser(
             pagination,
             error,
             saved,
+            sort_options,
+            limit: effective_limit,
+            fill_fallback,
         };
         Ok(askama_axum::into_response(&template))
     }
@@ -313,9 +420,96 @@ pub(super) async fn gallery_account_redirect(Query(query): Query<BrowserQuery>) 
         Some(actor) => browser_href(
             actor,
             query.skip_reposts.as_deref() == Some("on"),
+            parse_browser_sort(query.sort.as_deref()),
+            query.limit.map(clamp_feed_limit),
             query.cursor.as_deref(),
         ),
         None => "/browser".to_string(),
     };
     Redirect::to(&target).into_response()
+}
+
+// ---------------------------------------------------------------------
+// Like / bookmark actions (the lightbox buttons)
+// ---------------------------------------------------------------------
+
+/// Request body of the lightbox like/bookmark actions: the strong ref of
+/// the post to act on, taken straight off the grid item's
+/// `data-post-uri`/`data-post-cid` attributes.
+#[derive(Debug, Deserialize)]
+pub(super) struct PostActionForm {
+    uri: String,
+    cid: String,
+}
+
+/// Likes a post with the archiver account itself — the same account the
+/// likes/bookmarks poller archives from, so a like made here shows up in
+/// the next poll pass like any other.
+pub(super) async fn like_post(
+    State(state): State<WebState>,
+    Json(form): Json<PostActionForm>,
+) -> Response {
+    let Some(post_ref) = strong_ref(&form) else {
+        return action_error("missing post uri/cid");
+    };
+    action_response(state.app.bluesky.like_post(&post_ref).await, "Liked")
+}
+
+/// Bookmarks a post (`app.bsky.bookmark.createBookmark`, the same private
+/// bookmark store `getBookmarks` reads, so a bookmark made here is
+/// archived by the poller too).
+pub(super) async fn bookmark_post(
+    State(state): State<WebState>,
+    Json(form): Json<PostActionForm>,
+) -> Response {
+    let Some(post_ref) = strong_ref(&form) else {
+        return action_error("missing post uri/cid");
+    };
+    action_response(
+        state.app.bluesky.bookmark_post(&post_ref).await,
+        "Bookmarked",
+    )
+}
+
+/// Rejects forms whose fields are blank bodies before an API call is made.
+fn strong_ref(form: &PostActionForm) -> Option<crate::bluesky::StrongRef> {
+    let uri = form.uri.trim();
+    let cid = form.cid.trim();
+    (uri.starts_with("at://") && !cid.is_empty())
+        .then(|| crate::bluesky::StrongRef {
+            uri: uri.to_string(),
+            cid: cid.to_string(),
+        })
+}
+
+fn action_error(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "ok": false, "message": message })),
+    )
+        .into_response()
+}
+
+/// Shared response shape for the write actions: the lightbox JS `fetch`es
+/// them and flips the button into its done state on success; an upstream
+/// failure is a 502 with a short message the client surfaces.
+fn action_response(
+    result: Result<(), crate::bluesky::BlueskyError>,
+    done: &'static str,
+) -> Response {
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "state": done })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "bluesky write action failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "ok": false, "message": err.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }

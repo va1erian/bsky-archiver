@@ -1857,6 +1857,190 @@ async fn account_viewer_browses_live_pictures_with_repost_and_video_handling() {
     assert!(!body.contains("https://cdn.example.com/f9.jpg"));
     assert!(body.contains("https://cdn.example.com/f1.jpg"));
     assert!(body.contains("checked"), "the checkbox state is preserved");
+
+    // Every picture carries its post's strong ref for the lightbox's
+    // like/bookmark buttons.
+    assert!(body.contains("data-post-uri=\"at://did:plc:bob/app.bsky.feed.post/1\""));
+    assert!(body.contains("data-post-cid=\"cid-1\""));
+}
+
+#[tokio::test]
+async fn account_viewer_sort_reverses_the_page_and_survives_pagination() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    mount_ui_session(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(account_viewer_feed_page()))
+        .mount(&server)
+        .await;
+
+    let (_dir, state, _candidate_tx) =
+        test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    // Default (newest) keeps the API order: post 1's first image precedes
+    // its second.
+    let response = app.clone()
+        .oneshot(
+            Request::get("/browser?actor=bob.bsky.social&skip_reposts=on")
+                .header(header::COOKIE, cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+    assert!(body.find("f1.jpg") < body.find("f2.jpg"));
+    assert!(
+        body.contains("<option value=\"/browser?actor=bob%2Ebsky%2Esocial&amp;skip_reposts=on\" selected>"),
+        "the default run marks 'newest first' selected"
+    );
+
+    // Oldest reverses the page: post 1's images come back in the opposite
+    // order, the picker marks the option, and the "older" link keeps the
+    // sort so subsequent pages stay reversed.
+    let response = app
+        .oneshot(
+            Request::get("/browser?actor=bob.bsky.social&skip_reposts=on&sort=oldest")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+    assert!(body.find("f2.jpg") < body.find("f1.jpg"));
+    assert!(
+        body.contains("sort=oldest&amp;cursor=next"),
+        "the older link keeps the sort"
+    );
+    assert!(
+        body.contains("<option value=\"/browser?actor=bob%2Ebsky%2Esocial&amp;skip_reposts=on&amp;sort=oldest\" selected>"),
+        "the sort picker marks the active option"
+    );
+}
+
+#[tokio::test]
+async fn like_and_bookmark_actions_create_records_with_the_post_ref() {
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    mount_ui_session(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.createRecord"))
+        .and(body_partial_json(json!({
+            "collection": "app.bsky.feed.like",
+            "record": {
+                "subject": {
+                    "uri": "at://did:plc:bob/app.bsky.feed.post/1",
+                    "cid": "cid-1",
+                },
+            },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": "at://did:plc:alice/app.bsky.feed.like/abc",
+            "cid": "like-cid",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/app.bsky.bookmark.createBookmark"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let (_dir, state, _candidate_tx) =
+        test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let post = |endpoint: &str| {
+        let cookie = cookie.clone();
+        app.clone()
+            .oneshot(
+                Request::post(endpoint)
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "uri": "at://did:plc:bob/app.bsky.feed.post/1",
+                            "cid": "cid-1",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+    };
+
+    let response = post("/browser/like").await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("\"ok\":true"));
+    assert!(body.contains("Liked"));
+
+    let response = post("/browser/bookmark").await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("\"ok\":true"));
+    assert!(body.contains("Bookmarked"));
+
+    // A malformed ref is rejected with a 400 and no API write attempted.
+    let response = app
+        .oneshot(
+            Request::post("/browser/like")
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"uri": "not-a-uri", "cid": ""}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn browser_limit_param_drives_the_feed_page_size_and_persists_in_links() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    mount_ui_session(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("limit", "57"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(account_viewer_feed_page()))
+        .mount(&server)
+        .await;
+
+    let (_dir, state, _candidate_tx) =
+        test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let response = app
+        .oneshot(
+            Request::get("/browser?actor=bob.bsky.social&limit=57")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    // The wrapper echoes the effective limit for the fill top-up, and the
+    // "older" link keeps it so subsequent pages keep the alignment.
+    assert!(body.contains("data-fill-current=\"57\""));
+    assert!(
+        body.contains("&amp;limit=57&amp;cursor=next"),
+        "the older link keeps the limit"
+    );
 }
 
 #[tokio::test]

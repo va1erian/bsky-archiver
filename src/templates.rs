@@ -283,7 +283,7 @@ pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
         author: author_did_from_at_uri(&summary.at_uri).to_string(),
         excerpt: text.map(|t| excerpt(t, MAX_EXCERPT_CHARS)),
         detail_href: format!("/posts/{}", crate::web::encode_post_id(&summary.at_uri)),
-        indexed_at: summary.indexed_at.clone(),
+        indexed_at: display_time(&summary.indexed_at),
         media_count: summary.media_count,
         thumbnail: summary
             .thumbnail_filename
@@ -296,7 +296,7 @@ pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
                     category_label(summary.category)
                 ),
             }),
-        deleted_at: summary.deleted_at.clone(),
+        deleted_at: summary.deleted_at.as_deref().map(display_time),
     }
 }
 
@@ -377,6 +377,11 @@ pub struct GalleryItem {
     pub is_video: bool,
     pub post_href: String,
     pub alt: String,
+    /// Strong ref (AT-URI + CID) of the post the media belongs to, populated
+    /// only by the live browser view. Empty for archived media: the
+    /// lightbox's like/bookmark buttons only render when these are present.
+    pub post_uri: String,
+    pub post_cid: String,
 }
 
 pub fn gallery_item(summary: &MediaSummary) -> GalleryItem {
@@ -394,6 +399,29 @@ pub fn gallery_item(summary: &MediaSummary) -> GalleryItem {
             category_label(summary.category),
             author_did_from_at_uri(&summary.post_at_uri)
         ),
+        post_uri: String::new(),
+        post_cid: String::new(),
+    }
+}
+
+/// Renders a stored timestamp as an unambiguous `DD-MM-YYYY HH:MM:SS`
+/// (always zero-padded; the wall-clock of the stored offset — UTC for
+/// everything this app archives). Anything that doesn't parse as RFC3339
+/// renders as-is rather than blanking the page.
+pub fn display_time(rfc3339: &str) -> String {
+    use time::format_description::well_known::Rfc3339;
+
+    match time::OffsetDateTime::parse(rfc3339, &Rfc3339) {
+        Ok(timestamp) => format!(
+            "{:02}-{:02}-{:04} {:02}:{:02}:{:02}",
+            timestamp.day(),
+            u8::from(timestamp.month()),
+            timestamp.year(),
+            timestamp.hour(),
+            timestamp.minute(),
+            timestamp.second(),
+        ),
+        Err(_) => rfc3339.to_string(),
     }
 }
 
@@ -435,6 +463,12 @@ pub struct GalleryTemplate {
     pub category_options: Vec<CategoryOption>,
     pub sort_options: Vec<SortOption>,
     pub export: GalleryExport,
+    /// Page size echoed into the included gallery grid wrapper for the
+    /// client-side fill top-up (same value the pagination links carry).
+    pub page_size: u32,
+    /// Whether the included grid should render with the flex fallback
+    /// (see [`GalleryGridTemplate::fill_fallback`]).
+    pub fill_fallback: bool,
 }
 
 #[derive(Template)]
@@ -442,6 +476,13 @@ pub struct GalleryTemplate {
 pub struct GalleryGridTemplate {
     pub items: Vec<GalleryItem>,
     pub pagination: Pagination,
+    /// The currently effective page size, echoed on the grid wrapper for
+    /// the client-side fill top-up.
+    pub page_size: u32,
+    /// `true` when the page is the end of the list with fewer items than
+    /// the requested page size: there is nothing left to top up with, so
+    /// the grid renders with the stretched-flex fallback class up front.
+    pub fill_fallback: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -477,6 +518,14 @@ pub struct BrowserTemplate {
     pub pagination: CursorPagination,
     pub error: Option<String>,
     pub saved: Vec<SavedAccountRow>,
+    /// The sort picker's options, same shape as the gallery's.
+    pub sort_options: Vec<SortOption>,
+    /// Effective feed page limit echoed into the included grid wrapper for
+    /// the client-side fill top-up.
+    pub limit: u32,
+    /// Whether the included grid should render with the flex fallback
+    /// (see [`AccountGalleryGridTemplate::fill_fallback`]).
+    pub fill_fallback: bool,
 }
 
 /// One row of the browser's saved-accounts panel: a favorite handle with a
@@ -491,7 +540,7 @@ pub fn saved_account_row(account: &crate::storage::SavedAccount) -> SavedAccount
     SavedAccountRow {
         id: account.id,
         handle: account.handle.clone(),
-        added_at: account.added_at.clone(),
+        added_at: display_time(&account.added_at),
     }
 }
 
@@ -517,6 +566,13 @@ pub struct AccountGalleryGridTemplate {
     pub items: Vec<GalleryItem>,
     pub pagination: CursorPagination,
     pub error: Option<String>,
+    /// The currently effective feed page limit, echoed on the grid wrapper
+    /// for the client-side fill top-up.
+    pub limit: u32,
+    /// `true` when fewer images than the feed limit came back (a short or
+    /// exhausted account): the top-up can't raise a cursor page's depth
+    /// retroactively, so render with the stretched-flex fallback.
+    pub fill_fallback: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -584,7 +640,7 @@ pub fn source_row(source: &WatchedSource) -> SourceRow {
         kind_class,
         value: source.value.clone(),
         detail: source.did.clone(),
-        added_at: source.added_at.clone(),
+        added_at: display_time(&source.added_at),
     }
 }
 
@@ -647,6 +703,17 @@ mod tests {
             bluesky_post_url("at://did:plc:alice/app.bsky.feed.like/abc"),
             None
         );
+    }
+
+    #[test]
+    fn display_time_renders_day_month_year_dropping_subsecond_precision() {
+        assert_eq!(
+            display_time("2026-09-14T19:22:07.891100392Z"),
+            "14-09-2026 19:22:07"
+        );
+        assert_eq!(display_time("2026-01-03T04:05:06Z"), "03-01-2026 04:05:06");
+        // Unparseable strings render as-is instead of blanking the page.
+        assert_eq!(display_time("not a timestamp"), "not a timestamp");
     }
 
     #[test]

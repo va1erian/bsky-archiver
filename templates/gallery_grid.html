@@ -1,5 +1,5 @@
-<div id="gallery-grid">
-<div class="gallery-grid">
+<div id="gallery-grid" data-fill-param="page_size" data-fill-current="{{ page_size }}" data-fill-max="100">
+<div class="gallery-grid{% if fill_fallback %} cannot-fill{% endif %}">
 {% for item in items %}
 <figure class="item-card">
 <a class="gallery-item" href="{{ item.full_url }}" data-lightbox data-media-type="{% if item.is_video %}video{% else %}image{% endif %}" data-alt="{{ item.alt }}">

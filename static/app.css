@@ -30,8 +30,12 @@
   background: #059669;
 }
 
+/* Tumblr's own badge background is almost black; Pico's dark scheme sets
+   --pico-contrast-inverse to a dark ink too, so the label vanishes into the
+   badge unless pinned to white. */
 .badge-tumblr-like {
   background: #001935;
+  color: #fff;
 }
 
 .badge-account {
@@ -129,10 +133,28 @@
   overflow-wrap: anywhere;
 }
 
+/* Keep the auto-fill grid here: the *count* of items per page is chosen
+   client-side (the fill.js top-up re-requests the selection with a
+   page-size that is a multiple of the measured column count), so rows
+   fill edge-to-edge with uniform item widths in the common case.
+   Items on a short final line stretch via the `flex` rules below only
+   when the source is exhausted before a multiple could be fetched
+   (e.g. a small account's live feed), so blank gaps never appear. */
 .gallery-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
   gap: 0.75rem;
+}
+
+/* Fallback for un-toppable short pages: flex distribute, which lets the
+   final line's items share the leftover width instead of showing blanks. */
+.gallery-grid.cannot-fill {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.gallery-grid.cannot-fill > .item-card {
+  flex: 1 0 9rem;
 }
 
 .gallery-item {
@@ -352,6 +374,65 @@
 .lightbox-nav[disabled] {
   opacity: 0.3;
   pointer-events: none;
+}
+
+/* Like/bookmark action cluster, top-right beside the close button. The
+   Lucide glyphs render at their viewBox ratio; the `done` class swaps the
+   icon glyph for the check in the heartbeat/gold done colours. */
+.lightbox-actions {
+  position: absolute;
+  top: max(0.5rem, env(safe-area-inset-top));
+  right: max(3.75rem, calc(env(safe-area-inset-right) + 3.75rem));
+  display: flex;
+  gap: 0.5rem;
+  z-index: 2;
+}
+
+.lightbox-action {
+  width: 2.75rem;
+  height: 2.75rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.lightbox-action[hidden] {
+  display: none;
+}
+
+/* Both glyphs live in the button; which one shows is a class toggle. */
+.lightbox-action .icon-done {
+  display: none;
+}
+
+.lightbox-action.done .icon-action {
+  display: none;
+}
+
+.lightbox-action.done .icon-done {
+  display: block;
+}
+
+.lightbox-action.done#lightbox-like {
+  color: #ff4d79;
+}
+
+.lightbox-action.done#lightbox-bookmark {
+  color: #ffc531;
+}
+
+.lightbox-action:disabled {
+  opacity: 0.6;
+}
+
+.lightbox-action-error {
+  color: #ff8fa3;
+  font-size: 0.8rem;
+  align-self: center;
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.8);
+  white-space: nowrap;
 }
 
 .lightbox-counter {
@@ -738,6 +819,15 @@ a.gallery-item-thumb {
   .lightbox-nav {
     width: 44px;
     height: 44px;
+  }
+
+  .lightbox-action {
+    width: 44px;
+    height: 44px;
+  }
+
+  .lightbox-actions {
+    right: max(3.75rem, calc(env(safe-area-inset-right) + 3.75rem));
   }
 
   /* Sort selector follows the accent-picker's compact styling so it sits on

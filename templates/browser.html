@@ -22,14 +22,35 @@ Skip images from reposts
 {% endif %}
 {% if !actor.is_empty() %}
 <h2>Pictures posted by {{ actor }}</h2>
+<nav class="category-filter" aria-label="Sort">
+<span class="gallery-sort">
+<label for="browser-sort">Sort</label>
+<select id="browser-sort">
+{% for opt in sort_options %}
+<option value="{{ opt.href }}" {% if opt.selected %}selected{% endif %}>{{ opt.label }}</option>
+{% endfor %}
+</select>
+</span>
+</nav>
 {% include "account_gallery_grid.html" %}
 {% endif %}
 
 <script>
 (function () {
+  // Sort picker: navigate to the selected ordering like the gallery's
+  // picker does (its hrefs reset the cursor back to the newest page).
+  var select = document.getElementById("browser-sort");
+  if (select) {
+    select.addEventListener("change", function () {
+      if (select.value) window.location.href = select.value;
+    });
+  }
+
   // Same contract as the archive gallery: an "older posts" click swaps the
   // grid in place, so scroll back to the top of the new page.
   document.body.addEventListener("htmx:after:swap", function (event) {
+    // Same as the gallery: skip the scroll reset for the fill top-up.
+    if (window.__fillSkipScroll) return;
     var ctx = (event.detail || {}).ctx || {};
     var target = ctx.target;
     if (typeof target === "string") target = document.querySelector(target);
