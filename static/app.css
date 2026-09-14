@@ -2,6 +2,10 @@
    handles dark/light via prefers-color-scheme, so this file only adds
    the app-specific bits Pico doesn't know about. */
 
+.main-nav {
+  flex-wrap: wrap;
+}
+
 .badge {
   display: inline-block;
   padding: 0.1rem 0.55rem;
@@ -562,14 +566,11 @@ nav form {
 }
 
 @media (max-width: 767.98px) {
-  /* --- Mobile nav: the four links + Logout collapse behind a <details>
-     disclosure (no JS, inherits Pico's summary styling); the brand stays on the
-     row above. Letting the nav wrap drops the full-width toggle below the
-     brand. --- */
-  .main-nav {
-    flex-wrap: wrap;
-  }
-
+  /* --- Mobile nav: the links collapse behind a <details> disclosure (no JS,
+     inherits Pico's summary styling); the brand stays on the row above.
+     flex-wrap on .main-nav is already set globally (it lets the desktop row
+     wrap onto a second line when the six links + accent picker don't fit);
+     here the full-width menu drops below the brand row too. --- */
   .nav-menu {
     width: 100%;
   }
