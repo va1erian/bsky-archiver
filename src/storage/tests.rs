@@ -808,7 +808,7 @@ async fn opening_a_v1_database_upgrades_to_schema_v2_in_place() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "5");
+    assert_eq!(version, "6");
 
     // ...and the new table is usable immediately (no data had to move).
     assert!(store.list_watched_sources().await.unwrap().is_empty());

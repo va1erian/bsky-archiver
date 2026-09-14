@@ -1,9 +1,13 @@
 {% extends "base.html" %}
-{% block title %}Account gallery – bsky-archiver{% endblock %}
+{% block title %}Browser – bsky-archiver{% endblock %}
 {% block content %}
-<h1>Account gallery</h1>
+<h1>Browser</h1>
 <p>Browse the pictures an account posted on Bluesky, live — archived or not.</p>
-<form method="get" action="/gallery/account" class="account-viewer-form">
+{% include "saved_accounts_panel.html" %}
+
+<section class="account-viewer">
+<h2>Browse an account</h2>
+<form method="get" action="/browser" class="account-viewer-form">
 <label for="account-actor">Bluesky handle</label>
 <input type="text" id="account-actor" name="actor" value="{{ actor }}" placeholder="alice.bsky.social" autocomplete="off" {% if actor.is_empty() %}required{% endif %}>
 <label class="account-viewer-reposts">
@@ -12,6 +16,7 @@ Skip images from reposts
 </label>
 <button type="submit">Browse</button>
 </form>
+</section>
 {% if let Some(error) = error %}
 <p class="account-viewer-error" role="alert">{{ error }}</p>
 {% endif %}

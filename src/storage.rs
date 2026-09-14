@@ -147,6 +147,15 @@ pub struct WatchedSource {
     pub added_at: String,
 }
 
+/// One row of the `saved_accounts` table: a Bluesky account handle the UI's
+/// Browser page offers as a one-click favorite for live browsing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedAccount {
+    pub id: i64,
+    pub handle: String,
+    pub added_at: String,
+}
+
 /// Errors produced by the storage layer.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -457,7 +466,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// is what the Bluesky app actually displays — so the gallery's
 /// "bookmarked"/"liked" sorts key off the captured list position, falling
 /// back to archive order for rows not yet ranked.
-const SCHEMA_VERSION: i64 = 5;
+///
+/// Version 6 adds the `saved_accounts` table: the Browser page's
+/// UI-managed favorite accounts (handles), so a live browse is one click
+/// away instead of a handle re-type. Purely additive, like version 2.
+const SCHEMA_VERSION: i64 = 6;
 
 fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -504,6 +517,12 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
             added_at TEXT NOT NULL,
             UNIQUE(source_kind, source_value)
         );
+
+        CREATE TABLE IF NOT EXISTS saved_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            handle TEXT NOT NULL UNIQUE,
+            added_at TEXT NOT NULL
+        );
         ",
     )?;
 
@@ -533,6 +552,10 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     if previous_version < 5 {
         migrate_v4_to_v5(conn)?;
     }
+
+    // Version 6 only adds a table, which `CREATE TABLE IF NOT EXISTS`
+    // above already took care of for every prior version — no migration
+    // step needed.
 
     if current_version != Some(SCHEMA_VERSION) {
         conn.execute(
@@ -895,6 +918,69 @@ impl ArchiveStore {
             let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let affected =
                 conn.execute("DELETE FROM watched_sources WHERE id = ?1", params![id])?;
+            Ok(affected > 0)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Lists the Browser page's saved (favorite) accounts, oldest-added
+    /// first, from the `saved_accounts` table.
+    pub async fn list_saved_accounts(&self) -> Result<Vec<SavedAccount>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<SavedAccount>, StorageError> {
+                let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(
+                    "SELECT id, handle, added_at FROM saved_accounts ORDER BY added_at, id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(SavedAccount {
+                        id: row.get(0)?,
+                        handle: row.get(1)?,
+                        added_at: row.get(2)?,
+                    })
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await;
+        join_result(result)
+    }
+
+    /// Adds (or re-adds) a saved account by handle. Idempotent: the
+    /// `handle` is unique, so saving an already-saved handle refreshes
+    /// nothing and simply keeps the existing row (and its `added_at`).
+    /// Returns the row's id in both cases.
+    pub async fn add_saved_account(&self, handle: &str) -> Result<i64, StorageError> {
+        let db = Arc::clone(&self.db);
+        let handle = handle.to_string();
+        let added_at = now_rfc3339();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<i64, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT INTO saved_accounts (handle, added_at) VALUES (?1, ?2)
+                 ON CONFLICT(handle) DO NOTHING",
+                params![handle, added_at],
+            )?;
+            let id = conn.query_row(
+                "SELECT id FROM saved_accounts WHERE handle = ?1",
+                params![handle],
+                |row| row.get(0),
+            )?;
+            Ok(id)
+        })
+        .await;
+        join_result(result)
+    }
+
+    /// Removes a saved account by row id. Returns whether a row was
+    /// actually deleted (removing an already-absent id is a no-op `false`).
+    pub async fn remove_saved_account(&self, id: i64) -> Result<bool, StorageError> {
+        let db = Arc::clone(&self.db);
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let affected = conn.execute("DELETE FROM saved_accounts WHERE id = ?1", params![id])?;
             Ok(affected > 0)
         })
         .await;

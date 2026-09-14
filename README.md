@@ -28,9 +28,10 @@ view a gallery of archived media — filterable by category (posts / likes /
 bookmarks), sortable by archive time, the post's own `createdAt`, or the
 bookmark/like action ("Newest/Oldest bookmarked", which reproduces the order of
 Bluesky's own lists by keying off the item's captured list position; rows
-without a captured position fall back to archive time) — and downloadable as a
-single zip of every image in the current selection — and see the active (non-secret)
-configuration.
+without a captured position fall back to archive time) — downloadable as a
+single zip of every image in the current selection — see the active (non-secret)
+configuration — and browse any Bluesky account's picture feed live (with saved
+favorite accounts for one-click access) on the Browser page.
 
 Real-time capture of the watched accounts' own posts uses a Jetstream firehose
 subscription; a REST-polling path fully substitutes for it whenever the firehose

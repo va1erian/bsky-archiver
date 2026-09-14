@@ -424,7 +424,7 @@ pub struct GalleryGridTemplate {
 }
 
 // ---------------------------------------------------------------------
-// Account viewer (live /gallery/account)
+// Browser (live /browser, the former /gallery/account viewer)
 // ---------------------------------------------------------------------
 
 /// Cursor-based pagination for the account viewer: Bluesky's feed
@@ -440,13 +440,13 @@ pub struct CursorPagination {
     pub next_href: Option<String>,
 }
 
-/// The `/gallery/account` page: a handle form plus the live picture grid
-/// for the requested account. `actor` is empty on the first visit (no
-/// results yet); `error` carries an inline API failure (e.g. an
-/// unresolvable handle).
+/// The `/browser` page: the saved-accounts favorites panel, a handle form
+/// plus the live picture grid for the requested account. `actor` is empty
+/// on the first visit (no results yet); `error` carries an inline API
+/// failure (e.g. an unresolvable handle).
 #[derive(Template)]
-#[template(path = "account_gallery.html")]
-pub struct AccountGalleryTemplate {
+#[template(path = "browser.html")]
+pub struct BrowserTemplate {
     pub version: &'static str,
     pub git_revision: &'static str,
     pub build_date: &'static str,
@@ -455,9 +455,38 @@ pub struct AccountGalleryTemplate {
     pub items: Vec<GalleryItem>,
     pub pagination: CursorPagination,
     pub error: Option<String>,
+    pub saved: Vec<SavedAccountRow>,
 }
 
-/// The htmx fragment of [`AccountGalleryTemplate`]: the picture grid plus
+/// One row of the browser's saved-accounts panel: a favorite handle with a
+/// browse link and a remove action.
+pub struct SavedAccountRow {
+    pub id: i64,
+    pub handle: String,
+    pub added_at: String,
+}
+
+pub fn saved_account_row(account: &crate::storage::SavedAccount) -> SavedAccountRow {
+    SavedAccountRow {
+        id: account.id,
+        handle: account.handle.clone(),
+        added_at: account.added_at.clone(),
+    }
+}
+
+/// The favorites panel fragment: the current saved accounts with remove
+/// buttons, the add form, and an inline error slot. The `/browser/saved`
+/// add and `/browser/saved/:id` remove handlers both return this as an
+/// `outerHTML` swap of `#saved-accounts-panel`, the same pattern the
+/// config page's sources panel uses.
+#[derive(Template)]
+#[template(path = "saved_accounts_panel.html")]
+pub struct SavedAccountsPanelTemplate {
+    pub saved: Vec<SavedAccountRow>,
+    pub error: Option<String>,
+}
+
+/// The htmx fragment of [`BrowserTemplate`]: the picture grid plus
 /// its cursor pagination, swapped in place when the "older posts" link is
 /// clicked. Carries the inline error too, so a failed page load surfaces
 /// in the swapped fragment rather than as a misleading empty grid.

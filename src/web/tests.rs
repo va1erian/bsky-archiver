@@ -1651,7 +1651,7 @@ async fn non_htmx_source_mutation_redirects_to_config() {
 }
 
 // ---------------------------------------------------------------------
-// Account viewer (/gallery/account)
+// Browser (/browser: the account viewer + saved favorites)
 // ---------------------------------------------------------------------
 
 /// A getAuthorFeed page (`filter=posts_with_media`) mixing an authored
@@ -1724,7 +1724,7 @@ async fn account_gallery_without_actor_renders_just_the_form() {
 
     let response = app
         .oneshot(
-            Request::get("/gallery/account")
+            Request::get("/browser")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1734,7 +1734,7 @@ async fn account_gallery_without_actor_renders_just_the_form() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
 
-    assert!(body.contains("Account gallery"));
+    assert!(body.contains("Browser"));
     assert!(body.contains("name=\"actor\""));
     assert!(body.contains("name=\"skip_reposts\""));
     assert!(
@@ -1766,7 +1766,7 @@ async fn account_viewer_browses_live_pictures_with_repost_and_video_handling() {
     let response = app
         .clone()
         .oneshot(
-            Request::get("/gallery/account?actor=bob.bsky.social")
+            Request::get("/browser?actor=bob.bsky.social")
                 .header(header::COOKIE, cookie.clone())
                 .body(Body::empty())
                 .unwrap(),
@@ -1797,7 +1797,7 @@ async fn account_viewer_browses_live_pictures_with_repost_and_video_handling() {
     // With the repost option on, the repost's picture is skipped.
     let response = app
         .oneshot(
-            Request::get("/gallery/account?actor=bob.bsky.social&skip_reposts=on")
+            Request::get("/browser?actor=bob.bsky.social&skip_reposts=on")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1834,7 +1834,7 @@ async fn account_viewer_shows_an_inline_error_when_the_feed_fails() {
 
     let response = app
         .oneshot(
-            Request::get("/gallery/account?actor=nobody.bsky.social")
+            Request::get("/browser?actor=nobody.bsky.social")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1848,4 +1848,172 @@ async fn account_viewer_shows_an_inline_error_when_the_feed_fails() {
         "the failure is shown inline: {body}"
     );
     assert!(body.contains("role=\"alert\""));
+}
+
+// ---------------------------------------------------------------------
+// Saved accounts (favorites) on /browser
+// ---------------------------------------------------------------------
+
+async fn add_saved_form(
+    app: &Router,
+    cookie: &str,
+    body: &str,
+    htmx: bool,
+) -> (StatusCode, String) {
+    let mut request_builder = Request::post("/browser/saved")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if htmx {
+        request_builder = request_builder.header("HX-Request", "true");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder
+                .header(header::COOKIE, cookie)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = body_string(response).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn browser_page_shows_saved_accounts_and_the_add_strips_the_at_sign() {
+    let (_dir, state) = test_state().await;
+    state
+        .store
+        .add_saved_account("alice.bsky.social")
+        .await
+        .expect("seed saved account");
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/browser")
+                .header(header::COOKIE, cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Saved accounts"));
+    assert!(body.contains("alice.bsky.social"));
+    assert!(body.contains("action=\"/browser/saved/1\""));
+
+    // Saving strips the leading @ so the stored (and browsed) handle stays
+    // uniform.
+    let (status, panel) = add_saved_form(&app, &cookie, "handle=%40bob.bsky.social", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(panel.contains("bob.bsky.social"));
+    let saved = state.store.list_saved_accounts().await.unwrap();
+    let handles: Vec<_> = saved.iter().map(|a| a.handle.as_str()).collect();
+    assert_eq!(handles, vec!["alice.bsky.social", "bob.bsky.social"]);
+}
+
+#[tokio::test]
+async fn re_saving_a_saved_handle_stays_a_single_row() {
+    let (_dir, state) = test_state().await;
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let (status, _) = add_saved_form(&app, &cookie, "handle=bob.bsky.social", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = add_saved_form(&app, &cookie, "handle=bob.bsky.social", true).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let saved = state.store.list_saved_accounts().await.unwrap();
+    assert_eq!(saved.len(), 1);
+}
+
+#[tokio::test]
+async fn removing_a_saved_account_via_htmx_swaps_the_panel_without_it() {
+    let (_dir, state) = test_state().await;
+    state
+        .store
+        .add_saved_account("alice.bsky.social")
+        .await
+        .unwrap();
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let response = app
+        .oneshot(
+            Request::post("/browser/saved/1")
+                .header("HX-Request", "true")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("No saved accounts yet"));
+    assert!(state.store.list_saved_accounts().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn non_htmx_saved_account_mutation_redirects_to_the_browser() {
+    let (_dir, state) = test_state().await;
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/browser/saved")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, &cookie)
+                .body(Body::from("handle=dave.bsky.social"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/browser"
+    );
+    let saved = state.store.list_saved_accounts().await.unwrap();
+    assert_eq!(
+        saved.iter().map(|a| a.handle.as_str()).collect::<Vec<_>>(),
+        vec!["dave.bsky.social"]
+    );
+}
+
+#[tokio::test]
+async fn old_gallery_account_url_redirects_to_the_browser() {
+    let (_dir, state) = test_state().await;
+    let app = router(state);
+    let cookie = login(&app).await;
+
+    let response = app
+        .oneshot(
+            Request::get("/gallery/account?actor=bob.bsky.social&skip_reposts=on")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("/browser?actor=bob%2Ebsky%2Esocial"),
+        "location: {location}"
+    );
+    assert!(location.contains("skip_reposts=on"));
 }
