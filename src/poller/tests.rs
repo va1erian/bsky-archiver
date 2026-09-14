@@ -252,6 +252,86 @@ async fn empty_feed_is_not_treated_as_new_content() {
     assert_eq!(new_count, 0);
 }
 
+#[tokio::test]
+async fn repost_items_are_skipped_and_never_a_dedup_boundary() {
+    let server = MockServer::start().await;
+    mount_login(&server).await;
+    let (_dir, store) = open_store().await;
+
+    // An old post, already archived. The account then reposted it (which
+    // appears at the very top of getAuthorFeed) and reposted someone
+    // else's media post, before authoring a newer media post of their own.
+    let old_uri = "at://did:plc:alice/app.bsky.feed.post/1";
+    store
+        .save_post(Category::Post, old_uri, "cid-1", json!({}))
+        .await
+        .unwrap();
+
+    let repost_of_own = json!({
+        "reason": {"$type": "app.bsky.feed.defs#reasonRepost", "by": {"did": "did:plc:alice"}},
+        "post": {
+            "uri": old_uri,
+            "cid": "cid-1",
+            "author": {"did": "did:plc:alice"},
+            "record": {"text": "old"},
+            "embed": {
+                "$type": "app.bsky.embed.images#view",
+                "images": [{"fullsize": "https://cdn.example.com/old.jpg"}],
+            },
+        }
+    });
+    let repost_of_foreign = json!({
+        "reason": {"$type": "app.bsky.feed.defs#reasonRepost", "by": {"did": "did:plc:alice"}},
+        "post": {
+            "uri": "at://did:plc:bob/app.bsky.feed.post/9",
+            "cid": "cid-9",
+            "author": {"did": "did:plc:bob"},
+            "record": {
+                "text": "someone else's picture",
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{"alt": "", "image": {"ref": "bafy"}}],
+                }
+            },
+            "embed": {
+                "$type": "app.bsky.embed.images#view",
+                "images": [{"fullsize": "https://cdn.example.com/bob.jpg"}],
+            },
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [repost_of_own, repost_of_foreign, feed_view_post(2, true)],
+            "cursor": null,
+        })))
+        .mount(&server)
+        .await;
+
+    let (tx, mut rx) = candidate_post_channel(8);
+    let client = test_client(&server);
+    let new_count = poll_handle_once(&client, &store, &tx, "alice.bsky.social", 50)
+        .await
+        .expect("poll succeeds");
+
+    // Neither repost is archived (a repost is not an authored post), and
+    // the repost of the already-archived old post must not stop the walk
+    // before the newer authored post is reached.
+    assert_eq!(new_count, 1);
+    drop(tx);
+    let sent = rx.recv().await.expect("candidate sent");
+    assert_eq!(sent.at_uri, "at://did:plc:alice/app.bsky.feed.post/2");
+    assert!(rx.recv().await.is_none());
+
+    assert!(
+        !store
+            .is_archived(Category::Post, "at://did:plc:bob/app.bsky.feed.post/9")
+            .await
+            .unwrap()
+    );
+}
+
 #[test]
 fn adaptive_interval_grows_on_empty_and_error_then_resets_on_content() {
     let baseline = Duration::from_secs(10);

@@ -71,12 +71,14 @@ pub fn build_pagination(
     let next_href = (page < total_pages).then(|| href_for(page + 1));
     let last_href = (page < total_pages).then(|| href_for(total_pages));
 
-    // The numbered window is fixed-width (5 when there are enough pages)
+    // The numbered window is fixed-width (3 when there are enough pages)
     // rather than shrinking at the range edges: a centred window would go
-    // 3-4-5 links wide as you page, resizing the switcher on every click.
+    // 2-3-4 links wide as you page, resizing the switcher on every click.
     // The start is clamped twice so the window slides up against the last
-    // page instead of overrunning it.
-    const PAGE_LINK_WINDOW: u32 = 5;
+    // page instead of overrunning it. Three is as wide as the switcher
+    // gets: five overflowed the mobile viewport (first/prev + five numbers
+    // + next/last + the page meta line).
+    const PAGE_LINK_WINDOW: u32 = 3;
     let page_links = if total_pages == 0 {
         Vec::new()
     } else {
@@ -422,6 +424,52 @@ pub struct GalleryGridTemplate {
 }
 
 // ---------------------------------------------------------------------
+// Account viewer (live /gallery/account)
+// ---------------------------------------------------------------------
+
+/// Cursor-based pagination for the account viewer: Bluesky's feed
+/// endpoints paginate by opaque cursor (page numbers don't exist), so the
+/// switcher is an "older posts" link plus a way back to the newest page.
+/// The lightbox continues past the last image of a page via the
+/// `rel="next"` link, exactly as it does for the numbered gallery.
+#[derive(Debug, Clone)]
+pub struct CursorPagination {
+    /// Link back to the newest page (absent when already there).
+    pub start_href: Option<String>,
+    /// Link to the next (older) page, when the API returned a cursor.
+    pub next_href: Option<String>,
+}
+
+/// The `/gallery/account` page: a handle form plus the live picture grid
+/// for the requested account. `actor` is empty on the first visit (no
+/// results yet); `error` carries an inline API failure (e.g. an
+/// unresolvable handle).
+#[derive(Template)]
+#[template(path = "account_gallery.html")]
+pub struct AccountGalleryTemplate {
+    pub version: &'static str,
+    pub git_revision: &'static str,
+    pub build_date: &'static str,
+    pub actor: String,
+    pub skip_reposts: bool,
+    pub items: Vec<GalleryItem>,
+    pub pagination: CursorPagination,
+    pub error: Option<String>,
+}
+
+/// The htmx fragment of [`AccountGalleryTemplate`]: the picture grid plus
+/// its cursor pagination, swapped in place when the "older posts" link is
+/// clicked. Carries the inline error too, so a failed page load surfaces
+/// in the swapped fragment rather than as a misleading empty grid.
+#[derive(Template)]
+#[template(path = "account_gallery_grid.html")]
+pub struct AccountGalleryGridTemplate {
+    pub items: Vec<GalleryItem>,
+    pub pagination: CursorPagination,
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------
 // Login
 // ---------------------------------------------------------------------
 
@@ -604,13 +652,14 @@ mod tests {
                 .map(|link| link.number)
                 .collect()
         };
-        // Five links on every page once there are five pages: flush at the
-        // edges, centred in the middle, never resizing between clicks.
-        assert_eq!(numbers(1, 10), vec![1, 2, 3, 4, 5]);
-        assert_eq!(numbers(3, 10), vec![1, 2, 3, 4, 5]);
-        assert_eq!(numbers(5, 10), vec![3, 4, 5, 6, 7]);
-        assert_eq!(numbers(8, 10), vec![6, 7, 8, 9, 10]);
-        assert_eq!(numbers(10, 10), vec![6, 7, 8, 9, 10]);
+        // Three links on every page once there are three pages: flush at
+        // the edges, centred in the middle, never resizing between clicks.
+        // (Five overflowed the mobile page switcher.)
+        assert_eq!(numbers(1, 10), vec![1, 2, 3]);
+        assert_eq!(numbers(2, 10), vec![1, 2, 3]);
+        assert_eq!(numbers(5, 10), vec![4, 5, 6]);
+        assert_eq!(numbers(9, 10), vec![8, 9, 10]);
+        assert_eq!(numbers(10, 10), vec![8, 9, 10]);
         // Fewer pages than the window: show all of them.
         assert_eq!(numbers(2, 3), vec![1, 2, 3]);
         assert_eq!(numbers(1, 1), vec![1]);

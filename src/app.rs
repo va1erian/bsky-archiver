@@ -298,6 +298,48 @@ pub async fn serve(started: Started) {
     // Every producer above holds its own clone of `candidate_tx`; dropping
     // this one is what lets the channel close (and the media downloader
     // drain and stop) once all the producer tasks have actually ended.
+    //
+    // Before that, one startup catch-up: walk every watched account's feed
+    // once, regardless of firehose health. The firehose resumes from its
+    // persisted cursor, but Jetstream only replays a limited window —
+    // anything posted during a longer outage would be silently skipped
+    // forever, because the REST fallback only runs while the firehose is
+    // *down*, not after a clean reconnect. The walk stops at each account's
+    // dedup boundary, so a healthy archive costs one page fetch per account.
+    let catch_up_accounts: Vec<String> = state
+        .watchlist
+        .snapshot()
+        .iter()
+        .filter(|source| source.kind == SourceKind::Account)
+        .map(|source| source.value.clone())
+        .collect();
+    if !catch_up_accounts.is_empty() {
+        let client = Arc::clone(&bluesky_client);
+        let store = state.store.clone();
+        let sender = candidate_tx.clone();
+        tokio::spawn(async move {
+            for account in catch_up_accounts {
+                match crate::poller::backfill_account_once(&client, &store, &sender, &account).await
+                {
+                    Ok(new_count) => {
+                        tracing::info!(
+                            handle = %account,
+                            new_count,
+                            "startup catch-up walk complete"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            handle = %account,
+                            error = %err,
+                            "startup catch-up walk failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     drop(candidate_tx);
 
     let media_handle = tokio::spawn(run_media_downloader_supervised(

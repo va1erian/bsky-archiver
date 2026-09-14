@@ -511,3 +511,111 @@ async fn sweep_backfills_action_time_for_already_archived_bookmarks() {
         "the sweep should backfill the bookmark action time"
     );
 }
+
+/// The missing-media heal re-queues authored posts whose record declares
+/// more media than is stored (a failed download), flowing them through the
+/// candidate channel as `Authored` candidates built from the stored
+/// record's blob references.
+#[tokio::test]
+async fn sweep_requeues_media_for_authored_posts_stored_incomplete() {
+    let server = MockServer::start().await;
+    mount_login(&server).await;
+    let (_dir, store) = open_store().await;
+
+    // An authored post with two declared images but only one stored.
+    let uri = "at://did:plc:alice/app.bsky.feed.post/1";
+    store
+        .save_post(
+            Category::Post,
+            uri,
+            "cid-1",
+            json!({
+                "text": "two images, one stored",
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [
+                        {"image": {"ref": {"$link": "bafy1"}, "mimeType": "image/jpeg", "size": 10}},
+                        {"image": {"ref": {"$link": "bafy2"}, "mimeType": "image/jpeg", "size": 10}},
+                    ],
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .save_media(
+            Category::Post,
+            uri,
+            "000.jpg",
+            Some("image/jpeg".to_string()),
+            b"jpg".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    // A complete authored post: nothing to heal.
+    let complete = "at://did:plc:alice/app.bsky.feed.post/2";
+    store
+        .save_post(
+            Category::Post,
+            complete,
+            "cid-2",
+            json!({
+                "text": "one image, stored",
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [
+                        {"image": {"ref": {"$link": "bafy3"}, "mimeType": "image/jpeg", "size": 10}},
+                    ],
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .save_media(
+            Category::Post,
+            complete,
+            "000.jpg",
+            Some("image/jpeg".to_string()),
+            b"jpg".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    for endpoint in [
+        "/xrpc/app.bsky.bookmark.getBookmarks",
+        "/xrpc/app.bsky.feed.getActorLikes",
+        "/xrpc/app.bsky.feed.getPosts",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+    }
+
+    let (tx, mut rx) = candidate_post_channel(8);
+    let summary = {
+        let sweeper = NightlySweeper::new(
+            make_client(&server),
+            store.clone(),
+            tx.clone(),
+            "did:plc:alice".to_string(),
+            3,
+        );
+        sweeper.sweep_once().await.expect("sweep succeeds")
+    };
+    // The sweeper (and its sender clone) is dropped above, so `drop(tx)`
+    // below actually closes the channel and the final recv returns None.
+
+    assert_eq!(summary.media_requeued, 1, "only the incomplete post");
+    drop(tx);
+    let candidate = rx.recv().await.expect("re-queued candidate");
+    assert_eq!(candidate.at_uri, uri);
+    assert_eq!(candidate.category, PostCategory::Authored);
+    assert_eq!(candidate.media.len(), 2);
+    assert!(candidate.media[0].cdn_url.contains("bafy1"));
+    assert!(candidate.media[1].cdn_url.contains("bafy2"));
+    assert!(rx.recv().await.is_none(), "the complete post is untouched");
+}

@@ -430,7 +430,35 @@ impl BlueskyClient {
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<AuthorFeedPage, BlueskyError> {
+        self.get_author_feed_page(actor, cursor, limit, None).await
+    }
+
+    /// Fetches one page of `actor`'s feed restricted to posts with media
+    /// (`app.bsky.feed.getAuthorFeed` with `filter=posts_with_media`),
+    /// newest-first. Used by the gallery's live account viewer, which only
+    /// wants pictures. Reposts of media posts still appear (with a
+    /// `reason`), so callers filter those themselves.
+    pub async fn get_author_feed_media(
+        &self,
+        actor: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<AuthorFeedPage, BlueskyError> {
+        self.get_author_feed_page(actor, cursor, limit, Some("posts_with_media"))
+            .await
+    }
+
+    async fn get_author_feed_page(
+        &self,
+        actor: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        filter: Option<&str>,
+    ) -> Result<AuthorFeedPage, BlueskyError> {
         let mut query = vec![("actor", actor.to_string()), ("limit", limit.to_string())];
+        if let Some(filter) = filter {
+            query.push(("filter", filter.to_string()));
+        }
         if let Some(cursor) = cursor {
             query.push(("cursor", cursor.to_string()));
         }
@@ -612,6 +640,28 @@ mod tests {
             .get_author_feed("alice.bsky.social", Some("page-2"), 50)
             .await
             .expect("get author feed with cursor");
+    }
+
+    #[tokio::test]
+    async fn get_author_feed_media_requests_the_media_filter() {
+        let server = MockServer::start().await;
+        mock_session(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+            .and(query_param("filter", "posts_with_media"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "feed": [],
+                "cursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        client
+            .get_author_feed_media("bob.bsky.social", None, 50)
+            .await
+            .expect("get author feed media page");
     }
 
     #[tokio::test]

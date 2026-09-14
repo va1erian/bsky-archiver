@@ -17,7 +17,11 @@
 //!    reports as `notFound` (deleted upstream) with a `deleted_at`
 //!    timestamp;
 //! 2. walks the account's entire like list the same way;
-//! 3. batch-verifies (`app.bsky.feed.getPosts`, up to
+//! 3. re-queues the media of every authored post whose on-disk record
+//!    declares more media than is actually stored — a download that failed
+//!    or was interrupted leaves the record archived but pictures missing,
+//!    and unlike likes/bookmarks nothing else ever revisits authored posts;
+//! 4. batch-verifies (`app.bsky.feed.getPosts`, up to
 //!    [`VERIFY_BATCH_SIZE`] URIs per call) every URI already archived under
 //!    the like/bookmark categories — catching deletions that happened
 //!    while the service was down, or of posts no longer in either list —
@@ -38,7 +42,9 @@ use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
 use crate::bluesky::BlueskyClient;
-use crate::pipeline::{CandidatePostSender, PostCategory};
+use crate::pipeline::{
+    CandidatePost, CandidatePostSender, PostCategory, extract_media_from_record,
+};
 use crate::poller::{PAGE_SIZE, PollError, archive_like_bookmark_post};
 use crate::storage::{ArchiveStore, Category};
 
@@ -77,6 +83,8 @@ pub struct SweepSummary {
     pub newly_archived: usize,
     /// Archived posts newly marked deleted (first `deleted_at` write).
     pub newly_marked_deleted: usize,
+    /// Authored posts whose missing media was re-queued for download.
+    pub media_requeued: usize,
 }
 
 /// Runs the nightly likes/bookmarks deletion sweep forever, at a fixed
@@ -121,6 +129,7 @@ impl NightlySweeper {
                         info!(
                             newly_archived = summary.newly_archived,
                             newly_marked_deleted = summary.newly_marked_deleted,
+                            media_requeued = summary.media_requeued,
                             "likes/bookmarks sweep complete"
                         );
                         break;
@@ -146,9 +155,10 @@ impl NightlySweeper {
         }
     }
 
-    /// One full sweep: walk the bookmark list, walk the like list, then
-    /// batch-verify every archived like/bookmark URI. Each step commits as
-    /// it goes; an `Ok` return means every step ran to completion.
+    /// One full sweep: walk the bookmark list, walk the like list, re-queue
+    /// the media of authored posts that stored incomplete, then batch-verify
+    /// every archived like/bookmark URI. Each step commits as it goes; an
+    /// `Ok` return means every step ran to completion.
     pub async fn sweep_once(&self) -> Result<SweepSummary, SweepError> {
         let mut summary = SweepSummary::default();
 
@@ -157,6 +167,7 @@ impl NightlySweeper {
         summary.newly_marked_deleted += bookmarks_marked;
 
         summary.newly_archived += self.walk_likes().await?;
+        summary.media_requeued += self.heal_missing_authored_media().await?;
         summary.newly_marked_deleted += self.verify_archived().await?;
 
         Ok(summary)
@@ -277,6 +288,44 @@ impl NightlySweeper {
         Ok(newly_archived)
     }
 
+    /// Re-queues the media of every authored post whose on-disk record
+    /// declares more media than the index holds. Unlike likes/bookmarks
+    /// (which every poll pass and this sweep revisit), an authored post
+    /// whose media download failed or was interrupted is never seen again
+    /// by any walk — the REST dedup boundary stops at the first archived
+    /// post — so without this pass its pictures would be missing forever.
+    ///
+    /// The re-queued candidates flow through the same producer -> downloader
+    /// channel as fresh posts; the downloader re-saves the (unchanged)
+    /// record as a no-op and appends the missing media files.
+    async fn heal_missing_authored_media(&self) -> Result<usize, SweepError> {
+        let missing = self.store.list_posts_with_missing_media().await?;
+        let mut requeued = 0usize;
+        for post in missing {
+            let author_did = author_did_from_at_uri(&post.at_uri);
+            let media = extract_media_from_record(&post.record, author_did);
+            if media.is_empty() {
+                debug!(at_uri = %post.at_uri, "sweep: missing-media post yielded no downloadable refs; skipping");
+                continue;
+            }
+            let candidate = CandidatePost {
+                at_uri: post.at_uri.clone(),
+                cid: post.cid.clone(),
+                author_did: author_did.to_string(),
+                category: PostCategory::Authored,
+                record: post.record.clone(),
+                media,
+            };
+            if self.sender.send(candidate).await.is_err() {
+                warn!("candidate post channel closed; stopping the missing-media heal early");
+                break;
+            }
+            requeued += 1;
+            info!(at_uri = %post.at_uri, "sweep: re-queued media for an authored post stored incomplete");
+        }
+        Ok(requeued)
+    }
+
     /// Batch-verifies every URI archived under the like/bookmark
     /// categories and marks the ones the API reports as not found —
     /// deleted upstream, or the author's account was deactivated — with a
@@ -319,6 +368,15 @@ impl NightlySweeper {
 /// configurable rather than hardcoded.
 fn local_now() -> OffsetDateTime {
     OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc())
+}
+
+/// The DID embedded in an `at://did:.../collection/rkey` URI, for building
+/// the CDN URLs a stored record's blob references are fetchable at.
+fn author_did_from_at_uri(at_uri: &str) -> &str {
+    at_uri
+        .strip_prefix("at://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(at_uri)
 }
 
 /// Duration from `now` until the next occurrence of `local_hour`:00 local

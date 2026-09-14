@@ -63,6 +63,7 @@ pub fn router(app: SharedAppState) -> Router {
         .route("/posts", get(posts::list_posts))
         .route("/posts/:id", get(posts::post_detail))
         .route("/gallery", get(gallery::gallery))
+        .route("/gallery/account", get(gallery::gallery_account))
         .route("/gallery/export", get(gallery::gallery_export))
         .route("/config", get(config::config_view))
         .route("/media/:category/:id/:filename", get(media::media_file))

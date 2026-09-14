@@ -1268,3 +1268,120 @@ fn stored_media_corruption_signatures() {
         "a real MP4 header is not corruption"
     );
 }
+
+/// The missing-media scan flags authored posts whose record declares more
+/// media than is stored — a failed download — while complete posts,
+/// text-only posts, other categories, and deleted posts are left alone.
+#[tokio::test]
+async fn list_posts_with_missing_media_flags_only_incomplete_authored_posts() {
+    let (_dir, store) = open_store().await;
+
+    // Complete: two declared images, two stored.
+    let complete = "at://did:plc:alice/app.bsky.feed.post/complete";
+    store
+        .save_post(
+            Category::Post,
+            complete,
+            "cid-complete",
+            json!({
+                "text": "two images",
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{}, {}],
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    for name in ["000.jpg", "001.jpg"] {
+        store
+            .save_media(
+                Category::Post,
+                complete,
+                name,
+                Some("image/jpeg".to_string()),
+                b"jpg".to_vec(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Incomplete: two declared images, only one stored (a download failed).
+    let incomplete = "at://did:plc:alice/app.bsky.feed.post/incomplete";
+    store
+        .save_post(
+            Category::Post,
+            incomplete,
+            "cid-incomplete",
+            json!({
+                "text": "two images, one stored",
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{}, {}],
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .save_media(
+            Category::Post,
+            incomplete,
+            "000.jpg",
+            Some("image/jpeg".to_string()),
+            b"jpg".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    // Text-only: declares nothing, stores nothing — complete by definition.
+    store
+        .save_post(
+            Category::Post,
+            "at://did:plc:alice/app.bsky.feed.post/text",
+            "cid-text",
+            json!({"text": "no embed"}),
+        )
+        .await
+        .unwrap();
+
+    // A like whose media download failed is out of scope (likes/bookmarks
+    // are healed by their own walk revisits, not this scan).
+    let like = "at://did:plc:bob/app.bsky.feed.post/like";
+    store
+        .save_post(
+            Category::Like,
+            like,
+            "cid-like",
+            json!({
+                "embed": {"$type": "app.bsky.embed.images", "images": [{}]},
+            }),
+        )
+        .await
+        .unwrap();
+
+    // A deleted authored post: its media may legitimately be un-fetchable.
+    let deleted = "at://did:plc:alice/app.bsky.feed.post/deleted";
+    store
+        .save_post(
+            Category::Post,
+            deleted,
+            "cid-deleted",
+            json!({
+                "embed": {"$type": "app.bsky.embed.images", "images": [{}]},
+            }),
+        )
+        .await
+        .unwrap();
+    store.mark_post_deleted(deleted).await.unwrap();
+
+    let missing = store.list_posts_with_missing_media().await.unwrap();
+    let uris: Vec<_> = missing.iter().map(|p| p.at_uri.clone()).collect();
+    assert_eq!(uris, vec![incomplete.to_string()]);
+    assert_eq!(missing[0].cid, "cid-incomplete");
+    // The record is returned so the sweeper can re-queue from its blobs.
+    assert_eq!(
+        missing[0].record["embed"]["$type"],
+        json!("app.bsky.embed.images")
+    );
+}

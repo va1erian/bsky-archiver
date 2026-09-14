@@ -1649,3 +1649,203 @@ async fn non_htmx_source_mutation_redirects_to_config() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(body, "");
 }
+
+// ---------------------------------------------------------------------
+// Account viewer (/gallery/account)
+// ---------------------------------------------------------------------
+
+/// A getAuthorFeed page (`filter=posts_with_media`) mixing an authored
+/// two-image post, a repost of someone else's picture, and a video post.
+fn account_viewer_feed_page() -> serde_json::Value {
+    json!({
+        "feed": [
+            {
+                "post": {
+                    "uri": "at://did:plc:bob/app.bsky.feed.post/1",
+                    "cid": "cid-1",
+                    "author": {"did": "did:plc:bob"},
+                    "record": {"text": "two pics"},
+                    "embed": {
+                        "$type": "app.bsky.embed.images#view",
+                        "images": [
+                            {
+                                "thumb": "https://cdn.example.com/t1.jpg",
+                                "fullsize": "https://cdn.example.com/f1.jpg",
+                                "alt": "first pic",
+                            },
+                            {
+                                "thumb": "https://cdn.example.com/t2.jpg",
+                                "fullsize": "https://cdn.example.com/f2.jpg",
+                                "alt": "",
+                            },
+                        ],
+                    },
+                }
+            },
+            {
+                "reason": {"$type": "app.bsky.feed.defs#reasonRepost", "by": {"did": "did:plc:bob"}},
+                "post": {
+                    "uri": "at://did:plc:carol/app.bsky.feed.post/9",
+                    "cid": "cid-9",
+                    "author": {"did": "did:plc:carol"},
+                    "record": {"text": "carol's pic"},
+                    "embed": {
+                        "$type": "app.bsky.embed.images#view",
+                        "images": [{
+                            "thumb": "https://cdn.example.com/t9.jpg",
+                            "fullsize": "https://cdn.example.com/f9.jpg",
+                            "alt": "carol's",
+                        }],
+                    },
+                }
+            },
+            {
+                "post": {
+                    "uri": "at://did:plc:bob/app.bsky.feed.post/2",
+                    "cid": "cid-2",
+                    "author": {"did": "did:plc:bob"},
+                    "record": {"text": "a video"},
+                    "embed": {
+                        "$type": "app.bsky.embed.video#view",
+                        "playlist": "https://video.example.com/playlist.m3u8",
+                    },
+                }
+            },
+        ],
+        "cursor": "next-cursor",
+    })
+}
+
+#[tokio::test]
+async fn account_gallery_without_actor_renders_just_the_form() {
+    let (_dir, state) = test_state().await;
+    let app = router(state);
+    let cookie = login(&app).await;
+
+    let response = app
+        .oneshot(
+            Request::get("/gallery/account")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    assert!(body.contains("Account gallery"));
+    assert!(body.contains("name=\"actor\""));
+    assert!(body.contains("name=\"skip_reposts\""));
+    assert!(
+        !body.contains("id=\"account-gallery-grid\""),
+        "no grid before an actor is given"
+    );
+}
+
+#[tokio::test]
+async fn account_viewer_browses_live_pictures_with_repost_and_video_handling() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    mount_ui_session(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", "bob.bsky.social"))
+        .and(query_param("filter", "posts_with_media"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(account_viewer_feed_page()))
+        .mount(&server)
+        .await;
+
+    let (_dir, state, _candidate_tx) =
+        test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/gallery/account?actor=bob.bsky.social")
+                .header(header::COOKIE, cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    // Authored pictures render (thumbnail in the grid, fullsize for the
+    // lightbox), with the empty alt filled in.
+    assert!(body.contains("https://cdn.example.com/t1.jpg"));
+    assert!(body.contains("https://cdn.example.com/f1.jpg"));
+    assert!(body.contains("data-alt=\"first pic\""));
+    assert!(body.contains("data-alt=\"Picture from bob.bsky.social\""));
+    // The repost's picture is included by default...
+    assert!(body.contains("https://cdn.example.com/f9.jpg"));
+    // ...videos are not (the viewer is pictures-only)...
+    assert!(!body.contains("playlist.m3u8"));
+    // ...and each picture links back to its post on bsky.app.
+    assert!(body.contains("https://bsky.app/profile/did:plc:bob/post/1"));
+
+    // The API returned a cursor, so an "older" link continues the browse
+    // with the same actor and htmx swap targets.
+    assert!(body.contains("rel=\"next\""));
+    assert!(body.contains("cursor=next"));
+
+    // With the repost option on, the repost's picture is skipped.
+    let response = app
+        .oneshot(
+            Request::get("/gallery/account?actor=bob.bsky.social&skip_reposts=on")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+    assert!(!body.contains("https://cdn.example.com/f9.jpg"));
+    assert!(body.contains("https://cdn.example.com/f1.jpg"));
+    assert!(body.contains("checked"), "the checkbox state is preserved");
+}
+
+#[tokio::test]
+async fn account_viewer_shows_an_inline_error_when_the_feed_fails() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    mount_ui_session(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", "nobody.bsky.social"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "InvalidRequest",
+            "message": "unable to resolve handle",
+        })))
+        .mount(&server)
+        .await;
+
+    let (_dir, state, _candidate_tx) =
+        test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let response = app
+        .oneshot(
+            Request::get("/gallery/account?actor=nobody.bsky.social")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(
+        body.contains("could not load"),
+        "the failure is shown inline: {body}"
+    );
+    assert!(body.contains("role=\"alert\""));
+}

@@ -1,0 +1,29 @@
+<div id="account-gallery-grid">
+{% if let Some(error) = error %}
+<p class="account-viewer-error" role="alert">{{ error }}</p>
+{% endif %}
+<div class="gallery-grid">
+{% for item in items %}
+<figure class="item-card">
+<a class="gallery-item" href="{{ item.full_url }}" data-lightbox data-media-type="image" data-alt="{{ item.alt }}">
+<img src="{{ item.thumb_url }}" alt="{{ item.alt }}" loading="lazy">
+</a>
+<figcaption><a href="{{ item.post_href }}">View post</a></figcaption>
+</figure>
+{% endfor %}
+</div>
+{% if items.is_empty() && error.is_none() %}
+<p>No pictures found for this account{% if pagination.start_href.is_some() %} on this page{% endif %}.</p>
+{% endif %}
+
+<nav class="pagination" aria-label="Pagination">
+{% if let Some(href) = pagination.start_href %}
+<a href="{{ href }}" rel="first">&laquo; Newest</a>
+{% endif %}
+{% if let Some(href) = pagination.next_href %}
+<a href="{{ href }}" hx-get="{{ href }}" hx-target="#account-gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="next">Older &raquo;</a>
+{% else %}
+<span class="disabled">Older &raquo;</span>
+{% endif %}
+</nav>
+</div>

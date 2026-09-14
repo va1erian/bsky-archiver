@@ -32,6 +32,19 @@
 {% endif %}
 </section>
 
+<section class="account-viewer">
+<h2>Browse an account</h2>
+<form method="get" action="/gallery/account" class="account-viewer-form">
+<label for="gallery-account-actor">Bluesky handle</label>
+<input type="text" id="gallery-account-actor" name="actor" placeholder="alice.bsky.social" autocomplete="off" required>
+<label class="account-viewer-reposts">
+<input type="checkbox" name="skip_reposts" value="on">
+Skip images from reposts
+</label>
+<button type="submit">Browse</button>
+</form>
+</section>
+
 {% include "gallery_grid.html" %}
 
 <script>
