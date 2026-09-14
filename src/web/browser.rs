@@ -247,15 +247,13 @@ pub(super) async fn browser(
                 // The cursor link only when the API offers one AND the page
                 // wasn't filtered down to nothing — otherwise "older" would
                 // dead-end through empty page after empty page.
-                let next = page
-                    .cursor
-                    .filter(|_| !items.is_empty())
-                    .map(|cursor| {
-                        browser_href(actor, skip_reposts, oldest, limit_filter, Some(&cursor))
-                    });
-                let start = query.cursor.as_deref().map(|_| {
-                    browser_href(actor, skip_reposts, oldest, limit_filter, None)
+                let next = page.cursor.filter(|_| !items.is_empty()).map(|cursor| {
+                    browser_href(actor, skip_reposts, oldest, limit_filter, Some(&cursor))
                 });
+                let start = query
+                    .cursor
+                    .as_deref()
+                    .map(|_| browser_href(actor, skip_reposts, oldest, limit_filter, None));
                 (
                     items,
                     Some(templates::CursorPagination {
@@ -305,9 +303,7 @@ pub(super) async fn browser(
                 label: sort.label,
                 href: actor
                     .as_deref()
-                    .map(|actor| {
-                        browser_href(actor, skip_reposts, sort.oldest, limit_filter, None)
-                    })
+                    .map(|actor| browser_href(actor, skip_reposts, sort.oldest, limit_filter, None))
                     .unwrap_or_else(|| "/browser".to_string()),
                 selected: sort.oldest == oldest,
             })
@@ -475,11 +471,10 @@ pub(super) async fn bookmark_post(
 fn strong_ref(form: &PostActionForm) -> Option<crate::bluesky::StrongRef> {
     let uri = form.uri.trim();
     let cid = form.cid.trim();
-    (uri.starts_with("at://") && !cid.is_empty())
-        .then(|| crate::bluesky::StrongRef {
-            uri: uri.to_string(),
-            cid: cid.to_string(),
-        })
+    (uri.starts_with("at://") && !cid.is_empty()).then(|| crate::bluesky::StrongRef {
+        uri: uri.to_string(),
+        cid: cid.to_string(),
+    })
 }
 
 fn action_error(message: &str) -> Response {
