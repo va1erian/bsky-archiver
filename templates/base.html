@@ -58,18 +58,21 @@
 <p>bsky-archiver v{{ version }} · rev {{ git_revision }} · built {{ build_date }}</p>
 </footer>
 <script>
-// Fill-to-columns top-up: server-side the item count per page is fixed
-// while the *column* count depends on the viewport, so the last row would
-// end in blank cells. After render this measures how many grid columns
-// actually fit and, when the item count isn't a multiple of that, re-requests
-// the same selection with the page size (gallery: `page_size`; live
-// browser: the feed `limit`) raised to the next multiple. The swap is the
-// same htmx fragment pattern pagination uses, so links, the counter and
-// the lightbox contract stay intact; and because the raise happens for
-// the SAME page/cursor it cannot duplicate items. Without JS nothing
-// changes (default counts). If the source is exhausted before a multiple
-// can be fetched, the grid falls back to stretched flex items for that
-// page (see .cannot-fill in app.css).
+// Fill-to-columns top-up. Server-side the page counts are fixed while the
+// *column* count depends on the client viewport, so a fixed page size
+// (20/50 by default) leaves blank cells in the last row. After render this
+// measures how many grid columns actually fit: when the item count doesn't
+// fill them and the URL carries NO explicit page_size/limit — i.e. it's
+// browsing at the default count — it re-requests the same page/selection
+// with the count raised to the next multiple of the column count. The
+// swap is the same htmx fragment pattern pagination uses, but it changes
+// neither the URL nor the history, so deep-linked pages and back/forward
+// restoration do exactly what they did before — and explicit counts (the
+// pagination contract carried in URLs and links) keep their exact meaning:
+// those get the stretched-flex fallback for their short last line
+// (`.cannot-fill`, app.css). If the source runs out before a multiple can
+// be fetched, the default page also falls back to flex-stretch. Without
+// JS nothing changes: pages render at their default counts.
 (function () {
   var MIN_COLUMN_PX = 144; // .gallery-grid column floor (9rem)
   var MAX_TARGET = 100; // both server ceilings: page size and feed limit
@@ -95,22 +98,36 @@
     var grid = wrapper.querySelector(".gallery-grid");
     var param = wrapper.getAttribute("data-fill-param");
     if (!grid || !param) return;
-
-    var current = parseInt(wrapper.getAttribute("data-fill-current"), 10) || 0;
     var cols = columnsThatFit(grid);
     var items = grid.children.length;
     if (!cols || !items) return;
-    var target = Math.min(Math.ceil(items / cols) * cols, MAX_TARGET);
-    var params = new URLSearchParams(window.location.search);
-    // A previous top-up (or a hand-typed URL) may already request the
-    // aligned count; catch that without a refetch. Remaining gaps then
-    // reflect filtering or a short source the server can't top up.
-    if (target <= (parseInt(params.get(param), 10) || current)) return;
+    if (items % cols === 0) return; // rows already full
 
+    var params = new URLSearchParams(window.location.search);
+    // An explicit page_size/limit in the URL is a decision the user (or a
+    // pagination link) made: rewriting it would change how pages divide,
+    // break history restoration, and clash with the invariants the URLs
+    // promise. Explicit counts get the stretched-flex fallback instead.
+    if (params.has(param)) {
+      grid.classList.add("cannot-fill");
+      return;
+    }
+    // Default (no-param) page: raise the count to the next multiple of
+    // the measured columns. The swap covers the SAME page (page 1/cursor),
+    // just deeper, so it cannot duplicate; it neither pushes a history
+    // entry nor rewrites the URL, and the swapped-in markup carries the
+    // page_size value in its own links onwards.
+    var current = parseInt(wrapper.getAttribute("data-fill-current"), 10) || 0;
+    var target = Math.min(items + (cols - (items % cols)), MAX_TARGET);
+    if (target <= current) {
+      grid.classList.add("cannot-fill");
+      return;
+    }
+    params.set(param, String(target));
     var href = window.location.pathname + "?" + params.toString();
     if (attempted === href) {
-      // Already tried to fill to this exact shape and got shorted (feed
-      // exhausted, end-of-list page): fall back to flex-stretched items.
+      // Already fetched this alignment and got shorted (source exhausted
+      // before a multiple): fall back to flex-stretched items.
       grid.classList.add("cannot-fill");
       return;
     }
@@ -125,7 +142,7 @@
       .ajax("GET", href, {
         target: "#" + wrapper.id,
         swap: "outerHTML",
-        push: "true",
+        push: "false",
       })
       .then(
         function () {
@@ -155,13 +172,16 @@
     fill();
   }
 
-  // Any htmx swap may have brought a fresh grid in (pagination click,
-  // boosted nav, history restore). Our own top-up swap re-enters here
-  // too — the `attempted` guard makes that a no-op unless a different
-  // (e.g. resize-widened) target is worth trying.
+  // Any htmx swap may have brought a fresh grid in (boosted nav, history
+  // restore, the browser feed's cursor pages). With no explicit count
+  // parameter in the URL this keeps default pages aligned; with one, it
+  // just reasserts the flex fallback.
   document.body.addEventListener("htmx:after:swap", function () {
-    if (!window.__fillSkipScroll) fill();
+    fill();
   });
+
+  // `inflight` skips fills while a top-up fetch is in flight so concurrent
+  // resize/swap re-entries don't stack swaps of the same wrapper.
 })();
 </script>
 <script>
