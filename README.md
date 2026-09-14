@@ -11,6 +11,10 @@ A self-hosted daemon + web UI that watches a set of Bluesky sources and archives
 5. Optionally, the liked posts of a configured Tumblr account (see the
    `TUMBLR_*` environment variables below) — poll-only, via Tumblr's
    official API.
+6. Optionally, the media (photos/videos) posted in watched public Telegram
+   channels (see the `TELEGRAM_*` environment variables below) — poll-only,
+   over MTProto as a user account, archived into the `telegram_channels`
+   category.
 
 What's watched — the **watch list** of accounts (handle or DID) and feeds — is
 managed from the web UI's `/config` page (the "Watched sources" panel) and
@@ -55,6 +59,7 @@ plain `docker compose`.
 | `firehose` | The Jetstream websocket consumer: real-time capture of the watched accounts' authored posts with media, filtered by DID from the live roster, with reconnect/backoff, a persisted cursor so a restart resumes roughly where it left off, and an immediate reconnect when the watched-account set changes. |
 | `poller` | The REST-polling fallback for authored posts (active whenever the firehose is down), the feed poller (algorithm/custom feeds, which are never on the firehose), and the periodic likes/bookmarks poller. All use adaptive intervals with jittered exponential backoff. The bookmarks poller also detects deletions: a bookmark whose post comes back as `notFound` was deleted upstream, and its archived copy is marked with a `deleted_at` timestamp (a `blocked` post still exists and is never marked). |
 | `tumblr` | The Tumblr API v2 client (OAuth 1.0a HMAC-SHA1-signed requests) and the Tumblr likes poller, which archives the configured Tumblr account's liked posts into the `tumblr_likes` category on the same adaptive polling cadence. Only runs when the `TUMBLR_*` credentials are configured. |
+| `telegram` | The Telegram MTProto client (pure-Rust `grammers`, user-account session persisted at `<ARCHIVE_DIR>/telegram.session`) and the channel media archiver. Polls each watched public channel's history newest-first (one `messages.getHistory`-backed walk per cycle, stopping at a full page window of consecutively already-archived *media* messages), archives every photo/video message's JSON record into the `telegram_channels` category, and downloads the media itself over MTProto — Telegram files are not CDN-served, so this module owns its own (size-capped, concurrency-capped) downloads rather than feeding the shared `candidate`/`media` HTTP pipeline. First-time authorization is a one-time interactive login via the `bsky-archiver telegram-login` subcommand; the unattended service never prompts and reports an actionable `Error` health entry when the session is missing. Only runs when the `TELEGRAM_*` variables are configured. |
 | `sweep` | The likes/bookmarks deletion sweeper. It runs once at startup (so a deploy immediately catches up on anything the previous process missed and re-ranks the whole list) and then nightly at a fixed local hour (`NIGHTLY_SWEEP_LOCAL_HOUR`). It walks the entire bookmark and like lists (archiving anything the periodic pollers missed, re-ranking every item with its current position in Bluesky's list, and re-downloading stored media that carries a pre-fix corruption signature), then batch-verifies (`app.bsky.feed.getPosts`, 25 URIs per call) every URI already archived under those categories and marks the ones the API reports as gone. This is what catches deleted liked/bookmarked posts — including for authors not on the watch list, whom the firehose delete-op path never sees — and deletions that happened while the service was down. Marking only touches the index: the on-disk record and its media are always kept. |
 | `pipeline` | The shared `CandidatePost` channel and the `has_archivable_media` predicate connecting every producer (firehose, REST fallback, feed poller, likes/bookmarks poller) to the one consumer (the media downloader). |
 | `media` | Concurrency-limited, size-capped media downloading: streams each file, aborts if it exceeds `MEDIA_MAX_BYTES`, retries transient failures, and never leaves a partial file on disk. Videos arrive from Bluesky's CDN as HLS playlists whose segments are MPEG-TS; the TS segments are demuxed and remuxed into a single self-contained, playable `.mp4` (fMP4-based streams concatenate directly), capped in total by `MEDIA_MAX_BYTES`. |
@@ -66,7 +71,7 @@ plain `docker compose`.
 | `state` | `AppState`, the shared handle (config + storage + health + live roster + Bluesky client + a weak handle on the producer channel) passed to every request handler and background task. |
 | `web` | The `axum` HTTP server: routing, password-gated session auth, the pages/JSON surface backing the UI, and the `/sources` add/remove endpoints that manage the live watch list. |
 | `templates` | `askama` templates and their view models (kept separate from `web` so that module stays about *what data* each route needs, not how it's marked up). |
-| `app` | Startup sequencing (open storage, authenticate — failing fast on any error — and load the watch list, seeding it with the authenticated account on a fresh install) and supervised orchestration of every background task (firehose, REST fallback, feed poller, likes/bookmarks poller, media downloader, web server) plus graceful shutdown. |
+| `app` | Startup sequencing (open storage, authenticate — failing fast on any error — and load the watch list, seeding it with the authenticated account on a fresh install) and supervised orchestration of every background task (firehose, REST fallback, feed poller, likes/bookmarks poller, Tumblr likes, Telegram channel archiver, media downloader, web server) plus graceful shutdown. |
 
 Every background task in `app::serve` is independently supervised: a panic or
 unexpected exit in the firehose consumer, REST fallback poller, feed poller,
@@ -178,6 +183,9 @@ docker push localhost:5000/bsky-archiver:latest
 | `NIGHTLY_SWEEP_LOCAL_HOUR` | `3` | Local hour of day (0-23) at which the nightly likes/bookmarks deletion sweep runs. In a container this is the container's timezone (usually UTC; set `TZ` to shift it). |
 | `TUMBLR_CONSUMER_KEY`, `TUMBLR_CONSUMER_SECRET`, `TUMBLR_OAUTH_TOKEN`, `TUMBLR_OAUTH_SECRET` | *(unset)* | Tumblr OAuth 1.0a credentials enabling the Tumblr likes archiver. All four must be set together (or none, to disable Tumblr archiving). Register an application at <https://www.tumblr.com/oauth/apps> to get the consumer key/secret, then visit the [API console](https://api.tumblr.com/console) with your account and use "Show keys" to get your OAuth token/secret. |
 | `TUMBLR_POLL_INTERVAL_SECONDS` | `300` | Baseline interval for Tumblr likes polling (only used when the Tumblr credentials are set). Deliberately slower than `POLL_INTERVAL_SECONDS`: Tumblr rate-limits its API to 1000 requests/hour and 5000/day, and at the default the steady state uses ~12–24 API calls/hour (~300–600/day). Page fetches within a backfill walk are additionally paced 4s apart, keeping even a sustained full-list walk under the hourly cap. |
+| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_CHANNELS` | *(unset)* | Telegram MTProto credentials enabling the channel media archiver. All three must be set together (or none, to disable Telegram archiving). Get the Application ID/Hash at <https://my.telegram.org/apps> (they identify the *application*, not the user; any developer account works). `TELEGRAM_CHANNELS` is a comma-separated list of public `@username`s to archive (`@channel_one,@channel_two`; leading `@` optional). Private channels are not supported. The account (user session) is authorized once by running `bsky-archiver telegram-login` with the same environment (run `docker compose run --rm bsky-archiver telegram-login` in deployments); the session persists at `<ARCHIVE_DIR>/telegram.session` and survives along with the archive. |
+| `TELEGRAM_POLL_INTERVAL_SECONDS` | `120` | Baseline interval between Telegram channel polls (only used when the Telegram variables are set). Steady state costs one history request per watched channel per cycle; history pages within a backfill walk are additionally paced ~1.2s apart, and the grammers client further auto-sleeps through any small `FLOOD_WAIT` Telegram serves. |
+| `TELEGRAM_BACKFILL_LIMIT` | `2000` | How many messages deep (newest-first) the initial backfill walks each channel. `0` walks the channel's entire history (can be slow for large channels and is capped by `MEDIA_MAX_BYTES` per file as usual). After the backfill, every poll stops at the dedup boundary regardless of this value. |
 | `RUST_LOG` | `info` | Standard `tracing`/`tracing-subscriber` filter string. |
 
 What the archiver watches is **not** configured via environment variables: the watch
@@ -234,6 +242,38 @@ visible in container logs/exit status rather than hanging.
 5. Confirm `ARCHIVE_DIR`'s volume is durable in your deployment environment (e.g. a
    named Docker volume, not an ephemeral container filesystem) — it is the only
    state that must survive an upgrade or restart.
+
+### Archiving Telegram channels (optional)
+
+Telegram archiving runs over MTProto as a **user account** (not a bot — bots
+cannot read channel history), so it needs a one-time interactive login:
+
+1. Get an application ID/hash: log in at <https://my.telegram.org/apps> with any
+   Telegram account, create an app, and copy the `api_id` and `api_hash`. These
+   identify the application, not the user who archives.
+2. Set `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `TELEGRAM_CHANNELS`
+   (comma-separated public `@username`s) in your environment/compose file.
+3. Run the login subcommand **with the same environment as the service** (it
+   must read the same `ARCHIVE_DIR`, since the session lives at
+   `<ARCHIVE_DIR>/telegram.session`):
+   - Docker Compose: `docker compose run --rm bsky-archiver telegram-login`
+   - Local dev: `cargo run -- telegram-login` (a `.env` file works)
+   - Prompts: phone number (international format), the login code Telegram
+     sends, and your 2FA password if the account has one (typed in the
+     terminal, echoed like the official downloader examples).
+4. Start/keep the service running. Its Telegram archiver picks up the session,
+   resolves the channels, backfills up to `TELEGRAM_BACKFILL_LIMIT` messages,
+   and then polls every `TELEGRAM_POLL_INTERVAL_SECONDS`. The dashboard shows
+   the "Telegram channels" subsystem; a missing or broken session reports
+   `Error` with the fix in the detail column.
+
+Use a **dedicated account** (a spare Telegram account, or a second SIM/eSIM)
+rather than your primary one: heavy programmatic downloading as a user account
+is unusual activity, and a thrown-away login is cheaper to lose than your main
+account. Don't run many channels with a fresh account in one go — Telegram
+rate-limits aggressively per-account, and the archiver respects every
+`FLOOD_WAIT` but cannot stop Telegram from considering the account abusive if
+you push thousands of downloads at once.
 
 ## The `.symphony/` directory
 

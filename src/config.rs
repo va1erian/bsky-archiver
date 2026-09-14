@@ -17,6 +17,11 @@ const ALL_VARS: &[&str] = &[
     "TUMBLR_OAUTH_TOKEN",
     "TUMBLR_OAUTH_SECRET",
     "TUMBLR_POLL_INTERVAL_SECONDS",
+    "TELEGRAM_API_ID",
+    "TELEGRAM_API_HASH",
+    "TELEGRAM_CHANNELS",
+    "TELEGRAM_POLL_INTERVAL_SECONDS",
+    "TELEGRAM_BACKFILL_LIMIT",
     "ARCHIVE_DIR",
     "DATABASE_PATH",
     "UI_PASSWORD",
@@ -38,6 +43,15 @@ mod defaults {
     pub const MEDIA_MAX_BYTES: u64 = 104_857_600;
     pub const NIGHTLY_SWEEP_LOCAL_HOUR: u32 = 3;
     pub const TUMBLR_POLL_INTERVAL_SECONDS: u64 = 300;
+    pub const TELEGRAM_POLL_INTERVAL_SECONDS: u64 = 120;
+    pub const TELEGRAM_BACKFILL_LIMIT: u64 = 2000;
+}
+
+/// The default archive root, shared with the `telegram-login` subcommand's
+/// ARCHIVE_DIR fallback (the login session and the service must agree on
+/// where the session file lives).
+pub fn defaults_archive_dir() -> &'static str {
+    defaults::ARCHIVE_DIR
 }
 
 /// A secret string value (app password, UI password, session signing key).
@@ -143,6 +157,124 @@ impl TumblrConfig {
     }
 }
 
+/// Telegram MTProto credentials and channel watch list, used by
+/// [`crate::telegram`]. The API ID/hash pair comes from registering an
+/// application at <https://my.telegram.org/apps> (the free "api_id" and
+/// "api_hash" shown there; they identify the *application*, not the user).
+/// The archived user account is authorized once via the
+/// `bsky-archiver telegram-login` subcommand, whose session lives at
+/// `<ARCHIVE_DIR>/telegram.session`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramConfig {
+    pub api_id: i32,
+    pub api_hash: Secret,
+    /// Public `@username`s of the channels to archive (leading `@`
+    /// stripped). Private channels are not supported: MTProto history
+    /// access requires either a resolvable username or the channel already
+    /// present in the login account's session cache.
+    pub channels: Vec<String>,
+    /// Baseline interval between channel polls. Deliberately separate from
+    /// [`AppConfig::poll_interval_seconds`]: Telegram history fetches are
+    /// MTProto calls against the login account's own rate budget, not
+    /// Bluesky XRPC traffic, and the Telegram archiver shares no firehose.
+    pub poll_interval_seconds: u64,
+    /// How many messages deep the initial history backfill of each channel
+    /// walks (newest-first). `0` means the entire channel history, which
+    /// can take a very long time for large channels and is therefore never
+    /// the default.
+    pub backfill_limit: u64,
+}
+
+impl TelegramConfig {
+    /// The three variables that must be set together to enable Telegram
+    /// archiving.
+    const VARS: [&'static str; 3] = ["TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_CHANNELS"];
+
+    /// Reads the Telegram variables from the environment. All-or-nothing:
+    /// `Ok(None)` when none of the three are set (Telegram archiving
+    /// disabled), a config error when only some are set, and the config
+    /// when all three are. The two optional tunables default otherwise.
+    ///
+    /// `pub(crate)`, so [`crate::app`]'s `telegram-login` subcommand can
+    /// load just the Telegram part of the config without requiring the
+    /// (unrelated) mandatory Bluesky/UI variables to be set.
+    pub(crate) fn from_env() -> Result<Option<Self>, ConfigError> {
+        let values: Vec<Option<String>> = Self::VARS.map(optional_var).into_iter().collect();
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if let Some(missing) = values
+            .iter()
+            .zip(Self::VARS)
+            .find_map(|(value, var)| value.is_none().then_some(var))
+        {
+            return Err(ConfigError::InvalidValue {
+                var: missing,
+                message: format!(
+                    "{missing} is set but the other Telegram variables are missing; \
+                     set all of {} together (or none, to disable Telegram archiving)",
+                    Self::VARS.join(", ")
+                ),
+            });
+        }
+
+        let api_id: i32 = values[0]
+            .clone()
+            .expect("checked above")
+            .parse()
+            .map_err(|_| ConfigError::InvalidValue {
+                var: "TELEGRAM_API_ID",
+                message: "the value is not a valid integer (see https://my.telegram.org/apps)"
+                    .to_string(),
+            })?;
+        if api_id <= 0 {
+            return Err(ConfigError::InvalidValue {
+                var: "TELEGRAM_API_ID",
+                message: "the value must be a positive integer (see https://my.telegram.org/apps)"
+                    .to_string(),
+            });
+        }
+
+        let channels: Vec<String> = values[2]
+            .clone()
+            .expect("checked above")
+            .split(',')
+            .map(|entry| entry.trim().trim_start_matches('@'))
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        if channels.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                var: "TELEGRAM_CHANNELS",
+                message: "no channel usernames were given; \
+                          set a comma-separated list like @channel1,@channel2"
+                    .to_string(),
+            });
+        }
+
+        let poll_interval_seconds = match optional_var("TELEGRAM_POLL_INTERVAL_SECONDS") {
+            Some(raw) => parse_positive_u64("TELEGRAM_POLL_INTERVAL_SECONDS", &raw)?,
+            None => defaults::TELEGRAM_POLL_INTERVAL_SECONDS,
+        };
+        let backfill_limit = match optional_var("TELEGRAM_BACKFILL_LIMIT") {
+            // 0 is allowed here: it means "walk the entire channel history".
+            Some(raw) => raw.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+                var: "TELEGRAM_BACKFILL_LIMIT",
+                message: format!("{raw:?} is not a valid non-negative integer"),
+            })?,
+            None => defaults::TELEGRAM_BACKFILL_LIMIT,
+        };
+
+        Ok(Some(TelegramConfig {
+            api_id,
+            api_hash: Secret::from(values[1].clone().expect("checked above")),
+            channels,
+            poll_interval_seconds,
+            backfill_limit,
+        }))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bsky_identifier: String,
@@ -152,6 +284,11 @@ pub struct AppConfig {
     /// entirely; setting only *some* of the four variables is a startup
     /// error.
     pub tumblr: Option<TumblrConfig>,
+    /// Telegram MTProto credentials and watched channels, when the optional
+    /// Telegram channel archiver is enabled. `None` (the default) disables
+    /// Telegram archiving entirely; setting only *some* of the three
+    /// required variables is a startup error.
+    pub telegram: Option<TelegramConfig>,
     pub archive_dir: PathBuf,
     pub database_path: PathBuf,
     pub ui_password: Secret,
@@ -195,6 +332,7 @@ impl AppConfig {
         let ui_password = Secret::from(require_var("UI_PASSWORD")?);
         let ui_session_secret = Secret::from(require_var("UI_SESSION_SECRET")?);
         let tumblr = TumblrConfig::from_env()?;
+        let telegram = TelegramConfig::from_env()?;
 
         let archive_dir = optional_var("ARCHIVE_DIR")
             .map(PathBuf::from)
@@ -245,6 +383,7 @@ impl AppConfig {
             bsky_identifier,
             bsky_app_password,
             tumblr,
+            telegram,
             archive_dir,
             database_path,
             ui_password,
@@ -774,6 +913,148 @@ mod tests {
         assert!(!debug_output.contains("ui-password-secret"));
         assert!(!debug_output.contains("session-secret"));
         assert_eq!(debug_output.matches("<redacted>").count(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telegram_disabled_when_no_vars_set() {
+        let dir = temp_dir("telegram-disabled");
+        let required = required_vars(&dir);
+        let overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let _guard = EnvGuard::new(&overrides);
+
+        // `build()` reads only the process environment; `from_env()` would
+        // first load a developer's local `.env` (which may legitimately
+        // carry Telegram credentials) back over the guard's cleared vars.
+        let config = AppConfig::build().expect("config should load");
+        assert!(config.telegram.is_none(), "no telegram vars means disabled");
+        assert!(config.tumblr.is_none(), "no tumblr vars means disabled");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_telegram_vars_produce_specific_error() {
+        let dir = temp_dir("telegram-partial");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TELEGRAM_API_ID", "12345"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::build().expect_err("partial telegram vars should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "TELEGRAM_API_HASH"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_telegram_vars_enable_telegram_config() {
+        let dir = temp_dir("telegram-full");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TELEGRAM_API_ID", "12345"));
+        overrides.push(("TELEGRAM_API_HASH", "api-hash-secret"));
+        overrides.push(("TELEGRAM_CHANNELS", " @durov , ducks-are-cute "));
+        let _guard = EnvGuard::new(&overrides);
+
+        // `build()`, not `from_env()`: see the comment in
+        // `telegram_disabled_when_no_vars_set`.
+        let config = AppConfig::build().expect("config should load");
+        let telegram = config.telegram.expect("telegram should be enabled");
+        assert_eq!(telegram.api_id, 12345);
+        assert_eq!(telegram.api_hash.expose_secret(), "api-hash-secret");
+        assert_eq!(telegram.channels, vec!["durov", "ducks-are-cute"]);
+        assert_eq!(
+            telegram.poll_interval_seconds,
+            defaults::TELEGRAM_POLL_INTERVAL_SECONDS
+        );
+        assert_eq!(telegram.backfill_limit, defaults::TELEGRAM_BACKFILL_LIMIT);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_telegram_api_id_produces_specific_error() {
+        let dir = temp_dir("telegram-bad-id");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TELEGRAM_API_ID", "not-a-number"));
+        overrides.push(("TELEGRAM_API_HASH", "hash"));
+        overrides.push(("TELEGRAM_CHANNELS", "durov"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::build().expect_err("non-numeric api id should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "TELEGRAM_API_ID"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_telegram_api_id_produces_specific_error() {
+        let dir = temp_dir("telegram-zero-id");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TELEGRAM_API_ID", "0"));
+        overrides.push(("TELEGRAM_API_HASH", "hash"));
+        overrides.push(("TELEGRAM_CHANNELS", "durov"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::build().expect_err("zero api id should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "TELEGRAM_API_ID"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_telegram_channels_produce_specific_error() {
+        let dir = temp_dir("telegram-empty-channels");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TELEGRAM_API_ID", "12345"));
+        overrides.push(("TELEGRAM_API_HASH", "hash"));
+        overrides.push(("TELEGRAM_CHANNELS", " , @ "));
+        let _guard = EnvGuard::new(&overrides);
+
+        let err = AppConfig::build().expect_err("empty channel list should fail");
+        match err {
+            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "TELEGRAM_CHANNELS"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telegram_backfill_limit_allows_zero() {
+        let dir = temp_dir("telegram-backfill-zero");
+        let required = required_vars(&dir);
+        let mut overrides: Vec<(&'static str, &str)> =
+            required.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        overrides.push(("TELEGRAM_API_ID", "12345"));
+        overrides.push(("TELEGRAM_API_HASH", "hash"));
+        overrides.push(("TELEGRAM_CHANNELS", "durov"));
+        overrides.push(("TELEGRAM_BACKFILL_LIMIT", "0"));
+        let _guard = EnvGuard::new(&overrides);
+
+        let config = AppConfig::build().expect("config should load");
+        let telegram = config.telegram.expect("telegram should be enabled");
+        assert_eq!(telegram.backfill_limit, 0, "0 means full-history backfill");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

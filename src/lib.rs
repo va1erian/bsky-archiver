@@ -20,6 +20,9 @@
 //! - [`tumblr`] — the Tumblr API v2 client (OAuth 1.0a signed requests)
 //!   and the Tumblr likes poller, archiving the configured Tumblr
 //!   account's liked posts into the `tumblr_likes` category.
+//! - [`telegram`] — the Telegram MTProto client (grammers-based, user
+//!   account session) and the channel media archiver, walking watched
+//!   public channels' history into the `telegram_channels` category.
 //! - [`sweep`] — the nightly likes/bookmarks deletion sweep: walks both
 //!   lists in full and batch-verifies every archived like/bookmark URI,
 //!   marking posts deleted upstream with a `deleted_at` timestamp.
@@ -55,6 +58,7 @@ pub mod remux;
 pub mod state;
 pub mod storage;
 pub mod sweep;
+pub mod telegram;
 pub mod templates;
 pub mod tumblr;
 pub mod watchlist;

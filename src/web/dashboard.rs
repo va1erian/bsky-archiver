@@ -27,6 +27,10 @@ pub(super) async fn dashboard(State(state): State<WebState>) -> Result<Response,
         .list_posts(Some(Category::TumblrLike), 1, 1)
         .await?
         .total_items;
+    let telegram_channels_count = store
+        .list_posts(Some(Category::TelegramChannel), 1, 1)
+        .await?
+        .total_items;
 
     let texts = fetch_excerpts(store, &recent.items).await;
     let rows = recent
@@ -43,6 +47,7 @@ pub(super) async fn dashboard(State(state): State<WebState>) -> Result<Response,
         templates::subsystem_row("Feed poller", &snapshot.feed_poller),
         templates::subsystem_row("Likes & bookmarks", &snapshot.likes_bookmarks),
         templates::subsystem_row("Tumblr likes", &snapshot.tumblr_likes),
+        templates::subsystem_row("Telegram channels", &snapshot.telegram_archiver),
         templates::subsystem_row("Nightly sweep", &snapshot.nightly_sweep),
         templates::subsystem_row("Media downloader", &snapshot.media_downloader),
     ];
@@ -55,6 +60,7 @@ pub(super) async fn dashboard(State(state): State<WebState>) -> Result<Response,
         likes_count,
         bookmarks_count,
         tumblr_likes_count,
+        telegram_channels_count,
         health,
         recent: rows,
     };

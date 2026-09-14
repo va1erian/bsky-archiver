@@ -31,6 +31,17 @@ tokio-util = { version = "0.7.19", features = ["io", "compat"] }
 hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
+chrono = "0.4"
+
+# NOTE: grammers-client 0.10 (Telegram MTProto support) pulls in
+# grammers-crypto 0.10.0, which does not compile as published (it mixes
+# num-bigint 0.4 with num-bigint 0.5 through glass_pumpkin 2.0.0-rc1). The
+# checked-in Cargo.lock pins glass_pumpkin to 2.0.0-rc0 (num-bigint 0.4),
+# which fixes it; `cargo update -p glass_pumpkin --precise 2.0.0-rc0`
+# restores the pin if it is ever lost. Remove this note once a
+# grammers-crypto release resolves the duplication.
+grammers-client = "0.10"
+grammers-session = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

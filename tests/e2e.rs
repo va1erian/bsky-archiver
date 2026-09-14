@@ -63,6 +63,7 @@ fn test_config(archive_dir: std::path::PathBuf, database_path: std::path::PathBu
         bsky_identifier: WATCHED_HANDLE.to_string(),
         bsky_app_password: Secret::from("e2e-app-password".to_string()),
         tumblr: None,
+        telegram: None,
         archive_dir,
         database_path,
         ui_password: Secret::from("e2e-ui-password".to_string()),
