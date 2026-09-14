@@ -18,7 +18,7 @@
 </script>
 <script src="/static/htmx.min.js" defer></script>
 </head>
-<body>
+<body hx-boost="true">
 <header class="container">
 <nav class="main-nav">
 <ul>
@@ -43,7 +43,7 @@
 <li><a href="/browser">Browser</a></li>
 <li><a href="/config">Config</a></li>
 <li>
-<form method="post" action="/logout">
+<form method="post" action="/logout" hx-boost="false">
 <button type="submit" class="secondary outline">Logout</button>
 </form>
 </li>

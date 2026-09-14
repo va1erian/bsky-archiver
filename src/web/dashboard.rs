@@ -1,5 +1,11 @@
 //! Dashboard: the `/` overview with archive counts, subsystem health, and
 //! recent activity.
+//!
+//! Reactivity: the page renders with only the cheap index counts and the
+//! health snapshot, so boosted navigation lands instantly; the recent-
+//! activity grid renders excerpt-less and re-fetches itself from `/recent`
+//! via htmx after load — that's where the slow per-item `record.json` reads
+//! live.
 
 use axum::extract::State;
 use axum::response::Response;
@@ -10,30 +16,34 @@ use crate::templates;
 
 pub(super) async fn dashboard(State(state): State<WebState>) -> Result<Response, WebError> {
     let store = &state.app.store;
-    let recent = store.list_posts(None, 1, 10).await?;
-    let posts_count = store
-        .list_posts(Some(Category::Post), 1, 1)
-        .await?
-        .total_items;
-    let likes_count = store
-        .list_posts(Some(Category::Like), 1, 1)
-        .await?
-        .total_items;
-    let bookmarks_count = store
-        .list_posts(Some(Category::Bookmark), 1, 1)
-        .await?
-        .total_items;
-    let tumblr_likes_count = store
-        .list_posts(Some(Category::TumblrLike), 1, 1)
-        .await?
-        .total_items;
+    let counts_future = futures_util::future::join_all([
+        store.list_posts(Some(Category::Post), 1, 1),
+        store.list_posts(Some(Category::Like), 1, 1),
+        store.list_posts(Some(Category::Bookmark), 1, 1),
+        store.list_posts(Some(Category::TumblrLike), 1, 1),
+    ]);
+    let (counts, recent) =
+        futures_util::future::join(counts_future, store.list_posts(None, 1, 10)).await;
+    let recent = recent?;
+    let counts: Vec<u64> = counts
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|page| page.total_items)
+        .collect();
+    let [
+        posts_count,
+        likes_count,
+        bookmarks_count,
+        tumblr_likes_count,
+    ] = counts.try_into().expect("exactly four counters");
 
-    let texts = fetch_excerpts(store, &recent.items).await;
+    // Fast path: newest rows straight from the index, excerpt-less. The
+    // grid re-fetches itself as an excerpt-capable fragment after load.
     let rows = recent
         .items
         .iter()
-        .zip(texts)
-        .map(|(summary, text)| templates::post_row(summary, text.as_deref()))
+        .map(|summary| templates::post_row(summary, None))
         .collect();
 
     let snapshot = state.app.health.borrow().clone();
@@ -61,21 +71,52 @@ pub(super) async fn dashboard(State(state): State<WebState>) -> Result<Response,
     Ok(askama_axum::into_response(&template))
 }
 
+/// The deferred recent-activity fragment the dashboard's grid pulls in after
+/// load. It re-runs the newest-posts query but now does the expensive work —
+/// reading each item's `record.json` from disk for its excerpt text — in a
+/// single batched blocking task instead of one per item.
+pub(super) async fn recent(State(state): State<WebState>) -> Result<Response, WebError> {
+    let recent = state.app.store.list_posts(None, 1, 10).await?;
+    let texts = fetch_excerpts(&state.app.store, &recent.items).await;
+    let rows = recent_rows(&recent.items, texts);
+    let template = templates::RecentGridTemplate { recent: rows };
+    Ok(askama_axum::into_response(&template))
+}
+
+fn recent_rows<T>(items: &[PostSummary], texts: T) -> Vec<templates::PostRow>
+where
+    T: IntoIterator<Item = Option<String>>,
+{
+    items
+        .iter()
+        .zip(texts)
+        .map(|(summary, text)| templates::post_row(summary, text.as_deref()))
+        .collect()
+}
+
 /// Best-effort fetch of each summary's post text, for building list-view
 /// excerpts. The index deliberately doesn't store full record bodies
 /// ([`crate::storage`]'s `PostSummary` is index-only), so this reads each
-/// item's `record.json` straight from disk, concurrently. A read failure
-/// for one item just means that item renders without an excerpt — it
-/// never fails the whole page.
+/// item's `record.json` from disk — in one batched blocking task via
+/// [`ArchiveStore::get_records_batch`] — not in one task per item like
+/// before. A read failure for one item just means that item renders without
+/// an excerpt — it never fails the whole page.
 pub(super) async fn fetch_excerpts(
     store: &ArchiveStore,
     items: &[PostSummary],
 ) -> Vec<Option<String>> {
-    let fetches = items.iter().map(|item| async move {
-        match store.get_post(item.category, &item.at_uri).await {
-            Ok(Some(record)) => templates::record_text(&record.record).map(str::to_string),
-            Ok(None) | Err(_) => None,
-        }
-    });
-    futures_util::future::join_all(fetches).await
+    let entries = items
+        .iter()
+        .map(|item| (item.category, item.at_uri.clone()))
+        .collect();
+    let records = store.get_records_batch(entries).await.unwrap_or_default();
+    records
+        .into_iter()
+        .map(|record| {
+            record
+                .as_ref()
+                .and_then(|record| templates::record_text(&record.record))
+                .map(str::to_string)
+        })
+        .collect()
 }

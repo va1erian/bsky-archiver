@@ -417,6 +417,19 @@ nav form {
    The stagger tops out at three tiers so dense grids settle fast.
    --------------------------------------------------------------------------- */
 
+/* Deferred fast-path sections (excerpt-less lists/grids re-fetched as htmx
+   fragments after load) dim slightly while the replacement request is in
+   flight, so the two-stage render reads as intentional, not as a glitch. */
+#posts-list,
+#recent-grid {
+  transition: opacity 160ms ease-out;
+}
+
+#posts-list.htmx-request,
+#recent-grid.htmx-request {
+  opacity: 0.6;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   @keyframes card-in {
     from {

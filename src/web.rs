@@ -62,6 +62,7 @@ pub fn router(app: SharedAppState) -> Router {
 
     let protected = Router::new()
         .route("/", get(dashboard::dashboard))
+        .route("/recent", get(dashboard::recent))
         .route("/posts", get(posts::list_posts))
         .route("/posts/:id", get(posts::post_detail))
         .route("/gallery", get(gallery::gallery))
@@ -107,7 +108,17 @@ async fn require_auth(
 ) -> Response {
     match jar.get(SESSION_COOKIE) {
         Some(cookie) if cookie.value() == SESSION_VALUE => next.run(request).await,
-        _ => Redirect::to("/login").into_response(),
+        _ => {
+            // htmx (boosted navigation or a fragment swap) can't usefully
+            // follow a plain redirect — it would swap the login form into
+            // the current page's layout. `HX-Redirect` makes htmx navigate
+            // the whole browser instead.
+            if request.headers().contains_key("HX-Request") {
+                (StatusCode::OK, [("HX-Redirect", "/login")]).into_response()
+            } else {
+                Redirect::to("/login").into_response()
+            }
+        }
     }
 }
 
@@ -204,13 +215,20 @@ fn clamp_page_size(requested: Option<u32>) -> u32 {
 /// reload, or JS disabled entirely) always get the full page, which is
 /// what makes pagination work with no JS at all.
 ///
-/// History restores are the exception: htmx 4 services back/forward
-/// navigation by re-fetching the URL and swapping the `[hx-history-elt]`
-/// element (`<main>`) out of the response, which only exists in a full
-/// page. Those requests carry `HX-Request` too, so the restore header
-/// carves them back out to the full-page branch.
+/// Whether a request came from a plain htmx element swap (fragment
+/// pagination or a deferred list/grid loader), in which case handlers
+/// respond with just the swapped fragment instead of the full page.
+///
+/// `hx-boost` top-level navigation and history restores are the exceptions:
+/// both want the full page. Boosted navigation swaps `<body>` from a full
+/// page (and marks itself with `HX-Boosted`), and htmx 4 services back/
+/// forward by re-fetching the URL and extracting the `[hx-history-elt]`
+/// element, which only exists in a full page (those carry
+/// `HX-History-Restore-Request`).
 fn is_htmx_request(headers: &HeaderMap) -> bool {
-    headers.contains_key("HX-Request") && !headers.contains_key("HX-History-Restore-Request")
+    headers.contains_key("HX-Request")
+        && !headers.contains_key("HX-Boosted")
+        && !headers.contains_key("HX-History-Restore-Request")
 }
 
 /// Encodes an `at_uri` for use as a `/posts/:id` or `/media/.../:id/...`
