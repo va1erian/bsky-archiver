@@ -49,8 +49,6 @@ Skip images from reposts
   // Same contract as the archive gallery: an "older posts" click swaps the
   // grid in place, so scroll back to the top of the new page.
   document.body.addEventListener("htmx:after:swap", function (event) {
-    // Same as the gallery: skip the scroll reset for the fill top-up.
-    if (window.__fillSkipScroll) return;
     var ctx = (event.detail || {}).ctx || {};
     var target = ctx.target;
     if (typeof target === "string") target = document.querySelector(target);

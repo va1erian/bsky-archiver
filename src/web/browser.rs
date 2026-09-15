@@ -22,16 +22,6 @@ use crate::templates;
 /// page fills a grid comfortably without chaining requests per view.
 const ACCOUNT_GALLERY_PAGE_LIMIT: u32 = 50;
 
-/// Hard ceiling for the `limit` query param (the client-side fill top-up
-/// raises it); above this the API rejects the request outright.
-const ACCOUNT_GALLERY_MAX_LIMIT: u32 = 100;
-
-/// Normalizes the `limit` query param into the 1..=100 range the feed
-/// API accepts.
-fn clamp_feed_limit(limit: u32) -> u32 {
-    limit.clamp(1, ACCOUNT_GALLERY_MAX_LIMIT)
-}
-
 #[derive(Debug, Deserialize)]
 pub(super) struct BrowserQuery {
     pub(super) actor: Option<String>,
@@ -41,10 +31,6 @@ pub(super) struct BrowserQuery {
     /// `newest` (default, the API's own order) / `oldest` (the page
     /// reversed). Anything else falls back to `newest`.
     pub(super) sort: Option<String>,
-    /// How many feed items per request (the API page size). The client-side
-    /// fill top-up raises this to a multiple of the measured column count;
-    /// absent means the default below.
-    pub(super) limit: Option<u32>,
 }
 
 /// One offer of the browser's sort picker: the label, and whether it
@@ -72,15 +58,8 @@ fn parse_browser_sort(raw: Option<&str>) -> bool {
 }
 
 /// Builds `/browser` hrefs carrying every active filter (actor, repost
-/// preference, sort, feed page limit, cursor) so the "older" link
-/// continues the same browse.
-fn browser_href(
-    actor: &str,
-    skip_reposts: bool,
-    oldest: bool,
-    limit: Option<u32>,
-    cursor: Option<&str>,
-) -> String {
+/// preference, sort, cursor) so the "older" link continues the same browse.
+fn browser_href(actor: &str, skip_reposts: bool, oldest: bool, cursor: Option<&str>) -> String {
     let mut href = format!(
         "/browser?actor={}",
         percent_encoding::utf8_percent_encode(actor, percent_encoding::NON_ALPHANUMERIC)
@@ -92,11 +71,6 @@ fn browser_href(
     // emitted, mirroring how the archive gallery builds its links.
     if oldest {
         href.push_str("&sort=oldest");
-    }
-    // Ditto the default page limit: only carry the param once the
-    // client-side fill top-up (or the user) has put one in the URL.
-    if let Some(limit) = limit {
-        href.push_str(&format!("&limit={limit}"));
     }
     if let Some(cursor) = cursor {
         href.push_str("&cursor=");
@@ -228,18 +202,13 @@ pub(super) async fn browser(
         Some("on") | Some("1") | Some("true")
     );
     let oldest = parse_browser_sort(query.sort.as_deref());
-    let api_limit = query.limit.map(clamp_feed_limit);
-    let effective_limit = api_limit.unwrap_or(ACCOUNT_GALLERY_PAGE_LIMIT);
-    // Only the *explicit* choice lands in links, so a default browse emits
-    // no `limit` noise and a top-up-raised selection keeps its alignment.
-    let limit_filter = api_limit;
 
     let (items, pagination, error) = match actor.as_deref() {
         None => (Vec::new(), None, None),
         Some(actor) => match state
             .app
             .bluesky
-            .get_author_feed_media(actor, query.cursor.as_deref(), effective_limit)
+            .get_author_feed_media(actor, query.cursor.as_deref(), ACCOUNT_GALLERY_PAGE_LIMIT)
             .await
         {
             Ok(page) => {
@@ -247,13 +216,14 @@ pub(super) async fn browser(
                 // The cursor link only when the API offers one AND the page
                 // wasn't filtered down to nothing — otherwise "older" would
                 // dead-end through empty page after empty page.
-                let next = page.cursor.filter(|_| !items.is_empty()).map(|cursor| {
-                    browser_href(actor, skip_reposts, oldest, limit_filter, Some(&cursor))
-                });
+                let next = page
+                    .cursor
+                    .filter(|_| !items.is_empty())
+                    .map(|cursor| browser_href(actor, skip_reposts, oldest, Some(&cursor)));
                 let start = query
                     .cursor
                     .as_deref()
-                    .map(|_| browser_href(actor, skip_reposts, oldest, limit_filter, None));
+                    .map(|_| browser_href(actor, skip_reposts, oldest, None));
                 (
                     items,
                     Some(templates::CursorPagination {
@@ -280,19 +250,12 @@ pub(super) async fn browser(
         start_href: None,
         next_href: None,
     });
-    // Fewer images than the feed limit: either repost filtering or the
-    // account simply running out — either way the top-up has nothing to
-    // raise (a same-cursor fetch at a higher limit would just re-walk this
-    // page), so render upfront with the stretched-flex fallback.
-    let fill_fallback = items.len() < effective_limit as usize;
 
     if actor.is_some() && is_htmx_request(&headers) {
         let fragment = templates::AccountGalleryGridTemplate {
             items,
             pagination,
             error,
-            limit: effective_limit,
-            fill_fallback,
         };
         Ok(askama_axum::into_response(&fragment))
     } else {
@@ -303,7 +266,7 @@ pub(super) async fn browser(
                 label: sort.label,
                 href: actor
                     .as_deref()
-                    .map(|actor| browser_href(actor, skip_reposts, sort.oldest, limit_filter, None))
+                    .map(|actor| browser_href(actor, skip_reposts, sort.oldest, None))
                     .unwrap_or_else(|| "/browser".to_string()),
                 selected: sort.oldest == oldest,
             })
@@ -319,8 +282,6 @@ pub(super) async fn browser(
             error,
             saved,
             sort_options,
-            limit: effective_limit,
-            fill_fallback,
         };
         Ok(askama_axum::into_response(&template))
     }
@@ -417,7 +378,6 @@ pub(super) async fn gallery_account_redirect(Query(query): Query<BrowserQuery>) 
             actor,
             query.skip_reposts.as_deref() == Some("on"),
             parse_browser_sort(query.sort.as_deref()),
-            query.limit.map(clamp_feed_limit),
             query.cursor.as_deref(),
         ),
         None => "/browser".to_string(),

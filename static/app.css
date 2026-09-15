@@ -133,28 +133,10 @@
   overflow-wrap: anywhere;
 }
 
-/* Keep the auto-fill grid here: the *count* of items per page is chosen
-   client-side (the fill.js top-up re-requests the selection with a
-   page-size that is a multiple of the measured column count), so rows
-   fill edge-to-edge with uniform item widths in the common case.
-   Items on a short final line stretch via the `flex` rules below only
-   when the source is exhausted before a multiple could be fetched
-   (e.g. a small account's live feed), so blank gaps never appear. */
 .gallery-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
   gap: 0.75rem;
-}
-
-/* Fallback for un-toppable short pages: flex distribute, which lets the
-   final line's items share the leftover width instead of showing blanks. */
-.gallery-grid.cannot-fill {
-  display: flex;
-  flex-wrap: wrap;
-}
-
-.gallery-grid.cannot-fill > .item-card {
-  flex: 1 0 9rem;
 }
 
 .gallery-item {

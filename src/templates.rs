@@ -463,12 +463,6 @@ pub struct GalleryTemplate {
     pub category_options: Vec<CategoryOption>,
     pub sort_options: Vec<SortOption>,
     pub export: GalleryExport,
-    /// Page size echoed into the included gallery grid wrapper for the
-    /// client-side fill top-up (same value the pagination links carry).
-    pub page_size: u32,
-    /// Whether the included grid should render with the flex fallback
-    /// (see [`GalleryGridTemplate::fill_fallback`]).
-    pub fill_fallback: bool,
 }
 
 #[derive(Template)]
@@ -476,13 +470,6 @@ pub struct GalleryTemplate {
 pub struct GalleryGridTemplate {
     pub items: Vec<GalleryItem>,
     pub pagination: Pagination,
-    /// The currently effective page size, echoed on the grid wrapper for
-    /// the client-side fill top-up.
-    pub page_size: u32,
-    /// `true` when the page is the end of the list with fewer items than
-    /// the requested page size: there is nothing left to top up with, so
-    /// the grid renders with the stretched-flex fallback class up front.
-    pub fill_fallback: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -520,12 +507,6 @@ pub struct BrowserTemplate {
     pub saved: Vec<SavedAccountRow>,
     /// The sort picker's options, same shape as the gallery's.
     pub sort_options: Vec<SortOption>,
-    /// Effective feed page limit echoed into the included grid wrapper for
-    /// the client-side fill top-up.
-    pub limit: u32,
-    /// Whether the included grid should render with the flex fallback
-    /// (see [`AccountGalleryGridTemplate::fill_fallback`]).
-    pub fill_fallback: bool,
 }
 
 /// One row of the browser's saved-accounts panel: a favorite handle with a
@@ -566,13 +547,6 @@ pub struct AccountGalleryGridTemplate {
     pub items: Vec<GalleryItem>,
     pub pagination: CursorPagination,
     pub error: Option<String>,
-    /// The currently effective feed page limit, echoed on the grid wrapper
-    /// for the client-side fill top-up.
-    pub limit: u32,
-    /// `true` when fewer images than the feed limit came back (a short or
-    /// exhausted account): the top-up can't raise a cursor page's depth
-    /// retroactively, so render with the stretched-flex fallback.
-    pub fill_fallback: bool,
 }
 
 // ---------------------------------------------------------------------
