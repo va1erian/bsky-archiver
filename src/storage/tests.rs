@@ -808,7 +808,18 @@ async fn opening_a_v1_database_upgrades_to_schema_v2_in_place() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "6");
+    assert_eq!(version, "7");
+
+    // The deferred media-access index exists on the upgraded database.
+    let has_index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+             AND name = 'idx_media_post_at_uri'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_index, 1);
 
     // ...and the new table is usable immediately (no data had to move).
     assert!(store.list_watched_sources().await.unwrap().is_empty());

@@ -33,7 +33,7 @@
 </table>
 
 <h2>Recent activity</h2>
-<div id="recent-grid" hx-get="/recent" hx-trigger="load" hx-target="this" hx-swap="outerHTML">
+<div id="recent-grid" hx-get="/recent" hx-trigger="load" hx-swap="none">
 {% if recent.is_empty() %}
 <p>Nothing archived yet.</p>
 {% else %}
@@ -49,6 +49,7 @@
 {% endif %}
 <span class="badge {{ row.category_badge_class }}">{{ row.category_label }}</span>
 {% if let Some(deleted) = row.deleted_at %}<span class="badge badge-deleted">Deleted</span>{% endif %}
+<p class="excerpt" id="{{ row.excerpt_id }}"></p>
 <p class="item-meta">{{ row.author }} · {{ row.indexed_at }}</p>
 <a href="{{ row.detail_href }}">View</a>
 </article>
