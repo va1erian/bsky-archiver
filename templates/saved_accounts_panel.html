@@ -16,7 +16,7 @@
 <td data-label="Handle"><code>{{ account.handle }}</code></td>
 <td data-label="Saved">{{ account.added_at }}</td>
 <td data-label="Browse">
-<form method="get" action="/browser" class="saved-account-browse-form">
+<form method="get" action="/browse" class="saved-account-browse-form">
 <input type="hidden" name="actor" value="{{ account.handle }}">
 <button type="submit" class="secondary outline">Browse</button>
 </form>

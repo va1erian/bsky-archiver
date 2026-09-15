@@ -11,19 +11,22 @@ use axum::extract::State;
 use axum::response::Response;
 
 use super::{WebError, WebState};
-use crate::storage::{ArchiveStore, Category, PostSummary};
+use crate::storage::{ArchiveStore, Category, PostSort, PostSummary};
 use crate::templates;
 
 pub(super) async fn dashboard(State(state): State<WebState>) -> Result<Response, WebError> {
     let store = &state.app.store;
     let counts_future = futures_util::future::join_all([
-        store.list_posts(Some(Category::Post), 1, 1),
-        store.list_posts(Some(Category::Like), 1, 1),
-        store.list_posts(Some(Category::Bookmark), 1, 1),
-        store.list_posts(Some(Category::TumblrLike), 1, 1),
+        store.list_posts(Some(Category::Post), 1, 1, PostSort::default()),
+        store.list_posts(Some(Category::Like), 1, 1, PostSort::default()),
+        store.list_posts(Some(Category::Bookmark), 1, 1, PostSort::default()),
+        store.list_posts(Some(Category::TumblrLike), 1, 1, PostSort::default()),
     ]);
-    let (counts, recent) =
-        futures_util::future::join(counts_future, store.list_posts(None, 1, 10)).await;
+    let (counts, recent) = futures_util::future::join(
+        counts_future,
+        store.list_posts(None, 1, 10, PostSort::default()),
+    )
+    .await;
     let recent = recent?;
     let counts: Vec<u64> = counts
         .into_iter()
@@ -77,7 +80,11 @@ pub(super) async fn dashboard(State(state): State<WebState>) -> Result<Response,
 /// `hx-swap-oob` paragraphs that patch the grid's excerpt slots in place,
 /// leaving the thumbnails and layout (and any playing videos) untouched.
 pub(super) async fn recent(State(state): State<WebState>) -> Result<Response, WebError> {
-    let recent = state.app.store.list_posts(None, 1, 10).await?;
+    let recent = state
+        .app
+        .store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await?;
     let texts = fetch_excerpts(&state.app.store, &recent.items).await;
     let excerpts: Vec<templates::ExcerptSlot> = recent
         .items

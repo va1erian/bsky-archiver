@@ -69,6 +69,7 @@ pub fn router(app: SharedAppState) -> Router {
         .route("/gallery", get(gallery::gallery))
         .route("/gallery/export", get(gallery::gallery_export))
         .route("/browser", get(browser::browser))
+        .route("/browse", get(browser::browse))
         .route(
             "/browser/saved",
             axum::routing::post(browser::add_saved_account),

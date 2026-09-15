@@ -392,7 +392,12 @@ async fn poll_archives_new_likes_and_enqueues_media() {
     poller.poll_likes().await.expect("poll succeeds");
 
     let page = store
-        .list_posts(Some(Category::TumblrLike), 1, 10)
+        .list_posts(
+            Some(Category::TumblrLike),
+            1,
+            10,
+            crate::storage::PostSort::default(),
+        )
         .await
         .expect("list");
     assert_eq!(page.total_items, 2);
@@ -475,7 +480,12 @@ async fn poll_stops_at_dedup_boundary_after_a_full_window_of_archived_posts() {
     poller.poll_likes().await.expect("poll succeeds");
 
     let page = store
-        .list_posts(Some(Category::TumblrLike), 1, 100)
+        .list_posts(
+            Some(Category::TumblrLike),
+            1,
+            100,
+            crate::storage::PostSort::default(),
+        )
         .await
         .expect("list");
     assert_eq!(
@@ -541,7 +551,12 @@ async fn poll_survives_shifted_duplicates_at_page_boundaries() {
     poller.poll_likes().await.expect("poll succeeds");
 
     let page = store
-        .list_posts(Some(Category::TumblrLike), 1, 10)
+        .list_posts(
+            Some(Category::TumblrLike),
+            1,
+            10,
+            crate::storage::PostSort::default(),
+        )
         .await
         .expect("list");
     assert_eq!(
@@ -616,7 +631,12 @@ async fn full_walk_re_ranks_archived_posts_and_walks_to_the_end() {
     poller.poll_walk(true).await.expect("full walk succeeds");
 
     let page = store
-        .list_posts(Some(Category::TumblrLike), 1, 10)
+        .list_posts(
+            Some(Category::TumblrLike),
+            1,
+            10,
+            crate::storage::PostSort::default(),
+        )
         .await
         .expect("list");
     assert_eq!(page.total_items, 3, "full walk ignores the boundary");
@@ -669,7 +689,12 @@ async fn poll_walks_every_page_when_no_boundary_is_hit() {
     poller.poll_likes().await.expect("poll succeeds");
 
     let page = store
-        .list_posts(Some(Category::TumblrLike), 1, 10)
+        .list_posts(
+            Some(Category::TumblrLike),
+            1,
+            10,
+            crate::storage::PostSort::default(),
+        )
         .await
         .expect("list");
     assert_eq!(page.total_items, 3);
@@ -822,7 +847,12 @@ async fn poll_continues_past_short_pages_until_liked_count_is_reached() {
     poller.poll_likes().await.expect("poll succeeds");
 
     let page = store
-        .list_posts(Some(Category::TumblrLike), 1, 10)
+        .list_posts(
+            Some(Category::TumblrLike),
+            1,
+            10,
+            crate::storage::PostSort::default(),
+        )
         .await
         .expect("list");
     assert_eq!(page.total_items, 5, "short page 1 must not end the walk");

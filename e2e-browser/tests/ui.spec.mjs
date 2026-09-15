@@ -263,10 +263,10 @@ test("browser page shows its handle form and its saved-accounts panel", async ({
     "No saved accounts yet",
   );
 
-  // The old /gallery/account URL lands on the browser page.
+  // The old /gallery/account URL lands on the browse page.
   await page.goto("/gallery/account?actor=bob.bsky.social");
-  await expect(page).toHaveURL(/\/browser\?actor=/);
-  await expect(page.locator("main h1")).toHaveText("Browser");
+  await expect(page).toHaveURL(/\/browse\?actor=/);
+  await expect(page.locator("main h1")).toHaveText("Browse");
   // No network in the e2e environment, so the browse fails inline.
   await expect(page.locator("[role=alert]").last()).toContainText(
     "could not load",

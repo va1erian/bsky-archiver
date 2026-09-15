@@ -186,7 +186,13 @@ pub(super) async fn gallery(
         });
 
     if is_htmx_request(&headers) {
-        let fragment = templates::GalleryGridTemplate { items, pagination };
+        let fragment = templates::GalleryGridTemplate {
+            items,
+            pagination,
+            category: category.map(category_token).unwrap_or_default().to_string(),
+            sort: sort_token(sort).to_string(),
+            page_size,
+        };
         Ok(askama_axum::into_response(&fragment))
     } else {
         let estimate = state.app.store.export_estimate(category).await?;
@@ -202,6 +208,9 @@ pub(super) async fn gallery(
             category_options,
             sort_options,
             export,
+            category: category.map(category_token).unwrap_or_default().to_string(),
+            sort: sort_token(sort).to_string(),
+            page_size,
         };
         Ok(askama_axum::into_response(&template))
     }

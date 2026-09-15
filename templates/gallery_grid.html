@@ -18,6 +18,7 @@
 {% endif %}
 
 <nav class="pagination" aria-label="Pagination">
+<div class="pagination-links">
 {% if let Some(href) = pagination.first_href %}
 <a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="first">&laquo; First</a>
 {% else %}
@@ -28,13 +29,7 @@
 {% else %}
 <span class="disabled">Previous</span>
 {% endif %}
-{% for link in pagination.page_links %}
-{% if link.current %}
-<span class="current">{{ link.number }}</span>
-{% else %}
-<a href="{{ link.href }}" hx-get="{{ link.href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true">{{ link.number }}</a>
-{% endif %}
-{% endfor %}
+<button class="current" type="button" data-page-jump aria-haspopup="dialog" title="Go to page">{{ pagination.page }}</button>
 {% if let Some(href) = pagination.next_href %}
 <a href="{{ href }}" hx-get="{{ href }}" hx-target="#gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="next">Next</a>
 {% else %}
@@ -45,6 +40,17 @@
 {% else %}
 <span class="disabled">Last &raquo;</span>
 {% endif %}
-<span class="item-meta">Page {{ pagination.page }} of {{ pagination.total_pages }} ({{ pagination.total_items }} total)</span>
+</div>
+<span class="pagination-meta item-meta">Page {{ pagination.page }} of {{ pagination.total_pages }} ({{ pagination.total_items }} total)</span>
+<dialog class="page-jump-dialog">
+<form method="get" action="/gallery">
+{% if !category.is_empty() %}<input type="hidden" name="category" value="{{ category }}">{% endif %}
+<input type="hidden" name="sort" value="{{ sort }}">
+<input type="hidden" name="page_size" value="{{ page_size }}">
+<input type="number" name="page" min="1" max="{{ pagination.total_pages }}" value="{{ pagination.page }}" inputmode="numeric" required autofocus aria-label="Page number">
+<button type="submit">Go</button>
+<button type="submit" class="secondary outline" formmethod="dialog" formnovalidate>Cancel</button>
+</form>
+</dialog>
 </nav>
 </div>

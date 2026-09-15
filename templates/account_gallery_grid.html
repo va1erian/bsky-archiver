@@ -21,9 +21,9 @@
 <a href="{{ href }}" rel="first">&laquo; Newest</a>
 {% endif %}
 {% if let Some(href) = pagination.next_href %}
-<a href="{{ href }}" hx-get="{{ href }}" hx-target="#account-gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="next">Older &raquo;</a>
+<a href="{{ href }}" class="cursor-next" hx-get="{{ href }}" hx-target="#account-gallery-grid" hx-swap="outerHTML" hx-push-url="true" rel="next">Older &raquo;</a>
 {% else %}
-<span class="disabled">Older &raquo;</span>
+<span class="disabled cursor-next">Older &raquo;</span>
 {% endif %}
 </nav>
 </div>

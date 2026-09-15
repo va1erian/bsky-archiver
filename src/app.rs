@@ -869,7 +869,7 @@ mod tests {
         let page = started
             .state
             .store
-            .list_posts(None, 1, 10)
+            .list_posts(None, 1, 10, crate::storage::PostSort::default())
             .await
             .expect("list posts");
         assert_eq!(page.items.len(), 1);
@@ -997,7 +997,10 @@ mod tests {
         )
         .await;
 
-        let page = store.list_posts(None, 1, 10).await.expect("list posts");
+        let page = store
+            .list_posts(None, 1, 10, crate::storage::PostSort::default())
+            .await
+            .expect("list posts");
         assert_eq!(page.items.len(), 1);
         assert_eq!(
             page.items[0].at_uri,

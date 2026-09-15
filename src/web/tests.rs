@@ -1,4 +1,4 @@
-﻿//! `#[cfg(test)]` coverage for the web UI: drives the real router (real
+//! `#[cfg(test)]` coverage for the web UI: drives the real router (real
 //! `ArchiveStore` on a tempdir) through auth, every page, pagination
 //! boundaries, htmx fragment swaps, and media caching/revalidation.
 
@@ -202,6 +202,7 @@ async fn posts_pagination_behaves_at_boundaries() {
             category: None,
             page: Some(1),
             page_size: Some(10),
+            sort: None,
         }),
         HeaderMap::new(),
     )
@@ -219,6 +220,7 @@ async fn posts_pagination_behaves_at_boundaries() {
             category: None,
             page: Some(3),
             page_size: Some(10),
+            sort: None,
         }),
         HeaderMap::new(),
     )
@@ -236,6 +238,7 @@ async fn posts_pagination_behaves_at_boundaries() {
             category: None,
             page: Some(4),
             page_size: Some(10),
+            sort: None,
         }),
         HeaderMap::new(),
     )
@@ -254,6 +257,7 @@ async fn posts_pagination_behaves_at_boundaries() {
             category: None,
             page: Some(2),
             page_size: Some(10),
+            sort: None,
         }),
         HeaderMap::new(),
     )
@@ -271,6 +275,7 @@ async fn posts_pagination_behaves_at_boundaries() {
             category: None,
             page: Some(1),
             page_size: Some(u32::MAX),
+            sort: None,
         }),
         HeaderMap::new(),
     )
@@ -1169,6 +1174,104 @@ async fn gallery_unknown_sort_is_a_400() {
 }
 
 #[tokio::test]
+async fn posts_unknown_sort_is_a_400() {
+    let (_dir, state) = test_state().await;
+    let key = Key::derive_from(state.config.ui_session_secret.expose_secret().as_bytes());
+    let app_state = WebState {
+        app: Arc::clone(&state),
+        key,
+    };
+
+    let result = list_posts(
+        State(app_state),
+        Query(PostsQuery {
+            category: None,
+            page: Some(1),
+            page_size: Some(10),
+            sort: Some("bogus".to_string()),
+        }),
+        HeaderMap::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(WebError::BadRequest { .. })));
+}
+
+#[tokio::test]
+async fn posts_sort_is_marked_in_options_and_survives_pagination() {
+    let (_dir, state) = test_state().await;
+    // Two post-category records recorded with distinct createdAt values
+    // (the mirror the created-sorts key off), plus one like so the "All"
+    // and category filtering both have something to keep/skip.
+    let older = "at://did:plc:alice/app.bsky.feed.post/older";
+    let newer = "at://did:plc:alice/app.bsky.feed.post/newer";
+    state
+        .store
+        .save_post(
+            StorageCategory::Post,
+            older,
+            "cid-older",
+            json!({"createdAt": "2024-01-01T00:00:00Z"}),
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .save_post(
+            StorageCategory::Post,
+            newer,
+            "cid-newer",
+            json!({"createdAt": "2024-06-01T00:00:00Z"}),
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .save_post(
+            StorageCategory::Like,
+            "at://did:plc:bob/app.bsky.feed.post/x",
+            "cid-x",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let key = Key::derive_from(state.config.ui_session_secret.expose_secret().as_bytes());
+    let app_state = WebState {
+        app: Arc::clone(&state),
+        key,
+    };
+
+    // A page_size of 1 makes the posts selection span two pages, so the
+    // pagination's sort survival can be asserted.
+    let page = list_posts(
+        State(app_state.clone()),
+        Query(PostsQuery {
+            category: Some("posts".to_string()),
+            page: Some(1),
+            page_size: Some(1),
+            sort: Some("created-oldest".to_string()),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .unwrap();
+    let body = body_string(page.into_response()).await;
+
+    // The sort select is present with every option offered (Askama
+    // escapes the `&` separators inside option values) and resets to
+    // page 1 while keeping the active category.
+    for href in [
+        "/posts?category=posts&amp;sort=newest&amp;page=1&amp;page_size=1",
+        "/posts?category=posts&amp;sort=oldest&amp;page=1&amp;page_size=1",
+        "/posts?category=posts&amp;sort=created-oldest&amp;page=1&amp;page_size=1",
+    ] {
+        assert!(body.contains(href), "sort option missing: {href}");
+    }
+    // Only the older post's row lands on page 1 of the sorted page.
+    assert!(body.contains(&encode_post_id(older)));
+    assert!(!body.contains(&encode_post_id(newer)));
+}
+
+#[tokio::test]
 async fn gallery_sort_is_marked_in_options_and_survives_pagination() {
     let (_dir, state) = test_state().await;
     seed_image_and_video(&state.store).await;
@@ -1256,7 +1359,7 @@ async fn gallery_export_estimate_counts_images_only_including_null_content_type(
         )
         .await
         .unwrap();
-    // A video under the same category â€” excluded from the count.
+    // A video under the same category — excluded from the count.
     seed_image_and_video(&state.store).await;
 
     let key = Key::derive_from(state.config.ui_session_secret.expose_secret().as_bytes());
@@ -1282,7 +1385,7 @@ async fn gallery_export_estimate_counts_images_only_including_null_content_type(
     assert!(posts_body.contains("2 images"));
     assert!(posts_body.contains("Download zip"));
 
-    // Likes category: only a video â†’ empty export selection.
+    // Likes category: only a video → empty export selection.
     let likes = gallery(
         State(app_state),
         Query(GalleryQuery {
@@ -1703,7 +1806,7 @@ async fn non_htmx_source_mutation_redirects_to_config() {
 }
 
 // ---------------------------------------------------------------------
-// Browser (/browser: the account viewer + saved favorites)
+// Browser (/browser: entry page) + Browse (/browse: the account viewer)
 // ---------------------------------------------------------------------
 
 /// A getAuthorFeed page (`filter=posts_with_media`) mixing an authored
@@ -1787,8 +1890,39 @@ async fn account_gallery_without_actor_renders_just_the_form() {
     let body = body_string(response).await;
 
     assert!(body.contains("Browser"));
+    assert!(body.contains("Saved accounts"));
+    // The form submits to /browse nowadays.
+    assert!(body.contains("action=\"/browse\""));
     assert!(body.contains("name=\"actor\""));
     assert!(body.contains("name=\"skip_reposts\""));
+    assert!(
+        !body.contains("id=\"account-gallery-grid\""),
+        "no grid on the entry page"
+    );
+}
+
+#[tokio::test]
+async fn browse_without_actor_shows_the_empty_state_and_no_grid() {
+    let (_dir, state) = test_state().await;
+    let app = router(state);
+    let cookie = login(&app).await;
+
+    let response = app
+        .oneshot(
+            Request::get("/browse")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    assert!(body.contains("Pick an account to browse"));
+    assert!(body.contains("href=\"/browser\""));
+    // The handle form is there so the visit can complete without a detour.
+    assert!(body.contains("name=\"actor\""));
     assert!(
         !body.contains("id=\"account-gallery-grid\""),
         "no grid before an actor is given"
@@ -1818,7 +1952,7 @@ async fn account_viewer_browses_live_pictures_with_repost_and_video_handling() {
     let response = app
         .clone()
         .oneshot(
-            Request::get("/browser?actor=bob.bsky.social")
+            Request::get("/browse?actor=bob.bsky.social")
                 .header(header::COOKIE, cookie.clone())
                 .body(Body::empty())
                 .unwrap(),
@@ -1849,7 +1983,7 @@ async fn account_viewer_browses_live_pictures_with_repost_and_video_handling() {
     // With the repost option on, the repost's picture is skipped.
     let response = app
         .oneshot(
-            Request::get("/browser?actor=bob.bsky.social&skip_reposts=on")
+            Request::get("/browse?actor=bob.bsky.social&skip_reposts=on")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1865,6 +1999,60 @@ async fn account_viewer_browses_live_pictures_with_repost_and_video_handling() {
     // like/bookmark buttons.
     assert!(body.contains("data-post-uri=\"at://did:plc:bob/app.bsky.feed.post/1\""));
     assert!(body.contains("data-post-cid=\"cid-1\""));
+}
+
+#[tokio::test]
+async fn browse_htmx_request_returns_just_the_grid_fragment() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    mount_ui_session(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", "bob.bsky.social"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(account_viewer_feed_page()))
+        .mount(&server)
+        .await;
+
+    let (_dir, state, _candidate_tx) =
+        test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
+    let app = router(Arc::clone(&state));
+    let cookie = login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/browse?actor=bob.bsky.social")
+                .header(header::COOKIE, cookie.clone())
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    assert!(body.contains("id=\"account-gallery-grid\""));
+    assert!(
+        !body.contains("main h1") && !body.contains("<main"),
+        "fragment must not include full-page chrome"
+    );
+
+    // Without the htmx header the same URL gets the full page back.
+    let full = app
+        .oneshot(
+            Request::get("/browse?actor=bob.bsky.social")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(full.status(), StatusCode::OK);
+    let full_body = body_string(full).await;
+    assert!(full_body.contains("Pictures posted by"));
 }
 
 #[tokio::test]
@@ -1890,7 +2078,7 @@ async fn account_viewer_sort_reverses_the_page_and_survives_pagination() {
     let response = app
         .clone()
         .oneshot(
-            Request::get("/browser?actor=bob.bsky.social&skip_reposts=on")
+            Request::get("/browse?actor=bob.bsky.social&skip_reposts=on")
                 .header(header::COOKIE, cookie.clone())
                 .body(Body::empty())
                 .unwrap(),
@@ -1901,7 +2089,7 @@ async fn account_viewer_sort_reverses_the_page_and_survives_pagination() {
     assert!(body.find("f1.jpg") < body.find("f2.jpg"));
     assert!(
         body.contains(
-            "<option value=\"/browser?actor=bob%2Ebsky%2Esocial&amp;skip_reposts=on\" selected>"
+            "<option value=\"/browse?actor=bob%2Ebsky%2Esocial&amp;skip_reposts=on\" selected>"
         ),
         "the default run marks 'newest first' selected"
     );
@@ -1911,7 +2099,7 @@ async fn account_viewer_sort_reverses_the_page_and_survives_pagination() {
     // sort so subsequent pages stay reversed.
     let response = app
         .oneshot(
-            Request::get("/browser?actor=bob.bsky.social&skip_reposts=on&sort=oldest")
+            Request::get("/browse?actor=bob.bsky.social&skip_reposts=on&sort=oldest")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1925,7 +2113,7 @@ async fn account_viewer_sort_reverses_the_page_and_survives_pagination() {
         "the older link keeps the sort"
     );
     assert!(
-        body.contains("<option value=\"/browser?actor=bob%2Ebsky%2Esocial&amp;skip_reposts=on&amp;sort=oldest\" selected>"),
+        body.contains("<option value=\"/browse?actor=bob%2Ebsky%2Esocial&amp;skip_reposts=on&amp;sort=oldest\" selected>"),
         "the sort picker marks the active option"
     );
 }
@@ -2034,7 +2222,7 @@ async fn account_viewer_shows_an_inline_error_when_the_feed_fails() {
 
     let response = app
         .oneshot(
-            Request::get("/browser?actor=nobody.bsky.social")
+            Request::get("/browse?actor=nobody.bsky.social")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -2189,12 +2377,13 @@ async fn non_htmx_saved_account_mutation_redirects_to_the_browser() {
 }
 
 #[tokio::test]
-async fn old_gallery_account_url_redirects_to_the_browser() {
+async fn old_gallery_account_url_redirects_to_browse() {
     let (_dir, state) = test_state().await;
     let app = router(state);
     let cookie = login(&app).await;
 
     let response = app
+        .clone()
         .oneshot(
             Request::get("/gallery/account?actor=bob.bsky.social&skip_reposts=on")
                 .header(header::COOKIE, &cookie)
@@ -2212,8 +2401,21 @@ async fn old_gallery_account_url_redirects_to_the_browser() {
         .unwrap()
         .to_string();
     assert!(
-        location.starts_with("/browser?actor=bob%2Ebsky%2Esocial"),
+        location.starts_with("/browse?actor=bob%2Ebsky%2Esocial"),
         "location: {location}"
     );
     assert!(location.contains("skip_reposts=on"));
+
+    // Without an actor the redirect still lands on the browse page (its
+    // empty state links back to the saved-accounts entry page).
+    let response = app
+        .oneshot(
+            Request::get("/gallery/account")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/browse");
 }
