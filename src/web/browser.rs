@@ -1,11 +1,11 @@
-//! Browser (`/browser`): live browsing of one Bluesky account's pictures,
-//! plus the saved-accounts (favorites) panel for one-click access.
+//! Browser pages: `/browser` is the entry page — the saved-accounts
+//! (favorites) panel plus the "Browse an account" form — and `/browse`
+//! shows one Bluesky account's pictures, live — archived or not.
 //!
-//! This is the "browse an account" viewer that used to live on the gallery
-//! page, moved to its own page and given persistent favorites. It behaves
-//! identically to the gallery: same grid markup, same lightbox contract
-//! (`data-lightbox` links + `rel="next"` pagination the base lightbox walks
-//! across), same htmx fragment swaps on pagination.
+//! The picture viewer behaves identically to the gallery: same grid
+//! markup, same lightbox contract (`data-lightbox` links + `rel="next"`
+//! pagination the base lightbox walks across), same htmx fragment swaps
+//! on pagination.
 
 use axum::Form;
 use axum::Json;
@@ -57,11 +57,11 @@ fn parse_browser_sort(raw: Option<&str>) -> bool {
     raw == Some("oldest")
 }
 
-/// Builds `/browser` hrefs carrying every active filter (actor, repost
+/// Builds `/browse` hrefs carrying every active filter (actor, repost
 /// preference, sort, cursor) so the "older" link continues the same browse.
 fn browser_href(actor: &str, skip_reposts: bool, oldest: bool, cursor: Option<&str>) -> String {
     let mut href = format!(
-        "/browser?actor={}",
+        "/browse?actor={}",
         percent_encoding::utf8_percent_encode(actor, percent_encoding::NON_ALPHANUMERIC)
     );
     if skip_reposts {
@@ -186,7 +186,134 @@ fn account_gallery_items(
     items
 }
 
+/// One page of the live account viewer: the flattened grid items, the
+/// cursor pagination links, and an inline error when the feed fetch
+/// failed. Actor-less requests produce the empty triple.
+struct AccountGalleryPage {
+    items: Vec<templates::GalleryItem>,
+    pagination: templates::CursorPagination,
+    error: Option<String>,
+}
+
+/// Fetches (and flattens) one page of the actor's media feed, or builds
+/// the empty page when no actor is set. Shared by the `/browse` page and
+/// its htmx grid fragment.
+async fn account_gallery_page(
+    state: &WebState,
+    actor: Option<&str>,
+    cursor: Option<&str>,
+    skip_reposts: bool,
+    oldest: bool,
+) -> AccountGalleryPage {
+    let Some(actor) = actor else {
+        return AccountGalleryPage {
+            items: Vec::new(),
+            pagination: templates::CursorPagination {
+                start_href: None,
+                next_href: None,
+            },
+            error: None,
+        };
+    };
+
+    match state
+        .app
+        .bluesky
+        .get_author_feed_media(actor, cursor, ACCOUNT_GALLERY_PAGE_LIMIT)
+        .await
+    {
+        Ok(page) => {
+            let items = account_gallery_items(&page.feed, actor, skip_reposts, oldest);
+            // The cursor link only when the API offers one AND the page
+            // wasn't filtered down to nothing — otherwise "older" would
+            // dead-end through empty page after empty page.
+            let next = page
+                .cursor
+                .filter(|_| !items.is_empty())
+                .map(|cursor| browser_href(actor, skip_reposts, oldest, Some(&cursor)));
+            let start = cursor.map(|_| browser_href(actor, skip_reposts, oldest, None));
+            AccountGalleryPage {
+                items,
+                pagination: templates::CursorPagination {
+                    start_href: start,
+                    next_href: next,
+                },
+                error: None,
+            }
+        }
+        Err(err) => {
+            tracing::warn!(actor = %actor, error = %err, "account viewer feed fetch failed");
+            AccountGalleryPage {
+                items: Vec::new(),
+                pagination: templates::CursorPagination {
+                    start_href: None,
+                    next_href: None,
+                },
+                error: Some(format!(
+                    "could not load {actor}'s feed — check the handle and try again"
+                )),
+            }
+        }
+    }
+}
+
+/// Builds the sort picker's options for the given browse state. Hrefs
+/// reset the cursor back to the newest page (mirroring the archive
+/// gallery's picker); without an actor they just point at `/browse`.
+fn sort_options(
+    actor: Option<&str>,
+    skip_reposts: bool,
+    oldest: bool,
+) -> Vec<templates::SortOption> {
+    BROWSER_SORTS
+        .iter()
+        .map(|sort| templates::SortOption {
+            label: sort.label,
+            href: actor
+                .map(|actor| browser_href(actor, skip_reposts, sort.oldest, None))
+                .unwrap_or_else(|| "/browse".to_string()),
+            selected: sort.oldest == oldest,
+        })
+        .collect()
+}
+
+/// `GET /browser`: the entry page — the saved-accounts (favorites) panel
+/// plus the "Browse an account" form, which submits to `/browse`.
 pub(super) async fn browser(
+    State(state): State<WebState>,
+    Query(query): Query<BrowserQuery>,
+) -> Result<Response, WebError> {
+    let actor = query
+        .actor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let skip_reposts = matches!(
+        query.skip_reposts.as_deref(),
+        Some("on") | Some("1") | Some("true")
+    );
+
+    let saved = saved_rows(&state).await;
+    let template = templates::BrowserTemplate {
+        version: templates::APP_VERSION,
+        git_revision: templates::GIT_REVISION,
+        build_date: templates::BUILD_DATE,
+        actor: actor.unwrap_or_default(),
+        skip_reposts,
+        saved,
+        error: None,
+    };
+    Ok(askama_axum::into_response(&template))
+}
+
+/// `GET /browse`: one Bluesky account's live picture grid. An empty
+/// actor renders a friendly empty state instead of any grid; a set one
+/// fetches the feed and renders the sort nav + grid + cursor pagination.
+/// htmx element swaps (grid pagination) get just the grid fragment; the
+/// full page goes out for every other request (including htmx-boosted
+/// navigations and history restores).
+pub(super) async fn browse(
     State(state): State<WebState>,
     Query(query): Query<BrowserQuery>,
     headers: HeaderMap,
@@ -203,88 +330,37 @@ pub(super) async fn browser(
     );
     let oldest = parse_browser_sort(query.sort.as_deref());
 
-    let (items, pagination, error) = match actor.as_deref() {
-        None => (Vec::new(), None, None),
-        Some(actor) => match state
-            .app
-            .bluesky
-            .get_author_feed_media(actor, query.cursor.as_deref(), ACCOUNT_GALLERY_PAGE_LIMIT)
-            .await
-        {
-            Ok(page) => {
-                let items = account_gallery_items(&page.feed, actor, skip_reposts, oldest);
-                // The cursor link only when the API offers one AND the page
-                // wasn't filtered down to nothing — otherwise "older" would
-                // dead-end through empty page after empty page.
-                let next = page
-                    .cursor
-                    .filter(|_| !items.is_empty())
-                    .map(|cursor| browser_href(actor, skip_reposts, oldest, Some(&cursor)));
-                let start = query
-                    .cursor
-                    .as_deref()
-                    .map(|_| browser_href(actor, skip_reposts, oldest, None));
-                (
-                    items,
-                    Some(templates::CursorPagination {
-                        start_href: start,
-                        next_href: next,
-                    }),
-                    None,
-                )
-            }
-            Err(err) => {
-                tracing::warn!(actor = %actor, error = %err, "account viewer feed fetch failed");
-                (
-                    Vec::new(),
-                    None,
-                    Some(format!(
-                        "could not load {actor}'s feed — check the handle and try again"
-                    )),
-                )
-            }
-        },
-    };
-
-    let pagination = pagination.unwrap_or(templates::CursorPagination {
-        start_href: None,
-        next_href: None,
-    });
+    let page = account_gallery_page(
+        &state,
+        actor.as_deref(),
+        query.cursor.as_deref(),
+        skip_reposts,
+        oldest,
+    )
+    .await;
 
     if actor.is_some() && is_htmx_request(&headers) {
         let fragment = templates::AccountGalleryGridTemplate {
-            items,
-            pagination,
-            error,
+            items: page.items,
+            pagination: page.pagination,
+            error: page.error,
         };
-        Ok(askama_axum::into_response(&fragment))
-    } else {
-        let saved = saved_rows(&state).await;
-        let sort_options = BROWSER_SORTS
-            .iter()
-            .map(|sort| templates::SortOption {
-                label: sort.label,
-                href: actor
-                    .as_deref()
-                    .map(|actor| browser_href(actor, skip_reposts, sort.oldest, None))
-                    .unwrap_or_else(|| "/browser".to_string()),
-                selected: sort.oldest == oldest,
-            })
-            .collect();
-        let template = templates::BrowserTemplate {
-            version: templates::APP_VERSION,
-            git_revision: templates::GIT_REVISION,
-            build_date: templates::BUILD_DATE,
-            actor: actor.unwrap_or_default(),
-            skip_reposts,
-            items,
-            pagination,
-            error,
-            saved,
-            sort_options,
-        };
-        Ok(askama_axum::into_response(&template))
+        return Ok(askama_axum::into_response(&fragment));
     }
+
+    let sort_options = sort_options(actor.as_deref(), skip_reposts, oldest);
+    let template = templates::BrowseTemplate {
+        version: templates::APP_VERSION,
+        git_revision: templates::GIT_REVISION,
+        build_date: templates::BUILD_DATE,
+        actor: actor.unwrap_or_default(),
+        skip_reposts,
+        items: page.items,
+        pagination: page.pagination,
+        error: page.error,
+        sort_options,
+    };
+    Ok(askama_axum::into_response(&template))
 }
 
 async fn saved_rows(state: &WebState) -> Vec<templates::SavedAccountRow> {
@@ -366,7 +442,7 @@ pub(super) async fn remove_saved_account(
 }
 
 /// The old `/gallery/account` URL, kept working as a redirect: existing
-/// bookmarks/links land on the browser page with the same browse state.
+/// bookmarks/links land on the browse page with the same browse state.
 pub(super) async fn gallery_account_redirect(Query(query): Query<BrowserQuery>) -> Response {
     let actor = query
         .actor
@@ -380,7 +456,7 @@ pub(super) async fn gallery_account_redirect(Query(query): Query<BrowserQuery>) 
             parse_browser_sort(query.sort.as_deref()),
             query.cursor.as_deref(),
         ),
-        None => "/browser".to_string(),
+        None => "/browse".to_string(),
     };
     Redirect::to(&target).into_response()
 }

@@ -496,7 +496,15 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
         .expect("post media bytes on disk");
     assert_eq!(post_media_bytes, b"post-image-bytes");
 
-    let posts_page = store.list_posts(None, 1, 10).await.unwrap();
+    let posts_page = store
+        .list_posts(
+            None,
+            1,
+            10,
+            bsky_archiver::storage::PostSort::NewestArchived,
+        )
+        .await
+        .unwrap();
     assert_eq!(posts_page.total_items, 3);
 
     let gallery_page = store

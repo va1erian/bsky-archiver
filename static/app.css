@@ -255,23 +255,39 @@
   margin: 0;
 }
 
+/* Pagination is a stacked pair: a row of First/Previous/[page]/Next/Last
+   controls, then the small muted meta line under it. The current page is a
+   <button> (not a link) because it opens the in-page page-jump dialog
+   rather than navigating. */
 .pagination {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.45rem;
+  margin-top: 1rem;
+}
+
+.pagination-links {
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
   align-items: center;
-  margin-top: 1rem;
 }
 
 .pagination a,
-.pagination span.current {
+.pagination .pagination-links button.current {
   padding: 0.25rem 0.6rem;
   border-radius: var(--pico-border-radius, 0.25rem);
   border: 1px solid var(--pico-muted-border-color, #ccc);
   text-decoration: none;
 }
 
-.pagination span.current {
+/* Pico sizes buttons full-width with a default margin; the current-page
+   button must sit in the row exactly like its neighbouring links. */
+.pagination .pagination-links button.current {
+  width: auto;
+  margin: 0;
+  min-height: 0;
   background: var(--pico-primary, #2563eb);
   color: var(--pico-contrast-inverse, #fff);
   border-color: transparent;
@@ -280,6 +296,31 @@
 .pagination .disabled {
   opacity: 0.4;
   pointer-events: none;
+}
+
+/* Page-jump dialog: a small centred form (works without JS as a plain GET
+   navigation; the submit button closes it via formmethod="dialog"). */
+.page-jump-dialog {
+  max-width: 20rem;
+  min-width: 16rem;
+}
+
+.page-jump-dialog form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.page-jump-dialog input[type="number"] {
+  width: 6rem;
+  margin: 0;
+}
+
+.page-jump-dialog button {
+  width: auto;
+  margin: 0;
+  min-height: 0;
 }
 
 .media-full {
@@ -766,8 +807,12 @@ a.gallery-item-thumb {
     gap: 0.6rem;
   }
 
+  .pagination-links {
+    gap: 0.6rem;
+  }
+
   .pagination a,
-  .pagination span.current {
+  .pagination .pagination-links button.current {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -909,4 +954,10 @@ a.gallery-item-thumb {
   font-size: 0.85rem;
   color: var(--pico-muted-color, #6b7280);
   border-top: 1px solid var(--pico-muted-border-color, #ccc);
+}
+
+/* Account-grid cursor pagination: "Older" is always anchored on the
+   right of the row, "Newest" on the left. */
+.pagination .cursor-next {
+  margin-left: auto;
 }

@@ -46,20 +46,13 @@ pub struct Pagination {
     pub prev_href: Option<String>,
     pub next_href: Option<String>,
     pub last_href: Option<String>,
-    pub page_links: Vec<PageLink>,
 }
 
-#[derive(Debug, Clone)]
-pub struct PageLink {
-    pub number: u32,
-    pub href: String,
-    pub current: bool,
-}
-
-/// Builds pagination view data (first/last + prev/next links plus a small
-/// window of numbered page links around the current page) from a `page ->
-/// href` builder, so callers can plug in whatever other query params
-/// (category filter, page size) need to survive across pages.
+/// Builds pagination view data (first/last + prev/next links and the
+/// current page/total label, which the templates render as a fixed row of
+/// boundary buttons plus a page-jump dialog) from a `page -> href`
+/// builder, so callers can plug in whatever other query params
+/// (category filter, sort, page size) need to survive across pages.
 pub fn build_pagination(
     page: u32,
     total_pages: u32,
@@ -71,30 +64,6 @@ pub fn build_pagination(
     let next_href = (page < total_pages).then(|| href_for(page + 1));
     let last_href = (page < total_pages).then(|| href_for(total_pages));
 
-    // The numbered window is fixed-width (3 when there are enough pages)
-    // rather than shrinking at the range edges: a centred window would go
-    // 2-3-4 links wide as you page, resizing the switcher on every click.
-    // The start is clamped twice so the window slides up against the last
-    // page instead of overrunning it. Three is as wide as the switcher
-    // gets: five overflowed the mobile viewport (first/prev + five numbers
-    // + next/last + the page meta line).
-    const PAGE_LINK_WINDOW: u32 = 3;
-    let page_links = if total_pages == 0 {
-        Vec::new()
-    } else {
-        let window = PAGE_LINK_WINDOW.min(total_pages);
-        let start = page.saturating_sub(window / 2).max(1);
-        let end = (start + window - 1).min(total_pages);
-        let start = (end + 1).saturating_sub(window).max(1);
-        (start..=end)
-            .map(|n| PageLink {
-                number: n,
-                href: href_for(n),
-                current: n == page,
-            })
-            .collect()
-    };
-
     Pagination {
         page,
         total_pages,
@@ -103,7 +72,6 @@ pub fn build_pagination(
         prev_href,
         next_href,
         last_href,
-        page_links,
     }
 }
 
@@ -331,8 +299,8 @@ pub struct CategoryOption {
     pub selected: bool,
 }
 
-/// One entry of the gallery's sort dropdown; href resets to page 1 with the
-/// sort applied while keeping the active category.
+/// One entry of a sort dropdown (gallery, /posts, browser); the href resets
+/// to page 1 with the sort applied while keeping the active category.
 pub struct SortOption {
     pub label: &'static str,
     pub href: String,
@@ -348,6 +316,13 @@ pub struct PostsTemplate {
     pub rows: Vec<PostRow>,
     pub pagination: Pagination,
     pub category_options: Vec<CategoryOption>,
+    /// The /posts sort dropdown's options, same shape as the gallery's.
+    pub sort_options: Vec<SortOption>,
+    /// Category/page_size context the included [`PostsListTemplate`]
+    /// fragment shares (its page-jump dialog form and excerpt hrefs
+    /// render straight off this page's fields).
+    pub category: String,
+    pub page_size: u32,
     /// Same field as [`PostsListTemplate::excerpts_href`]: the URL the
     /// embedded list will pull its excerpt fill out of once the page loads.
     pub excerpts_href: Option<String>,
@@ -362,6 +337,11 @@ pub struct PostsListTemplate {
     /// skeleton response carries it on `#posts-list` so a pagination swap
     /// immediately loads the next page's excerpts too.
     pub excerpts_href: Option<String>,
+    /// Query params the page-jump dialog must carry along (empty `category`
+    /// renders no hidden input). The dialog is a plain GET form so the jump
+    /// works without JS and stays hx-boost-instant with it.
+    pub category: String,
+    pub page_size: u32,
 }
 
 pub struct PostMedia {
@@ -487,6 +467,12 @@ pub struct GalleryTemplate {
     pub category_options: Vec<CategoryOption>,
     pub sort_options: Vec<SortOption>,
     pub export: GalleryExport,
+    /// Category/sort/page_size context the included
+    /// [`GalleryGridTemplate`] fragment shares (its page-jump dialog
+    /// renders straight off this page's fields).
+    pub category: String,
+    pub sort: String,
+    pub page_size: u32,
 }
 
 #[derive(Template)]
@@ -494,10 +480,16 @@ pub struct GalleryTemplate {
 pub struct GalleryGridTemplate {
     pub items: Vec<GalleryItem>,
     pub pagination: Pagination,
+    /// Query params the page-jump dialog must carry along (empty `category`
+    /// renders no hidden input); the dialog is a plain GET form.
+    pub category: String,
+    pub sort: String,
+    pub page_size: u32,
 }
 
 // ---------------------------------------------------------------------
-// Browser (live /browser, the former /gallery/account viewer)
+// Browser (entry page) + Browse (live account viewer, the former
+// /gallery/account viewer)
 // ---------------------------------------------------------------------
 
 /// Cursor-based pagination for the account viewer: Bluesky's feed
@@ -513,10 +505,8 @@ pub struct CursorPagination {
     pub next_href: Option<String>,
 }
 
-/// The `/browser` page: the saved-accounts favorites panel, a handle form
-/// plus the live picture grid for the requested account. `actor` is empty
-/// on the first visit (no results yet); `error` carries an inline API
-/// failure (e.g. an unresolvable handle).
+/// The `/browser` entry page: the saved-accounts favorites panel plus the
+/// "Browse an account" handle form, which submits to `/browse`.
 #[derive(Template)]
 #[template(path = "browser.html")]
 pub struct BrowserTemplate {
@@ -525,10 +515,29 @@ pub struct BrowserTemplate {
     pub build_date: &'static str,
     pub actor: String,
     pub skip_reposts: bool,
+    pub saved: Vec<SavedAccountRow>,
+    /// Inline error slot. The saved-accounts panel include references
+    /// `error`, and the full-page render has none — but the mutation
+    /// responses reuse the panel as a standalone fragment with its own
+    /// error, so the parent struct carries a `None` to satisfy it.
+    pub error: Option<String>,
+}
+
+/// The `/browse` page: the live picture grid for the requested account.
+/// `actor` is empty before a handle is given (a friendly empty state with
+/// no grid); `error` carries an inline API failure (e.g. an unresolvable
+/// handle).
+#[derive(Template)]
+#[template(path = "browse.html")]
+pub struct BrowseTemplate {
+    pub version: &'static str,
+    pub git_revision: &'static str,
+    pub build_date: &'static str,
+    pub actor: String,
+    pub skip_reposts: bool,
     pub items: Vec<GalleryItem>,
     pub pagination: CursorPagination,
     pub error: Option<String>,
-    pub saved: Vec<SavedAccountRow>,
     /// The sort picker's options, same shape as the gallery's.
     pub sort_options: Vec<SortOption>,
 }
@@ -561,7 +570,7 @@ pub struct SavedAccountsPanelTemplate {
     pub error: Option<String>,
 }
 
-/// The htmx fragment of [`BrowserTemplate`]: the picture grid plus
+/// The htmx fragment of [`BrowseTemplate`]: the picture grid plus
 /// its cursor pagination, swapped in place when the "older posts" link is
 /// clicked. Carries the inline error too, so a failed page load surfaces
 /// in the swapped fragment rather than as a misleading empty grid.
@@ -755,28 +764,5 @@ mod tests {
         assert!(p.prev_href.is_none());
         assert!(p.next_href.is_none());
         assert!(p.last_href.is_none());
-        assert!(p.page_links.is_empty());
-    }
-
-    #[test]
-    fn build_pagination_page_window_is_fixed_width() {
-        let numbers = |page: u32, total: u32| -> Vec<u32> {
-            build_pagination(page, total, 1_000, |n| format!("/posts?page={n}"))
-                .page_links
-                .into_iter()
-                .map(|link| link.number)
-                .collect()
-        };
-        // Three links on every page once there are three pages: flush at
-        // the edges, centred in the middle, never resizing between clicks.
-        // (Five overflowed the mobile page switcher.)
-        assert_eq!(numbers(1, 10), vec![1, 2, 3]);
-        assert_eq!(numbers(2, 10), vec![1, 2, 3]);
-        assert_eq!(numbers(5, 10), vec![4, 5, 6]);
-        assert_eq!(numbers(9, 10), vec![8, 9, 10]);
-        assert_eq!(numbers(10, 10), vec![8, 9, 10]);
-        // Fewer pages than the window: show all of them.
-        assert_eq!(numbers(2, 3), vec![1, 2, 3]);
-        assert_eq!(numbers(1, 1), vec![1]);
     }
 }

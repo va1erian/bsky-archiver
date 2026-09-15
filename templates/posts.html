@@ -10,6 +10,46 @@
 <a href="{{ opt.href }}">{{ opt.label }}</a>
 {% endif %}
 {% endfor %}
+<span class="gallery-sort">
+<label for="posts-sort">Sort</label>
+<select id="posts-sort">
+{% for opt in sort_options %}
+<option value="{{ opt.href }}" {% if opt.selected %}selected{% endif %}>{{ opt.label }}</option>
+{% endfor %}
+</select>
+</span>
 </nav>
 {% include "posts_list.html" %}
+
+<script>
+(function () {
+  var select = document.getElementById("posts-sort");
+  if (select) {
+    select.addEventListener("change", function () {
+      if (select.value) window.location.href = select.value;
+    });
+  }
+
+  // The page-jump dialogs live inside the list fragments htmx swaps in
+  // place, so the opener listens on the document (delegated) and is bound
+  // once per tab: hx-boost re-executes this block on every boosted
+  // navigation, and showModal on an already-open dialog would throw.
+  if (window.__pageJumpBound) return;
+  window.__pageJumpBound = true;
+  document.addEventListener("click", function (event) {
+    var button = event.target.closest("[data-page-jump]");
+    if (!button) return;
+    var pagination = button.closest(".pagination");
+    var dialog = pagination && pagination.querySelector("dialog.page-jump-dialog");
+    if (!dialog || typeof dialog.showModal !== "function") return;
+    event.preventDefault();
+    dialog.showModal();
+    var input = dialog.querySelector("input[type=number]");
+    if (input) {
+      input.focus();
+      input.select();
+    }
+  });
+})();
+</script>
 {% endblock %}

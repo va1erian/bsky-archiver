@@ -70,7 +70,10 @@ async fn save_then_list_round_trip() {
         .expect("save post");
     assert_eq!(outcome, SaveOutcome::Inserted);
 
-    let page = store.list_posts(None, 1, 10).await.expect("list posts");
+    let page = store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await
+        .expect("list posts");
     assert_eq!(page.total_items, 1);
     assert_eq!(page.items.len(), 1);
     assert_eq!(
@@ -104,7 +107,10 @@ async fn saving_same_post_twice_is_a_dedup_no_op() {
         .expect("second save");
     assert_eq!(second, SaveOutcome::AlreadyArchived);
 
-    let page = store.list_posts(None, 1, 10).await.expect("list posts");
+    let page = store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await
+        .expect("list posts");
     assert_eq!(page.total_items, 1);
 
     let fetched = store
@@ -147,8 +153,14 @@ async fn categories_are_isolated() {
         .await
         .unwrap();
 
-    let posts = store.list_posts(Some(Category::Post), 1, 10).await.unwrap();
-    let likes = store.list_posts(Some(Category::Like), 1, 10).await.unwrap();
+    let posts = store
+        .list_posts(Some(Category::Post), 1, 10, PostSort::default())
+        .await
+        .unwrap();
+    let likes = store
+        .list_posts(Some(Category::Like), 1, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(posts.total_items, 1);
     assert_eq!(likes.total_items, 1);
 
@@ -203,7 +215,10 @@ async fn save_media_updates_record_and_gallery_index() {
     assert_eq!(gallery.items[0].filename, "image1.jpg");
     assert_eq!(gallery.items[0].post_at_uri, at_uri);
 
-    let post_list = store.list_posts(None, 1, 10).await.unwrap();
+    let post_list = store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(
         post_list.items[0].thumbnail_filename.as_deref(),
         Some("image1.jpg")
@@ -314,18 +329,30 @@ async fn pagination_returns_correct_slices_and_counts() {
             .unwrap();
     }
 
-    let page1 = store.list_posts(None, 1, 10).await.unwrap();
+    let page1 = store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(page1.items.len(), 10);
     assert_eq!(page1.total_items, 25);
     assert_eq!(page1.total_pages, 3);
 
-    let page2 = store.list_posts(None, 2, 10).await.unwrap();
+    let page2 = store
+        .list_posts(None, 2, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(page2.items.len(), 10);
 
-    let page3 = store.list_posts(None, 3, 10).await.unwrap();
+    let page3 = store
+        .list_posts(None, 3, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(page3.items.len(), 5);
 
-    let page4 = store.list_posts(None, 4, 10).await.unwrap();
+    let page4 = store
+        .list_posts(None, 4, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(page4.items.len(), 0);
 
     // No overlap between pages.
@@ -382,7 +409,10 @@ async fn reindex_from_empty_database_matches_incremental_index() {
         .await
         .unwrap();
 
-    let before_posts = store.list_posts(None, 1, 100).await.unwrap();
+    let before_posts = store
+        .list_posts(None, 1, 100, PostSort::default())
+        .await
+        .unwrap();
     let before_media = store
         .list_media(None, 1, 100, MediaSort::NewestArchived)
         .await
@@ -394,12 +424,18 @@ async fn reindex_from_empty_database_matches_incremental_index() {
     let fresh_store = ArchiveStore::open(archive_dir.clone(), fresh_database_path)
         .await
         .unwrap();
-    let empty_before_reindex = fresh_store.list_posts(None, 1, 100).await.unwrap();
+    let empty_before_reindex = fresh_store
+        .list_posts(None, 1, 100, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(empty_before_reindex.total_items, 0);
 
     fresh_store.reindex().await.unwrap();
 
-    let after_posts = fresh_store.list_posts(None, 1, 100).await.unwrap();
+    let after_posts = fresh_store
+        .list_posts(None, 1, 100, PostSort::default())
+        .await
+        .unwrap();
     let after_media = fresh_store
         .list_media(None, 1, 100, MediaSort::NewestArchived)
         .await
@@ -448,7 +484,10 @@ async fn reindex_on_existing_index_replaces_stale_rows() {
     std::fs::remove_file(&path).unwrap();
 
     store.reindex().await.unwrap();
-    let page = store.list_posts(None, 1, 10).await.unwrap();
+    let page = store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(page.total_items, 0);
 }
 
@@ -599,6 +638,118 @@ async fn list_media_sorts_by_created_at_when_available() {
             .map(|m| m.filename.as_str())
             .collect::<Vec<_>>(),
         ["aa.jpg", "bb.jpg"],
+    );
+}
+
+/// `list_posts` mirrors the same sort semantics `list_media` gives the
+/// gallery: created-time ordering keys off the mirrored `record_created_at`
+/// (falling back to archive time for rows without one), and the action
+/// sorts key off `action_seq`, keeping not-yet-ranked rows last — all of
+/// them, for posts-category rows, which never have an action.
+#[tokio::test]
+async fn list_posts_sorts_by_created_and_action_time() {
+    let (_dir, store) = open_store().await;
+
+    let older_created = "at://did:plc:alice/app.bsky.feed.post/older";
+    let newer_created = "at://did:plc:alice/app.bsky.feed.post/newer";
+    let no_created = "at://did:plc:alice/app.bsky.feed.post/plain";
+    store
+        .save_post(
+            Category::Post,
+            older_created,
+            "cid-a",
+            json!({"createdAt": "2024-01-01T00:00:00Z"}),
+        )
+        .await
+        .unwrap();
+    store
+        .save_post(
+            Category::Post,
+            newer_created,
+            "cid-b",
+            json!({"createdAt": "2024-06-01T00:00:00Z"}),
+        )
+        .await
+        .unwrap();
+    // Saved last, so newest-archived order is exactly this list; no
+    // `createdAt`, so the created sorts fall back to its archive time.
+    store
+        .save_post(Category::Post, no_created, "cid-c", json!({}))
+        .await
+        .unwrap();
+
+    let uris = |page: &crate::storage::Page<crate::storage::PostSummary>| -> Vec<String> {
+        page.items.iter().map(|p| p.at_uri.clone()).collect()
+    };
+
+    let newest_archived = store
+        .list_posts(Some(Category::Post), 1, 10, PostSort::NewestArchived)
+        .await
+        .unwrap();
+    assert_eq!(
+        uris(&newest_archived),
+        vec![
+            no_created.to_string(),
+            newer_created.to_string(),
+            older_created.to_string()
+        ],
+    );
+
+    let oldest_archived = store
+        .list_posts(Some(Category::Post), 1, 10, PostSort::OldestArchived)
+        .await
+        .unwrap();
+    assert_eq!(
+        uris(&oldest_archived),
+        vec![
+            older_created.to_string(),
+            newer_created.to_string(),
+            no_created.to_string()
+        ],
+    );
+
+    let created_newest = store
+        .list_posts(Some(Category::Post), 1, 10, PostSort::NewestCreated)
+        .await
+        .unwrap();
+    // `no_created`'s archive-time fallback is the newest of the three, so
+    // it leads; the two ranked rows follow by their created values.
+    assert_eq!(
+        uris(&created_newest),
+        vec![
+            no_created.to_string(),
+            newer_created.to_string(),
+            older_created.to_string()
+        ],
+    );
+
+    let created_oldest = store
+        .list_posts(Some(Category::Post), 1, 10, PostSort::OldestCreated)
+        .await
+        .unwrap();
+    assert_eq!(
+        uris(&created_oldest),
+        vec![
+            older_created.to_string(),
+            newer_created.to_string(),
+            no_created.to_string()
+        ],
+    );
+
+    // Category=posts rows have no action at all: every row is unranked, so
+    // the action sorts keep them all (NULLs-last, archive order) rather
+    // than dropping the page.
+    let action_newest = store
+        .list_posts(Some(Category::Post), 1, 10, PostSort::NewestAction)
+        .await
+        .unwrap();
+    assert_eq!(
+        uris(&action_newest),
+        vec![
+            no_created.to_string(),
+            newer_created.to_string(),
+            older_created.to_string()
+        ]
     );
 }
 
@@ -792,7 +943,10 @@ async fn opening_a_v1_database_upgrades_to_schema_v2_in_place() {
         .expect("open store upgrades v1");
 
     // The v1 posts row is untouched...
-    let page = store.list_posts(None, 1, 10).await.unwrap();
+    let page = store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(page.total_items, 1);
     assert_eq!(page.items[0].at_uri, "at://did:plc:v1/app.bsky.feed.post/1");
 
@@ -1010,7 +1164,10 @@ async fn list_posts_includes_deleted_at() {
         .await
         .unwrap();
 
-    let page = store.list_posts(None, 1, 10).await.unwrap();
+    let page = store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(page.items.len(), 1);
     assert!(
         page.items[0].deleted_at.is_none(),
@@ -1019,7 +1176,10 @@ async fn list_posts_includes_deleted_at() {
 
     store.mark_post_deleted(at_uri).await.unwrap();
 
-    let page = store.list_posts(None, 1, 10).await.unwrap();
+    let page = store
+        .list_posts(None, 1, 10, PostSort::default())
+        .await
+        .unwrap();
     assert_eq!(page.items.len(), 1);
     assert!(
         page.items[0].deleted_at.is_some(),

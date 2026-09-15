@@ -471,31 +471,186 @@
     if (event.target === dialog) dialog.close();
   });
 
-  // Swipe navigation: a mostly-horizontal flick moves to the neighbouring
-  // image (or page). Touches that start on a video (its controls) or a
-  // button are left alone, and vertical drags never navigate. A second
-  // finger invalidates the swipe via the touchstart length check.
+  // Touch gestures: a small state machine decides, on the first ~12px of
+  // dominant-axis movement, whether the gesture is a horizontal swipe
+  // (navigate to the neighbouring image/page) or a vertical upward drag
+  // (drag-to-close, media following the finger). One mode is committed and
+  // the other is never fallen through to. Touches starting on a button
+  // never gesture; touches starting in a video's native control bar
+  // (bottom ~96px of its box — UA shadow DOM, so detected geometrically)
+  // neither, so scrubbing/seeking stays possible; swiping on the video
+  // itself works. A second finger invalidates the gesture.
   var touchStart = null;
+
+  function touchOnVideoControls(event, touch) {
+    var video = event.target.closest("video");
+    if (!video) return false;
+    var rect = video.getBoundingClientRect();
+    return (
+      touch.clientY >= rect.bottom - Math.min(96, rect.height) &&
+      touch.clientY <= rect.bottom
+    );
+  }
+
+  // Release below the dismiss threshold (or gesture cancelled): spring the
+  // media back to identity quickly and clear the inline styles afterwards.
+  function springBackMedia(el) {
+    if (!el) return;
+    var clear = function () {
+      el.style.transform = "";
+      el.style.opacity = "";
+    };
+    if (prefersReducedMotion()) {
+      clear();
+      return;
+    }
+    try {
+      var anim = el.animate(
+        [
+          {
+            transform: el.style.transform || "translateY(0)",
+            opacity: el.style.opacity || "1",
+          },
+          { transform: "translateY(0)", opacity: "1" },
+        ],
+        { duration: 140, easing: "ease-out" }
+      );
+      anim.addEventListener("finish", clear);
+      anim.addEventListener("cancel", clear);
+    } catch (err) {
+      clear();
+    }
+  }
+
+  // Release beyond the threshold (distance or flick velocity): fly the media
+  // up and out, then close — the dialog's close handler (stopPlayback) tears
+  // the media down, which also clears every inline transform left over.
+  function dismissViaDrag(el) {
+    function closeNow() {
+      if (el && el.isConnected) teardownMedia(el);
+      // The dialog may already have been closed out from under the gesture
+      // (an unrelated htmx swap); closing a closed dialog throws.
+      if (dialog.open) dialog.close();
+    }
+    if (!el || prefersReducedMotion()) {
+      closeNow();
+      return;
+    }
+    try {
+      var anim = el.animate(
+        [
+          {
+            transform: el.style.transform || "translateY(0)",
+            opacity: el.style.opacity || "1",
+          },
+          {
+            transform: "translateY(-" + Math.round(window.innerHeight * 1.1) + "px)",
+            opacity: "0",
+          },
+        ],
+        { duration: 180, easing: "ease-out" }
+      );
+      anim.addEventListener("finish", closeNow);
+      anim.addEventListener("cancel", closeNow);
+    } catch (err) {
+      closeNow();
+    }
+  }
+
+  function cancelTouchGesture() {
+    if (!touchStart) return;
+    var el = touchStart.el;
+    touchStart = null;
+    springBackMedia(el);
+  }
+
   dialog.addEventListener("touchstart", function (event) {
-    if (event.touches.length !== 1 || event.target.closest("video, button")) {
+    if (event.touches.length !== 1 || event.target.closest("button")) {
       touchStart = null;
       return;
     }
     var touch = event.touches[0];
-    touchStart = { x: touch.clientX, y: touch.clientY };
+    touchStart = {
+      x: touch.clientX,
+      y: touch.clientY,
+      mode: null, // undecided until ~12px of dominant-axis movement
+      controls: touchOnVideoControls(event, touch),
+      el: null,
+      velocity: 0,
+      lastY: touch.clientY,
+      lastT: event.timeStamp,
+    };
   }, { passive: true });
-  dialog.addEventListener("touchcancel", function () {
-    touchStart = null;
-  }, { passive: true });
-  dialog.addEventListener("touchend", function (event) {
+
+  // Non-passive so the drag-close path can preventDefault (stopping page
+  // overscroll/bounce while the media follows the finger); the horizontal
+  // swipe path never calls preventDefault.
+  dialog.addEventListener("touchmove", function (event) {
     if (!touchStart) return;
-    var touch = event.changedTouches[0];
+    if (event.touches.length !== 1) {
+      cancelTouchGesture();
+      return;
+    }
+    var touch = event.touches[0];
     var dx = touch.clientX - touchStart.x;
     var dy = touch.clientY - touchStart.y;
+    if (!touchStart.mode) {
+      if (touchStart.controls) {
+        // Started in the video control bar: scrubbing, never a gesture.
+        return;
+      }
+      if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy)) {
+        touchStart.mode = "h";
+      } else if (dy < 0 && -dy > 12 && -dy > Math.abs(dx)) {
+        touchStart.mode = "v";
+        // Co-exist with an in-flight slide: snap it to its end state first
+        // so the drag grabs the settled current media.
+        finishPendingSlide();
+        touchStart.el = content.firstElementChild;
+      }
+    }
+    if (touchStart.mode !== "v" || !touchStart.el) return;
+    event.preventDefault();
+    var dragged = -dy;
+    touchStart.el.style.transform = "translateY(" + -dragged + "px)";
+    touchStart.el.style.opacity = String(
+      Math.max(0, 1 - dragged / (window.innerHeight * 0.25))
+    );
+    var dt = event.timeStamp - touchStart.lastT;
+    if (dt > 0) {
+      var v = ((touchStart.lastY - touch.clientY) / dt) * 1000;
+      touchStart.velocity = touchStart.velocity
+        ? touchStart.velocity * 0.5 + v * 0.5
+        : v;
+    }
+    touchStart.lastY = touch.clientY;
+    touchStart.lastT = event.timeStamp;
+  }, { passive: false });
+
+  dialog.addEventListener("touchcancel", function () {
+    cancelTouchGesture();
+  }, { passive: true });
+
+  dialog.addEventListener("touchend", function (event) {
+    if (!touchStart) return;
+    var state = touchStart;
     touchStart = null;
+    var touch = event.changedTouches[0];
+    var dx = touch.clientX - state.x;
+    var dy = touch.clientY - state.y;
+    if (state.mode === "v") {
+      event.preventDefault(); // no synthetic click after a drag
+      if (-dy > window.innerHeight * 0.22 || state.velocity > 800) {
+        dismissViaDrag(state.el);
+      } else {
+        springBackMedia(state.el);
+      }
+      return;
+    }
+    if (state.mode !== "h") return;
     if (Math.abs(dx) < 48 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
     if (dx < 0) goNext(); else goPrev();
-  }, { passive: true });
+  }, { passive: false });
 
   document.addEventListener("keydown", function (event) {
     if (!dialog.open) return;

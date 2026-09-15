@@ -303,6 +303,52 @@ impl MediaSort {
     }
 }
 
+/// How rows are ordered for the posts list (`/posts`). Same semantics as
+/// [`MediaSort`] but keyed off the `posts` table's own columns: archive
+/// time (`indexed_at`), the record's mirrored `createdAt`, and the
+/// like/bookmark action position (`action_seq`; NULL for posts rows, which
+/// have no action — the ranked-rows-first ordering still applies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostSort {
+    #[default]
+    NewestArchived,
+    OldestArchived,
+    NewestCreated,
+    OldestCreated,
+    NewestAction,
+    OldestAction,
+}
+
+impl PostSort {
+    /// SQL used as the ordering key (column/tiebreak pair inline) in
+    /// `list_posts`, where `p` is the `posts` alias in scope.
+    /// `record_created_at` falls back to the row's archive time for rows
+    /// whose record carried no `createdAt`; the action sorts key off
+    /// `action_seq` (the item's position in Bluesky's own list — what the
+    /// Bluesky app displays), falling back to archive order for rows not
+    /// yet ranked.
+    fn sql(self) -> &'static str {
+        match self {
+            PostSort::NewestArchived => "p.indexed_at DESC, p.at_uri DESC",
+            PostSort::OldestArchived => "p.indexed_at ASC, p.at_uri ASC",
+            PostSort::NewestCreated => {
+                "COALESCE(p.record_created_at, p.indexed_at) DESC, p.at_uri DESC"
+            }
+            PostSort::OldestCreated => {
+                "COALESCE(p.record_created_at, p.indexed_at) ASC, p.at_uri ASC"
+            }
+            PostSort::NewestAction => concat!(
+                "(p.action_seq IS NULL) ASC, p.action_seq ASC, ",
+                "p.indexed_at DESC, p.at_uri DESC"
+            ),
+            PostSort::OldestAction => concat!(
+                "(p.action_seq IS NULL) ASC, p.action_seq DESC, ",
+                "p.indexed_at ASC, p.at_uri ASC"
+            ),
+        }
+    }
+}
+
 /// A row for the gallery view: one media file plus a pointer back to its
 /// post.
 #[derive(Debug, Clone, PartialEq)]
@@ -1201,13 +1247,14 @@ impl ArchiveStore {
         join_result(result)
     }
 
-    /// Lists posts (optionally filtered by category) newest-first, via
-    /// the SQLite index.
+    /// Lists posts (optionally filtered by category), ordered by `sort`
+    /// (see [`PostSort`]), via the SQLite index.
     pub async fn list_posts(
         &self,
         category: Option<Category>,
         page: u32,
         page_size: u32,
+        sort: PostSort,
     ) -> Result<Page<PostSummary>, StorageError> {
         let db = Arc::clone(&self.db);
         let page = page.max(1);
@@ -1225,7 +1272,7 @@ impl ArchiveStore {
                 )? as u64;
 
                 let offset = (page - 1) as i64 * page_size as i64;
-                let mut stmt = conn.prepare(
+                let sql = format!(
                     "SELECT p.at_uri, p.category, p.cid, p.indexed_at,
                         (SELECT COUNT(*) FROM media m WHERE m.post_at_uri = p.at_uri),
                         (SELECT m.filename FROM media m WHERE m.post_at_uri = p.at_uri
@@ -1235,9 +1282,12 @@ impl ArchiveStore {
                         p.deleted_at
                  FROM posts p
                  WHERE ?1 IS NULL OR p.category = ?1
-                 ORDER BY p.indexed_at DESC, p.at_uri DESC
-                 LIMIT ?2 OFFSET ?3",
-                )?;
+                 ORDER BY {order}
+                 LIMIT ?2 OFFSET ?3
+                ",
+                    order = sort.sql()
+                );
+                let mut stmt = conn.prepare(&sql)?;
                 let rows =
                     stmt.query_map(params![category_filter, page_size as i64, offset], |row| {
                         let category: String = row.get(1)?;

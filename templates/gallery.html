@@ -54,6 +54,28 @@
     if (typeof target === "string") target = document.querySelector(target);
     if (target && target.id === "gallery-grid") window.scrollTo(0, 0);
   });
+
+  // Page-jump dialog opener, shared with /posts (see posts.html): the
+  // dialogs live inside the swapped grid fragments, so listen on the
+  // document and bind once per tab (hx-boost re-runs this block on every
+  // boosted navigation).
+  if (!window.__pageJumpBound) {
+    window.__pageJumpBound = true;
+    document.addEventListener("click", function (event) {
+      var button = event.target.closest("[data-page-jump]");
+      if (!button) return;
+      var pagination = button.closest(".pagination");
+      var dialog = pagination && pagination.querySelector("dialog.page-jump-dialog");
+      if (!dialog || typeof dialog.showModal !== "function") return;
+      event.preventDefault();
+      dialog.showModal();
+      var input = dialog.querySelector("input[type=number]");
+      if (input) {
+        input.focus();
+        input.select();
+      }
+    });
+  }
 })();
 </script>
 

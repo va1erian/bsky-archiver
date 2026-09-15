@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use super::dashboard::fetch_excerpts;
 use super::{WebError, WebState, clamp_page_size, is_htmx_request};
-use crate::storage::Category;
+use crate::storage::{Category, PostSort};
 use crate::templates;
 
 // ---------------------------------------------------------------------
@@ -20,6 +20,7 @@ pub(super) struct PostsQuery {
     pub(super) category: Option<String>,
     pub(super) page: Option<u32>,
     pub(super) page_size: Option<u32>,
+    pub(super) sort: Option<String>,
 }
 
 /// Shared query parsing/execution for `/posts` and `/posts/excerpts` so both
@@ -28,6 +29,7 @@ struct PagedQuery {
     category: Option<Category>,
     page: u32,
     page_size: u32,
+    sort: PostSort,
 }
 
 fn paged_query(query: PostsQuery) -> Result<PagedQuery, WebError> {
@@ -41,7 +43,44 @@ fn paged_query(query: PostsQuery) -> Result<PagedQuery, WebError> {
         category,
         page: query.page.unwrap_or(1).max(1),
         page_size: clamp_page_size(query.page_size),
+        sort: parse_post_sort(query.sort.as_deref())?,
     })
+}
+
+/// Parses a `/posts` `sort` query value into a [`PostSort`]: `newest`
+/// (default, archive time) / `oldest` / `created-newest` / `created-oldest`
+/// / `bookmarked-newest` / `bookmarked-oldest` (the like/bookmark action
+/// position, the order Bluesky's own lists use); anything else is a `400`,
+/// matching how an unknown category is handled and the tokens/shape the
+/// gallery's sort picker uses.
+fn parse_post_sort(raw: Option<&str>) -> Result<PostSort, WebError> {
+    let sort = match raw {
+        None | Some("newest") => PostSort::NewestArchived,
+        Some("oldest") => PostSort::OldestArchived,
+        Some("created-newest") => PostSort::NewestCreated,
+        Some("created-oldest") => PostSort::OldestCreated,
+        Some("bookmarked-newest") => PostSort::NewestAction,
+        Some("bookmarked-oldest") => PostSort::OldestAction,
+        Some(other) => {
+            return Err(WebError::BadRequest {
+                message: format!("unknown sort {other:?}"),
+            });
+        }
+    };
+    Ok(sort)
+}
+
+/// The query token for a [`PostSort`] in `/posts` links, the token that
+/// [`parse_post_sort`] accepts.
+fn sort_token(sort: PostSort) -> &'static str {
+    match sort {
+        PostSort::NewestArchived => "newest",
+        PostSort::OldestArchived => "oldest",
+        PostSort::NewestCreated => "created-newest",
+        PostSort::OldestCreated => "created-oldest",
+        PostSort::NewestAction => "bookmarked-newest",
+        PostSort::OldestAction => "bookmarked-oldest",
+    }
 }
 
 /// Fast path for both the full page and the pagination fragment: rows come
@@ -58,9 +97,14 @@ pub(super) async fn list_posts(
     let result = state
         .app
         .store
-        .list_posts(parsed.category, parsed.page, parsed.page_size)
+        .list_posts(parsed.category, parsed.page, parsed.page_size, parsed.sort)
         .await?;
-    let excerpts_href = excerpts_href(category_param.as_deref(), parsed.page, parsed.page_size);
+    let excerpts_href = excerpts_href(
+        category_param.as_deref(),
+        parsed.sort,
+        parsed.page,
+        parsed.page_size,
+    );
 
     let rows = result
         .items
@@ -70,7 +114,7 @@ pub(super) async fn list_posts(
 
     let pagination =
         templates::build_pagination(result.page, result.total_pages, result.total_items, |n| {
-            posts_href(category_param.as_deref(), n, parsed.page_size)
+            posts_href(category_param.as_deref(), parsed.sort, n, parsed.page_size)
         });
 
     if is_htmx_request(&headers) {
@@ -78,10 +122,15 @@ pub(super) async fn list_posts(
             rows,
             pagination,
             excerpts_href: Some(excerpts_href),
+            category: category_param.clone().unwrap_or_default(),
+            page_size: parsed.page_size,
         };
         Ok(askama_axum::into_response(&fragment))
     } else {
-        let category_options = build_category_options(category_param.as_deref());
+        let category_options =
+            build_category_options(category_param.as_deref(), parsed.sort, parsed.page_size);
+        let sort_options =
+            build_post_sort_options(category_param.as_deref(), parsed.sort, parsed.page_size);
         let template = templates::PostsTemplate {
             version: templates::APP_VERSION,
             git_revision: templates::GIT_REVISION,
@@ -89,6 +138,9 @@ pub(super) async fn list_posts(
             rows,
             pagination,
             category_options,
+            sort_options,
+            category: category_param.clone().unwrap_or_default(),
+            page_size: parsed.page_size,
             excerpts_href: Some(excerpts_href),
         };
         Ok(askama_axum::into_response(&template))
@@ -107,7 +159,7 @@ pub(super) async fn excerpts(
     let result = state
         .app
         .store
-        .list_posts(parsed.category, parsed.page, parsed.page_size)
+        .list_posts(parsed.category, parsed.page, parsed.page_size, parsed.sort)
         .await?;
     let texts = fetch_excerpts(&state.app.store, &result.items).await;
     let excerpts: Vec<templates::ExcerptSlot> = result
@@ -126,27 +178,40 @@ pub(super) async fn excerpts(
     }))
 }
 
-fn posts_href(category: Option<&str>, page: u32, page_size: u32) -> String {
-    match category {
-        Some(category) => format!("/posts?category={category}&page={page}&page_size={page_size}"),
-        None => format!("/posts?page={page}&page_size={page_size}"),
-    }
+/// Builds `/posts` hrefs carrying every active filter, so moving pages
+/// keeps the category, sort, and page size.
+fn posts_path(category: Option<&str>, sort: PostSort) -> String {
+    let category_part = match category {
+        Some(category) => format!("category={category}&"),
+        None => String::new(),
+    };
+    format!("/posts?{category_part}sort={}", sort_token(sort))
+}
+
+fn posts_href(category: Option<&str>, sort: PostSort, page: u32, page_size: u32) -> String {
+    format!(
+        "{}&page={page}&page_size={page_size}",
+        posts_path(category, sort)
+    )
 }
 
 /// Like [`posts_href`] but pointing at the deferred excerpt fill.
-fn excerpts_href(category: Option<&str>, page: u32, page_size: u32) -> String {
-    match category {
-        Some(category) => {
-            format!("/posts/excerpts?category={category}&page={page}&page_size={page_size}")
-        }
-        None => format!("/posts/excerpts?page={page}&page_size={page_size}"),
-    }
+fn excerpts_href(category: Option<&str>, sort: PostSort, page: u32, page_size: u32) -> String {
+    let path = posts_path(category, sort).replace("/posts?", "/posts/excerpts?");
+    format!("{path}&page={page}&page_size={page_size}")
 }
 
-fn build_category_options(selected: Option<&str>) -> Vec<templates::CategoryOption> {
+fn build_category_options(
+    selected: Option<&str>,
+    sort: PostSort,
+    page_size: u32,
+) -> Vec<templates::CategoryOption> {
+    // Switching category resets to page 1 but keeps the active sort, like
+    // the gallery's category nav.
+    let href = |token: Option<&str>| posts_href(token, sort, 1, page_size);
     let mut options = vec![templates::CategoryOption {
         label: "All",
-        href: "/posts".to_string(),
+        href: href(None),
         selected: selected.is_none(),
     }];
     for (value, label) in [
@@ -157,12 +222,37 @@ fn build_category_options(selected: Option<&str>) -> Vec<templates::CategoryOpti
     ] {
         options.push(templates::CategoryOption {
             label,
-            href: format!("/posts?category={value}"),
+            href: href(Some(value)),
             selected: selected == Some(value),
         });
     }
     options
 }
+
+/// Builds the sort dropdown's options: each resets to page 1 while keeping
+/// the active category. Same labels and tokens as the gallery's picker.
+fn build_post_sort_options(
+    active_category: Option<&str>,
+    selected: PostSort,
+    page_size: u32,
+) -> Vec<templates::SortOption> {
+    [
+        (PostSort::NewestArchived, "Newest archived"),
+        (PostSort::OldestArchived, "Oldest archived"),
+        (PostSort::NewestCreated, "Newest created"),
+        (PostSort::OldestCreated, "Oldest created"),
+        (PostSort::NewestAction, "Newest bookmarked"),
+        (PostSort::OldestAction, "Oldest bookmarked"),
+    ]
+    .into_iter()
+    .map(|(sort, label)| templates::SortOption {
+        label,
+        href: posts_href(active_category, sort, 1, page_size),
+        selected: sort == selected,
+    })
+    .collect()
+}
+
 pub(super) async fn post_detail(
     State(state): State<WebState>,
     Path(id): Path<String>,
