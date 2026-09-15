@@ -179,10 +179,6 @@ pub(super) async fn gallery(
         .list_media(category, page, page_size, sort)
         .await?;
     let items: Vec<_> = result.items.iter().map(templates::gallery_item).collect();
-    // End-of-list page (fewer items than the page size): the client-side
-    // fill top-up has nothing left to fetch, so the grid renders upfront
-    // with the stretched-flex fallback (and JS-class fallback otherwise).
-    let fill_fallback = items.len() < page_size as usize;
 
     let pagination =
         templates::build_pagination(result.page, result.total_pages, result.total_items, |n| {
@@ -190,12 +186,7 @@ pub(super) async fn gallery(
         });
 
     if is_htmx_request(&headers) {
-        let fragment = templates::GalleryGridTemplate {
-            fill_fallback,
-            items,
-            pagination,
-            page_size,
-        };
+        let fragment = templates::GalleryGridTemplate { items, pagination };
         Ok(askama_axum::into_response(&fragment))
     } else {
         let estimate = state.app.store.export_estimate(category).await?;
@@ -211,8 +202,6 @@ pub(super) async fn gallery(
             category_options,
             sort_options,
             export,
-            page_size,
-            fill_fallback,
         };
         Ok(askama_axum::into_response(&template))
     }

@@ -1,4 +1,4 @@
-//! `#[cfg(test)]` coverage for the web UI: drives the real router (real
+﻿//! `#[cfg(test)]` coverage for the web UI: drives the real router (real
 //! `ArchiveStore` on a tempdir) through auth, every page, pagination
 //! boundaries, htmx fragment swaps, and media caching/revalidation.
 
@@ -1253,7 +1253,7 @@ async fn gallery_export_estimate_counts_images_only_including_null_content_type(
         )
         .await
         .unwrap();
-    // A video under the same category — excluded from the count.
+    // A video under the same category â€” excluded from the count.
     seed_image_and_video(&state.store).await;
 
     let key = Key::derive_from(state.config.ui_session_secret.expose_secret().as_bytes());
@@ -1279,7 +1279,7 @@ async fn gallery_export_estimate_counts_images_only_including_null_content_type(
     assert!(posts_body.contains("2 images"));
     assert!(posts_body.contains("Download zip"));
 
-    // Likes category: only a video → empty export selection.
+    // Likes category: only a video â†’ empty export selection.
     let likes = gallery(
         State(app_state),
         Query(GalleryQuery {
@@ -2005,46 +2005,6 @@ async fn like_and_bookmark_actions_create_records_with_the_post_ref() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn browser_limit_param_drives_the_feed_page_size_and_persists_in_links() {
-    use wiremock::matchers::{method, path, query_param};
-    use wiremock::{Mock, ResponseTemplate};
-
-    let server = wiremock::MockServer::start().await;
-    mount_ui_session(&server).await;
-    Mock::given(method("GET"))
-        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
-        .and(query_param("limit", "57"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(account_viewer_feed_page()))
-        .mount(&server)
-        .await;
-
-    let (_dir, state, _candidate_tx) =
-        test_state_with_bluesky(url::Url::parse(&server.uri()).unwrap()).await;
-    let app = router(Arc::clone(&state));
-    let cookie = login(&app).await;
-
-    let response = app
-        .oneshot(
-            Request::get("/browser?actor=bob.bsky.social&limit=57")
-                .header(header::COOKIE, cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_string(response).await;
-
-    // The wrapper echoes the effective limit for the fill top-up, and the
-    // "older" link keeps it so subsequent pages keep the alignment.
-    assert!(body.contains("data-fill-current=\"57\""));
-    assert!(
-        body.contains("&amp;limit=57&amp;cursor=next"),
-        "the older link keeps the limit"
-    );
 }
 
 #[tokio::test]

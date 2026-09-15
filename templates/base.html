@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -55,135 +55,8 @@
 {% block content %}{% endblock %}
 </main>
 <footer class="app-footer container">
-<p>bsky-archiver v{{ version }} · rev {{ git_revision }} · built {{ build_date }}</p>
+<p>bsky-archiver v{{ version }} Â· rev {{ git_revision }} Â· built {{ build_date }}</p>
 </footer>
-<script>
-// Fill-to-columns top-up. Server-side the page counts are fixed while the
-// *column* count depends on the client viewport, so a fixed page size
-// (20/50 by default) leaves blank cells in the last row. After render this
-// measures how many grid columns actually fit: when the item count doesn't
-// fill them and the URL carries NO explicit page_size/limit — i.e. it's
-// browsing at the default count — it re-requests the same page/selection
-// with the count raised to the next multiple of the column count. The
-// swap is the same htmx fragment pattern pagination uses, but it changes
-// neither the URL nor the history, so deep-linked pages and back/forward
-// restoration do exactly what they did before — and explicit counts (the
-// pagination contract carried in URLs and links) keep their exact meaning:
-// those get the stretched-flex fallback for their short last line
-// (`.cannot-fill`, app.css). If the source runs out before a multiple can
-// be fetched, the default page also falls back to flex-stretch. Without
-// JS nothing changes: pages render at their default counts.
-(function () {
-  var MIN_COLUMN_PX = 144; // .gallery-grid column floor (9rem)
-  var MAX_TARGET = 100; // both server ceilings: page size and feed limit
-  var inflight = false;
-  var attempted = null;
-
-  function columnsThatFit(grid) {
-    var style = window.getComputedStyle(grid);
-    var gap = parseFloat(style.columnGap) || 0;
-    var width = grid.clientWidth;
-    return Math.max(1, Math.floor((width + gap) / (MIN_COLUMN_PX + gap)));
-  }
-
-  function fill() {
-    if (inflight || typeof htmx === "undefined") return;
-    // An open lightbox is mid walk: a swap now would tear its content
-    // down (the dialog's swap handler closes it), so leave it alone.
-    var dialog = document.getElementById("lightbox");
-    if (dialog && dialog.open) return;
-
-    var wrapper = document.querySelector("[data-fill-param]");
-    if (!wrapper) return;
-    var grid = wrapper.querySelector(".gallery-grid");
-    var param = wrapper.getAttribute("data-fill-param");
-    if (!grid || !param) return;
-    var cols = columnsThatFit(grid);
-    var items = grid.children.length;
-    if (!cols || !items) return;
-    if (items % cols === 0) return; // rows already full
-
-    var params = new URLSearchParams(window.location.search);
-    // An explicit page_size/limit in the URL is a decision the user (or a
-    // pagination link) made: rewriting it would change how pages divide,
-    // break history restoration, and clash with the invariants the URLs
-    // promise. Explicit counts get the stretched-flex fallback instead.
-    if (params.has(param)) {
-      grid.classList.add("cannot-fill");
-      return;
-    }
-    // Default (no-param) page: raise the count to the next multiple of
-    // the measured columns. The swap covers the SAME page (page 1/cursor),
-    // just deeper, so it cannot duplicate; it neither pushes a history
-    // entry nor rewrites the URL, and the swapped-in markup carries the
-    // page_size value in its own links onwards.
-    var current = parseInt(wrapper.getAttribute("data-fill-current"), 10) || 0;
-    var target = Math.min(items + (cols - (items % cols)), MAX_TARGET);
-    if (target <= current) {
-      grid.classList.add("cannot-fill");
-      return;
-    }
-    params.set(param, String(target));
-    var href = window.location.pathname + "?" + params.toString();
-    if (attempted === href) {
-      // Already fetched this alignment and got shorted (source exhausted
-      // before a multiple): fall back to flex-stretched items.
-      grid.classList.add("cannot-fill");
-      return;
-    }
-    attempted = href;
-    inflight = true;
-    // Set while the top-up is in flight so the per-page after:swap
-    // handlers that force the viewport to the top skip this swap; reset
-    // in the continuation, which htmx resolves strictly after the
-    // after:swap dispatch has finished.
-    window.__fillSkipScroll = true;
-    htmx
-      .ajax("GET", href, {
-        target: "#" + wrapper.id,
-        swap: "outerHTML",
-        push: "false",
-      })
-      .then(
-        function () {
-          inflight = false;
-          window.__fillSkipScroll = false;
-        },
-        function () {
-          inflight = false;
-          window.__fillSkipScroll = false;
-          grid.classList.add("cannot-fill");
-        }
-      );
-  }
-
-  var resizeTimer = null;
-  window.addEventListener("resize", function () {
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(fill, 250);
-  });
-
-  // Run once at ready: the first paint renders the server default
-  // (20/50), so a viewport whose column count divides it badly gets the
-  // aligned count right away.
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", fill);
-  } else {
-    fill();
-  }
-
-  // Any htmx swap may have brought a fresh grid in (boosted nav, history
-  // restore, the browser feed's cursor pages). With no explicit count
-  // parameter in the URL this keeps default pages aligned; with one, it
-  // just reasserts the flex fallback.
-  document.body.addEventListener("htmx:after:swap", function () {
-    fill();
-  });
-
-  // `inflight` skips fills while a top-up fetch is in flight so concurrent
-  // resize/swap re-entries don't stack swaps of the same wrapper.
-})();
-</script>
 <script>
 (function(){
   var select = document.getElementById('accent-select');
@@ -397,8 +270,8 @@
   // so playback and its network fetch actually stop.
   dialog.addEventListener("close", stopPlayback);
 
-  // A swap (gallery pagination, …) replaces the page under an open
-  // lightbox; close it rather than leave media playing over new content —
+  // A swap (gallery pagination, â€¦) replaces the page under an open
+  // lightbox; close it rather than leave media playing over new content â€”
   // unless the swap *is* the lightbox loading an adjacent page, in which
   // case the loadAdjacentPage continuation takes over. htmx fires
   // after:swap before its ajax promise settles, so this flag doubles as
@@ -516,7 +389,7 @@
   });
 
   // Loads the adjacent gallery/posts page through htmx (same fragment swap
-  // the pagination links perform), then lands on its first (or last) item —
+  // the pagination links perform), then lands on its first (or last) item â€”
   // so next past the last image of a page continues into the next page,
   // and prev before the first image walks back into the previous one.
   function loadAdjacentPage(rel, pickFromEnd, direction) {
