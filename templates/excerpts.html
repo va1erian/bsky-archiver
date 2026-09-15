@@ -1,0 +1,8 @@
+{# The out-of-band excerpt fill used by `/posts/excerpts` and `/recent`:
+   each paragraph carries hx-swap-oob, so htmx replaces the identically-id'd
+   placeholder in the already-rendered list without touching the rest of the
+   page (no flicker, no media re-fetch). Only slots that resolved to text are
+   emitted — failed reads leave their placeholders empty. #}
+{% for slot in excerpts %}
+<p class="excerpt" id="{{ slot.id }}" hx-swap-oob="true">{% if let Some(text) = slot.text %}{{ text }}{% endif %}</p>
+{% endfor %}

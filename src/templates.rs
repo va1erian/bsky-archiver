@@ -233,19 +233,40 @@ pub struct DashboardTemplate {
     pub bookmarks_count: u64,
     pub tumblr_likes_count: u64,
     pub health: Vec<SubsystemRow>,
-    /// Recent-activity rows rendered excerpt-less; the grid self-refreshes
-    /// from `/recent` via htmx after load.
+    /// Recent-activity rows rendered excerpt-less; the grid's placeholder
+    /// slots are filled out-of-band from `/recent` via htmx after load.
     pub recent: Vec<PostRow>,
 }
 
-/// The deferred recent-activity grid served by `/recent`: identical card
-/// markup to the dashboard's fast-path grid (the dashboard deliberately
-/// renders excerpt-less rows so boosted navigation lands instantly), plus
-/// the excerpts the fragment swap provides.
+/// One deferred excerpt slot: an in-page `<p class="excerpt" id>` placeholder
+/// (stable per `at_uri`) plus the text that a hx-swap-oob response fills in.
+pub struct ExcerptSlot {
+    pub id: String,
+    pub text: Option<String>,
+}
+
+/// The out-of-band excerpt fill served by `/posts/excerpts` and `/recent`.
+/// Each element carries `hx-swap-oob`, so htmx replaces the identically-id'd
+/// placeholder paragraph in the already-rendered list — the thumbnails,
+/// videos, and layout never move, so there is no flicker and no media
+/// re-fetch.
 #[derive(Template)]
-#[template(path = "recent_grid.html")]
-pub struct RecentGridTemplate {
-    pub recent: Vec<PostRow>,
+#[template(path = "excerpts.html")]
+pub struct ExcerptsTemplate {
+    pub excerpts: Vec<ExcerptSlot>,
+}
+
+/// A stable DOM id for a post's excerpt placeholder, derived from the
+/// `at_uri` (FNV-1a 64) so the deferred `/posts/excerpts` and `/recent`
+/// responses can address the row the fast-path render left empty,
+/// independently of element order.
+pub fn excerpt_id(at_uri: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in at_uri.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("ex-{hash:016x}")
 }
 
 // ---------------------------------------------------------------------
@@ -262,8 +283,11 @@ pub struct PostRow {
     pub category_label: &'static str,
     pub category_badge_class: &'static str,
     pub author: String,
+    /// Stable DOM id for the excerpt slot, also addressed by the deferred
+    /// out-of-band `/posts/excerpts` and `/recent` fills.
+    pub excerpt_id: String,
     /// Item text as an excerpt (index-only lists show none: the text lives in
-    /// the record file, read separately by the deferred fragment).
+    /// the record file, filled in later by the out-of-band excerpt swap).
     pub excerpt: Option<String>,
     pub detail_href: String,
     pub indexed_at: String,
@@ -274,13 +298,14 @@ pub struct PostRow {
 
 /// Builds a [`PostRow`] from an index-layer [`PostSummary`] plus the item's
 /// text (fetched separately by the caller — batched and deferred now — since
-/// the index deliberately doesn't store full record bodies). `None` renders
-/// the row without an excerpt, which is also the skeleton-row fast path.
+/// the index deliberately doesn't store full record bodies). `None` leaves
+/// the row's excerpt slot empty for the deferred fill.
 pub fn post_row(summary: &PostSummary, text: Option<&str>) -> PostRow {
     PostRow {
         category_label: category_label(summary.category),
         category_badge_class: category_badge_class(summary.category),
         author: author_did_from_at_uri(&summary.at_uri).to_string(),
+        excerpt_id: excerpt_id(&summary.at_uri),
         excerpt: text.map(|t| excerpt(t, MAX_EXCERPT_CHARS)),
         detail_href: format!("/posts/{}", crate::web::encode_post_id(&summary.at_uri)),
         indexed_at: display_time(&summary.indexed_at),
@@ -323,10 +348,9 @@ pub struct PostsTemplate {
     pub rows: Vec<PostRow>,
     pub pagination: Pagination,
     pub category_options: Vec<CategoryOption>,
-    /// Same field as [`PostsListTemplate::self_refresh`]: the full page
-    /// embeds the excerpt-less list, which re-fetches this URL as a
-    /// fragment after load.
-    pub self_refresh: Option<String>,
+    /// Same field as [`PostsListTemplate::excerpts_href`]: the URL the
+    /// embedded list will pull its excerpt fill out of once the page loads.
+    pub excerpts_href: Option<String>,
 }
 
 #[derive(Template)]
@@ -334,10 +358,10 @@ pub struct PostsTemplate {
 pub struct PostsListTemplate {
     pub rows: Vec<PostRow>,
     pub pagination: Pagination,
-    /// When set, the list renders as the fast path (excerpt-less rows) and
-    /// re-fetches this URL as an excerpted fragment after load. `None` on
-    /// the htmx fragment responses themselves so they don't loop.
-    pub self_refresh: Option<String>,
+    /// URL of the out-of-band excerpt fill for this exact page; every
+    /// skeleton response carries it on `#posts-list` so a pagination swap
+    /// immediately loads the next page's excerpts too.
+    pub excerpts_href: Option<String>,
 }
 
 pub struct PostMedia {

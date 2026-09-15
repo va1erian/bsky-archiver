@@ -1,4 +1,5 @@
-//! Posts list (`/posts`) and post detail (`/posts/:id`) handlers.
+//! Posts list (`/posts`), the deferred excerpt fill (`/posts/excerpts`),
+//! and post detail (`/posts/:id`) handlers.
 
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -21,59 +22,66 @@ pub(super) struct PostsQuery {
     pub(super) page_size: Option<u32>,
 }
 
-pub(super) async fn list_posts(
-    State(state): State<WebState>,
-    Query(query): Query<PostsQuery>,
-    headers: HeaderMap,
-) -> Result<Response, WebError> {
+/// Shared query parsing/execution for `/posts` and `/posts/excerpts` so both
+/// address exactly the same page of index rows.
+struct PagedQuery {
+    category: Option<Category>,
+    page: u32,
+    page_size: u32,
+}
+
+fn paged_query(query: PostsQuery) -> Result<PagedQuery, WebError> {
     let category = match query.category.as_deref() {
         Some(raw) => Some(raw.parse::<Category>().map_err(|_| WebError::BadRequest {
             message: format!("unknown category {raw:?}"),
         })?),
         None => None,
     };
-    let page = query.page.unwrap_or(1).max(1);
-    let page_size = clamp_page_size(query.page_size);
+    Ok(PagedQuery {
+        category,
+        page: query.page.unwrap_or(1).max(1),
+        page_size: clamp_page_size(query.page_size),
+    })
+}
 
+/// Fast path for both the full page and the pagination fragment: rows come
+/// straight from the index, excerpt-less. Every response carries the
+/// out-of-band excerpt loader on `#posts-list`, so the list reads text via
+/// `/posts/excerpts` after render (and again after each pagination swap).
+pub(super) async fn list_posts(
+    State(state): State<WebState>,
+    Query(query): Query<PostsQuery>,
+    headers: HeaderMap,
+) -> Result<Response, WebError> {
+    let category_param = query.category.clone();
+    let parsed = paged_query(query)?;
     let result = state
         .app
         .store
-        .list_posts(category, page, page_size)
+        .list_posts(parsed.category, parsed.page, parsed.page_size)
         .await?;
-    let category_param = query.category.clone();
-    let self_href = posts_href(query.category.as_deref(), result.page, page_size);
+    let excerpts_href = excerpts_href(category_param.as_deref(), parsed.page, parsed.page_size);
+
+    let rows = result
+        .items
+        .iter()
+        .map(|summary| templates::post_row(summary, None))
+        .collect();
 
     let pagination =
         templates::build_pagination(result.page, result.total_pages, result.total_items, |n| {
-            posts_href(category_param.as_deref(), n, page_size)
+            posts_href(category_param.as_deref(), n, parsed.page_size)
         });
 
     if is_htmx_request(&headers) {
-        // Fragment swap: the excerpt reads (one batched record-file scan
-        // across the page's items) happen here, after the fast full page
-        // has already shown skeleton rows.
-        let texts = fetch_excerpts(&state.app.store, &result.items).await;
-        let rows = result
-            .items
-            .iter()
-            .zip(texts)
-            .map(|(summary, text)| templates::post_row(summary, text.as_deref()))
-            .collect();
         let fragment = templates::PostsListTemplate {
             rows,
             pagination,
-            self_refresh: None,
+            excerpts_href: Some(excerpts_href),
         };
         Ok(askama_axum::into_response(&fragment))
     } else {
-        // Full page fast path: rows straight from the index, no excerpt
-        // reads — the skeleton list re-fetches itself via htmx after load.
-        let rows = result
-            .items
-            .iter()
-            .map(|summary| templates::post_row(summary, None))
-            .collect();
-        let category_options = build_category_options(query.category.as_deref());
+        let category_options = build_category_options(category_param.as_deref());
         let template = templates::PostsTemplate {
             version: templates::APP_VERSION,
             git_revision: templates::GIT_REVISION,
@@ -81,16 +89,57 @@ pub(super) async fn list_posts(
             rows,
             pagination,
             category_options,
-            self_refresh: Some(self_href),
+            excerpts_href: Some(excerpts_href),
         };
         Ok(askama_axum::into_response(&template))
     }
+}
+
+/// The deferred excerpt fill: same page selection as the list, batched
+/// record reads, response is a set of `hx-swap-oob` paragraphs that patch
+/// the excerpt slots in place. Slots whose read failed are simply not
+/// emitted, leaving their placeholder empty.
+pub(super) async fn excerpts(
+    State(state): State<WebState>,
+    Query(query): Query<PostsQuery>,
+) -> Result<Response, WebError> {
+    let parsed = paged_query(query)?;
+    let result = state
+        .app
+        .store
+        .list_posts(parsed.category, parsed.page, parsed.page_size)
+        .await?;
+    let texts = fetch_excerpts(&state.app.store, &result.items).await;
+    let excerpts: Vec<templates::ExcerptSlot> = result
+        .items
+        .iter()
+        .zip(texts)
+        .filter_map(|(summary, text)| {
+            text.map(|t| templates::ExcerptSlot {
+                id: templates::excerpt_id(&summary.at_uri),
+                text: Some(t),
+            })
+        })
+        .collect();
+    Ok(askama_axum::into_response(&templates::ExcerptsTemplate {
+        excerpts,
+    }))
 }
 
 fn posts_href(category: Option<&str>, page: u32, page_size: u32) -> String {
     match category {
         Some(category) => format!("/posts?category={category}&page={page}&page_size={page_size}"),
         None => format!("/posts?page={page}&page_size={page_size}"),
+    }
+}
+
+/// Like [`posts_href`] but pointing at the deferred excerpt fill.
+fn excerpts_href(category: Option<&str>, page: u32, page_size: u32) -> String {
+    match category {
+        Some(category) => {
+            format!("/posts/excerpts?category={category}&page={page}&page_size={page_size}")
+        }
+        None => format!("/posts/excerpts?page={page}&page_size={page_size}"),
     }
 }
 

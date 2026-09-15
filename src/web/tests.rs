@@ -525,13 +525,18 @@ async fn dashboard_renders_counts_health_and_recent_activity() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
 
-    // The dashboard's fast path renders the recent grid excerpt-less and
-    // self-refreshes it via htmx after load.
+    // The dashboard's fast path renders the recent grid excerpt-less; the
+    // excerpts arrive out-of-band from /recent, patched into the grid's
+    // placeholder slots without swapping the grid itself.
     assert!(
         body.contains("Connected") || body.contains("Degraded"),
         "health status missing"
     );
     assert!(body.contains("badge-post"), "category badge missing");
+    assert!(
+        body.contains("hx-get=\"/recent\""),
+        "excerpt loader missing"
+    );
     assert!(
         body.contains(&format!("bsky-archiver v{}", env!("CARGO_PKG_VERSION"))),
         "version footer missing"
@@ -554,10 +559,8 @@ async fn dashboard_renders_counts_health_and_recent_activity() {
         "post excerpt missing from /recent fragment"
     );
     assert!(
-        fragment_body.contains("badge-post")
-            && fragment_body.contains("<img")
-            && fragment_body.contains("alt="),
-        "fragment cards/badges/thumbnails missing"
+        fragment_body.contains("hx-swap-oob") && fragment_body.contains("class=\"excerpt\""),
+        "excerpt fill must be an out-of-band swap"
     );
 }
 
@@ -581,11 +584,12 @@ async fn posts_list_renders_cards_badges_thumbnails_and_pagination() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
 
-    // Fast path: skeleton rows without excerpts; the excerpted list arrives
-    // via the self-refresh htmx fragment.
+    // Fast path: skeleton rows without excerpts; the excerpts arrive
+    // out-of-band from /posts/excerpts, patched into the list's placeholder
+    // slots without swapping the list (and its media) itself.
     assert!(
-        body.contains("hx-get=\"/") && body.contains("hx-trigger=\"load\""),
-        "posts list self-refresh markers missing"
+        body.contains("hx-get=\"/posts/excerpts") && body.contains("hx-trigger=\"load\""),
+        "posts list excerpt loader missing"
     );
     assert!(body.contains("badge-post") && body.contains("badge-like"));
     assert!(body.contains("<img") && body.contains("alt="));
@@ -599,27 +603,26 @@ async fn posts_list_renders_cards_badges_thumbnails_and_pagination() {
     assert!(body.contains("rel=\"manifest\""));
     assert!(body.contains("name=\"theme-color\""));
 
-    // The htmx fragment swap carries the excerpts.
-    let fragment = app
+    // The deferred out-of-band fill carries the excerpts.
+    let fill = app
         .clone()
         .oneshot(
-            Request::get("/posts")
+            Request::get("/posts/excerpts?page=1&page_size=20")
                 .header(header::COOKIE, &cookie)
-                .header(header::HeaderName::from_static("hx-request"), "true")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(fragment.status(), StatusCode::OK);
-    let fragment_body = body_string(fragment).await;
+    assert_eq!(fill.status(), StatusCode::OK);
+    let fill_body = body_string(fill).await;
     assert!(
-        fragment_body.contains("a photo post") && fragment_body.contains("a liked video"),
-        "post excerpts missing from fragment"
+        fill_body.contains("a photo post") && fill_body.contains("a liked video"),
+        "post excerpts missing from the excerpt fill"
     );
     assert!(
-        fragment_body.contains("badge-post") && fragment_body.contains("badge-like"),
-        "fragment badges missing"
+        fill_body.contains("hx-swap-oob") && fill_body.contains("class=\"excerpt\""),
+        "excerpt fill must be an out-of-band swap"
     );
 }
 

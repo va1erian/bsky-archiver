@@ -64,6 +64,7 @@ pub fn router(app: SharedAppState) -> Router {
         .route("/", get(dashboard::dashboard))
         .route("/recent", get(dashboard::recent))
         .route("/posts", get(posts::list_posts))
+        .route("/posts/excerpts", get(posts::excerpts))
         .route("/posts/:id", get(posts::post_detail))
         .route("/gallery", get(gallery::gallery))
         .route("/gallery/export", get(gallery::gallery_export))

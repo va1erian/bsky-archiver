@@ -554,9 +554,8 @@ async fn full_pipeline_archives_post_like_and_bookmark_and_renders_in_web_ui() {
     let posts_fragment = app
         .clone()
         .oneshot(
-            Request::get("/posts")
+            Request::get("/posts/excerpts?page=1&page_size=20")
                 .header(header::COOKIE, cookie.clone())
-                .header("HX-Request", "true")
                 .body(Body::empty())
                 .unwrap(),
         )

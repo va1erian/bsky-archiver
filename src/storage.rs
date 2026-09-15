@@ -470,7 +470,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Version 6 adds the `saved_accounts` table: the Browser page's
 /// UI-managed favorite accounts (handles), so a live browse is one click
 /// away instead of a handle re-type. Purely additive, like version 2.
-const SCHEMA_VERSION: i64 = 6;
+///
+/// Version 7 adds the `idx_media_post_at_uri` index (see the bootstrap
+/// batch): no data migration, the `IF NOT EXISTS` statement above creates it
+/// on every startup, for existing databases too.
+const SCHEMA_VERSION: i64 = 7;
 
 fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -508,6 +512,14 @@ fn bootstrap_schema(conn: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_media_indexed_at ON media(indexed_at, id);
         CREATE INDEX IF NOT EXISTS idx_media_category_indexed_at
             ON media(category, indexed_at, id);
+        -- Cover index for the index-only list queries that reach media from
+        -- the post side (the posts page's per-row media count and thumbnail
+        -- subqueries and deletion sweeps). Without it each correlated lookup
+        -- is a full media-table scan — the media table's own indexes lead with
+        -- other columns, and the UNIQUE(category, post_at_uri, filename) index
+        -- can't be used without a bound category.
+        CREATE INDEX IF NOT EXISTS idx_media_post_at_uri
+            ON media(post_at_uri, id);
 
         CREATE TABLE IF NOT EXISTS watched_sources (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

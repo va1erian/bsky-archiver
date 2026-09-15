@@ -1,4 +1,4 @@
-<div id="posts-list" {% if let Some(refresh) = self_refresh %}hx-get="{{ refresh }}" hx-trigger="load" hx-target="this" hx-swap="outerHTML"{% endif %}>
+﻿<div id="posts-list" {% if let Some(href) = excerpts_href %}hx-get="{{ href }}" hx-trigger="load" hx-swap="none"{% endif %}>
 <div class="card-grid">
 {% for row in rows %}
 <article class="item-card">
@@ -13,13 +13,15 @@
 {% endif %}
 <span class="badge {{ row.category_badge_class }}">{{ row.category_label }}</span>
 {% if let Some(deleted) = row.deleted_at %}<span class="badge badge-deleted">Deleted</span>{% endif %}
-{% if let Some(excerpt) = row.excerpt %}<p class="excerpt">{{ excerpt }}</p>{% endif %}
-<p class="item-meta">{{ row.author }} · {{ row.indexed_at }} · {{ row.media_count }} media</p>
+<p class="excerpt" id="{{ row.excerpt_id }}">{% if let Some(excerpt) = row.excerpt %}{{ excerpt }}{% endif %}</p>
+<p class="item-meta">{{ row.author }} Â· {{ row.indexed_at }} Â· {{ row.media_count }} media</p>
 <a href="{{ row.detail_href }}">View post</a>
 </article>
 {% endfor %}
 </div>
-{% if rows.is_empty() %}{% if self_refresh.is_none() %}<p>No items found.</p>{% endif %}{% endif %}
+{% if rows.is_empty() %}
+<p>No items found.</p>
+{% endif %}
 
 <nav class="pagination" aria-label="Pagination">
 {% if let Some(href) = pagination.first_href %}

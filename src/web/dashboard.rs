@@ -71,27 +71,28 @@ pub(super) async fn dashboard(State(state): State<WebState>) -> Result<Response,
     Ok(askama_axum::into_response(&template))
 }
 
-/// The deferred recent-activity fragment the dashboard's grid pulls in after
-/// load. It re-runs the newest-posts query but now does the expensive work —
-/// reading each item's `record.json` from disk for its excerpt text — in a
-/// single batched blocking task instead of one per item.
+/// The deferred recent-activity excerpt fill the dashboard's grid pulls in
+/// after load. It re-runs the newest-posts query and reads each item's
+/// `record.json` in a single batched blocking task; the response is a set of
+/// `hx-swap-oob` paragraphs that patch the grid's excerpt slots in place,
+/// leaving the thumbnails and layout (and any playing videos) untouched.
 pub(super) async fn recent(State(state): State<WebState>) -> Result<Response, WebError> {
     let recent = state.app.store.list_posts(None, 1, 10).await?;
     let texts = fetch_excerpts(&state.app.store, &recent.items).await;
-    let rows = recent_rows(&recent.items, texts);
-    let template = templates::RecentGridTemplate { recent: rows };
-    Ok(askama_axum::into_response(&template))
-}
-
-fn recent_rows<T>(items: &[PostSummary], texts: T) -> Vec<templates::PostRow>
-where
-    T: IntoIterator<Item = Option<String>>,
-{
-    items
+    let excerpts: Vec<templates::ExcerptSlot> = recent
+        .items
         .iter()
         .zip(texts)
-        .map(|(summary, text)| templates::post_row(summary, text.as_deref()))
-        .collect()
+        .filter_map(|(summary, text)| {
+            text.map(|t| templates::ExcerptSlot {
+                id: templates::excerpt_id(&summary.at_uri),
+                text: Some(t),
+            })
+        })
+        .collect();
+    Ok(askama_axum::into_response(&templates::ExcerptsTemplate {
+        excerpts,
+    }))
 }
 
 /// Best-effort fetch of each summary's post text, for building list-view

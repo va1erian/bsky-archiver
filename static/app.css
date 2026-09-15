@@ -133,6 +133,13 @@
   overflow-wrap: anywhere;
 }
 
+/* Excerpt slots start empty on the fast-path render and are filled
+   out-of-band by htmx; the min-height keeps rows at their final size in the
+   meantime, so the fill doesn't shift the layout. */
+.excerpt:empty {
+  min-height: 2.6em;
+}
+
 .gallery-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
@@ -480,9 +487,8 @@ nav form {
    The stagger tops out at three tiers so dense grids settle fast.
    --------------------------------------------------------------------------- */
 
-/* Deferred fast-path sections (excerpt-less lists/grids re-fetched as htmx
-   fragments after load) dim slightly while the replacement request is in
-   flight, so the two-stage render reads as intentional, not as a glitch. */
+/* Deferred excerpt loads (an out-of-band fill that patches placeholder
+   slots in place) quiet the owning section while the request is in flight. */
 #posts-list,
 #recent-grid {
   transition: opacity 160ms ease-out;
