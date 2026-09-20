@@ -15,13 +15,13 @@
 <tr>
 <td data-label="Handle"><code>{{ account.handle }}</code></td>
 <td data-label="Saved">{{ account.added_at }}</td>
-<td data-label="Browse">
+<td>
 <form method="get" action="/browse" class="saved-account-browse-form">
 <input type="hidden" name="actor" value="{{ account.handle }}">
 <button type="submit" class="secondary outline">Browse</button>
 </form>
 </td>
-<td data-label="Remove">
+<td>
 <form method="post" action="/browser/saved/{{ account.id }}" hx-post="/browser/saved/{{ account.id }}" hx-target="#saved-accounts-panel" hx-swap="outerHTML">
 <button type="submit" class="secondary outline">Remove</button>
 </form>

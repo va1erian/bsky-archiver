@@ -14,7 +14,7 @@
 <span class="badge {{ row.category_badge_class }}">{{ row.category_label }}</span>
 {% if let Some(deleted) = row.deleted_at %}<span class="badge badge-deleted">Deleted</span>{% endif %}
 <p class="excerpt" id="{{ row.excerpt_id }}">{% if let Some(excerpt) = row.excerpt %}{{ excerpt }}{% endif %}</p>
-<p class="item-meta">{{ row.author }} Â· {{ row.indexed_at }} Â· {{ row.media_count }} media</p>
+<p class="item-meta">{{ row.author }} &middot; {{ row.indexed_at }} &middot; {{ row.media_count }} media</p>
 <a href="{{ row.detail_href }}">View post</a>
 </article>
 {% endfor %}

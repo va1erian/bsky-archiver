@@ -255,6 +255,14 @@
   margin: 0;
 }
 
+/* Pico sizes <button> full-width; inside the narrow auto-laid table columns
+   of the desktop/tablet rendering that squeezes the label into "Brows / e".
+   Size to the content there — but only there: in the phone reflow the cells
+   are stacked blocks and the buttons stay full-width for reach. */
+.config-table td form button {
+  white-space: nowrap;
+}
+
 /* Pagination is a stacked pair: a row of First/Previous/[page]/Next/Last
    controls, then the small muted meta line under it. The current page is a
    <button> (not a link) because it opens the in-page page-jump dialog
@@ -262,7 +270,7 @@
 .pagination {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   gap: 0.45rem;
   margin-top: 1rem;
 }
@@ -368,6 +376,13 @@
 
 #lightbox::backdrop {
   background: rgba(0, 0, 0, 0.92);
+}
+
+/* While the lightbox is open the page behind it must not scroll: an
+   upward drag-to-close gesture would otherwise scroll the underlying
+   document instead of dismissing it. */
+body:has(> #lightbox[open]) {
+  overflow: hidden;
 }
 
 .close-lightbox {
@@ -686,6 +701,10 @@ nav form {
   .nav-menu::details-content {
     content-visibility: visible;
   }
+
+  .config-table td form button {
+    width: auto;
+  }
 }
 
 @media (max-width: 767.98px) {
@@ -954,10 +973,4 @@ a.gallery-item-thumb {
   font-size: 0.85rem;
   color: var(--pico-muted-color, #6b7280);
   border-top: 1px solid var(--pico-muted-border-color, #ccc);
-}
-
-/* Account-grid cursor pagination: "Older" is always anchored on the
-   right of the row, "Newest" on the left. */
-.pagination .cursor-next {
-  margin-left: auto;
 }
