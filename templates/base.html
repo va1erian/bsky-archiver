@@ -288,14 +288,59 @@
     items = Array.prototype.slice.call(document.querySelectorAll("[data-lightbox]"));
   }
 
+  // Quick Look-style zoom: the tapped thumbnail's on-screen box is captured
+  // before the dialog opens, then the full-size media animates from that box
+  // out to its final full-screen position/size, so the image reads as
+  // growing out of the thing that was touched rather than just appearing.
+  function animateOpenZoom(newEl, originRect) {
+    if (!newEl || !originRect || !originRect.width || !originRect.height) return;
+    if (prefersReducedMotion()) return;
+    function run() {
+      var finalRect = newEl.getBoundingClientRect();
+      if (!finalRect.width || !finalRect.height) return;
+      var scaleX = originRect.width / finalRect.width;
+      var scaleY = originRect.height / finalRect.height;
+      var translateX =
+        originRect.left + originRect.width / 2 - (finalRect.left + finalRect.width / 2);
+      var translateY =
+        originRect.top + originRect.height / 2 - (finalRect.top + finalRect.height / 2);
+      try {
+        newEl.animate(
+          [
+            {
+              transform:
+                "translate(" + translateX + "px, " + translateY + "px) scale(" +
+                scaleX + ", " + scaleY + ")",
+              opacity: 0.7,
+            },
+            { transform: "translate(0px, 0px) scale(1, 1)", opacity: 1 },
+          ],
+          { duration: 130, easing: "cubic-bezier(0.22, 0.61, 0.36, 1)" }
+        );
+      } catch (err) {
+        /* no Web Animations support: media just appears at full size */
+      }
+    }
+    // Wait for the full-size image to decode so the zoom never reveals a
+    // half-painted frame; video has no decode() so it starts right away.
+    if (newEl.tagName === "IMG" && newEl.decode) {
+      newEl.decode().then(run, run);
+    } else {
+      run();
+    }
+  }
+
   function show(link) {
     collectItems();
     index = items.indexOf(link);
     if (index < 0) return;
     loadingPage = false;
     loadSeq++; // any in-flight page load from a previous viewing is stale
+    var originEl = link.querySelector("img, video") || link;
+    var originRect = originEl.getBoundingClientRect();
     render(0);
     dialog.showModal();
+    animateOpenZoom(content.firstElementChild, originRect);
   }
 
   // -------------------------------------------------------------------
