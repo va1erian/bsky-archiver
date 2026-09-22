@@ -9,9 +9,10 @@
 <label for="account-actor">Bluesky handle</label>
 <input type="text" id="account-actor" name="actor" value="{{ actor }}" placeholder="alice.bsky.social" autocomplete="off">
 <label class="account-viewer-reposts">
-<input type="checkbox" name="skip_reposts" value="on" {% if skip_reposts %}checked{% endif %}>
+<input type="checkbox" id="account-viewer-skip-reposts" name="skip_reposts" value="on" {% if skip_reposts %}checked{% endif %}>
 Skip images from reposts
 </label>
+<input type="hidden" id="account-viewer-sort" name="sort" value="">
 <button type="submit">Browse</button>
 </form>
 </section>
@@ -35,6 +36,36 @@ Skip images from reposts
 
 <script>
 (function () {
+  // Remembers the last sort/repost preference used here, across accounts:
+  // actor changes every visit so it's never itself part of the memory, but
+  // the sort order and "skip reposts" choice are. A real browse (actor set)
+  // always updates the memory from its resolved values, even when a
+  // default is left implicit in the URL (e.g. `sort=newest` is never
+  // written out). A fresh visit (no actor yet) pre-fills the form — the
+  // checkbox directly, and the sort via a hidden field, since the sort
+  // picker itself only exists once results are showing — so the very first
+  // lookup already honours what was picked last time.
+  var KEY = "browser-filter";
+  var params = new URLSearchParams(window.location.search);
+  var actor = params.get("actor");
+  var sortField = document.getElementById("account-viewer-sort");
+  if (actor) {
+    var resolved = {
+      sort: params.get("sort") || "newest",
+      skipReposts: !!params.get("skip_reposts"),
+    };
+    try { localStorage.setItem(KEY, JSON.stringify(resolved)); } catch (err) { /* storage unavailable */ }
+    if (sortField) sortField.value = params.get("sort") || "";
+  } else {
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (err) { /* storage unavailable or malformed */ }
+    if (saved) {
+      if (sortField && saved.sort && saved.sort !== "newest") sortField.value = saved.sort;
+      var checkbox = document.getElementById("account-viewer-skip-reposts");
+      if (checkbox) checkbox.checked = !!saved.skipReposts;
+    }
+  }
+
   // Sort picker: navigate to the selected ordering like the gallery's
   // picker does (its hrefs reset the cursor back to the newest page).
   var select = document.getElementById("browser-sort");
