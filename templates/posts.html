@@ -1,6 +1,32 @@
 {% extends "base.html" %}
 {% block title %}Posts – bsky-archiver{% endblock %}
 {% block content %}
+<script>
+(function () {
+  // Remembers the last category/sort picked here, so a plain nav click back
+  // to /posts (no query string) lands back on it instead of resetting to
+  // "All / Newest archived". A URL that already carries a filter (a picked
+  // link, a pagination href, a bookmark) always wins and updates the memory;
+  // only a bare /posts consults it, and only once, via an immediate
+  // redirect before the default-filtered list below has a chance to paint.
+  var KEY = "posts-filter";
+  var params = new URLSearchParams(window.location.search);
+  if (params.toString()) {
+    var keep = new URLSearchParams();
+    if (params.get("category")) keep.set("category", params.get("category"));
+    if (params.get("sort")) keep.set("sort", params.get("sort"));
+    if (params.get("page_size")) keep.set("page_size", params.get("page_size"));
+    var serialized = keep.toString();
+    if (serialized) {
+      try { localStorage.setItem(KEY, serialized); } catch (err) { /* storage unavailable */ }
+    }
+  } else {
+    var saved = null;
+    try { saved = localStorage.getItem(KEY); } catch (err) { /* storage unavailable */ }
+    if (saved) window.location.replace("/posts?" + saved + "&page=1");
+  }
+})();
+</script>
 <h1>Posts</h1>
 <nav class="category-filter" aria-label="Category filter">
 {% for opt in category_options %}
