@@ -189,6 +189,70 @@ test("lightbox walks across the page boundary forward and back", async ({
   await expect(page.locator(".pagination .item-meta")).toContainText("Page 1 of 3");
 });
 
+test("lightbox images zoom by pinch and double-click, and reset on navigation", async ({
+  page,
+}) => {
+  await login(page);
+  await page.goto(GALLERY);
+  await page.locator(".gallery-grid .gallery-item").first().click();
+  await expect(page.locator("#lightbox-counter")).toHaveText("1 / 10");
+  const img = page.locator("#lightbox-content img");
+  const dialog = page.locator("#lightbox");
+  const scale = () =>
+    img.evaluate((el) => new DOMMatrix(getComputedStyle(el).transform).a);
+  const box = await img.boundingBox();
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+
+  // Double-click toggles zoom in and back out.
+  await img.dblclick();
+  await expect(dialog).toHaveClass(/zoomed/);
+  await expect.poll(scale).toBeCloseTo(2.5, 1);
+  await img.dblclick();
+  await expect(dialog).not.toHaveClass(/zoomed/);
+  await expect.poll(scale).toBeCloseTo(1, 1);
+
+  // Two-finger pinch spreading 100px -> 300px zooms ~3x.
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+  const touch = (type, spread) =>
+    cdp.send("Input.dispatchTouchEvent", {
+      type,
+      touchPoints:
+        type === "touchEnd"
+          ? []
+          : [
+              { x: cx - spread / 2, y: cy, id: 1 },
+              { x: cx + spread / 2, y: cy, id: 2 },
+            ],
+    });
+  await touch("touchStart", 100);
+  for (const spread of [150, 200, 250, 300]) await touch("touchMove", spread);
+  await touch("touchEnd", 300);
+  await expect(dialog).toHaveClass(/zoomed/);
+  await expect.poll(scale).toBeCloseTo(3, 1);
+  await expect(dialog).toHaveAttribute("open");
+
+  // While zoomed, a one-finger horizontal drag pans instead of swiping.
+  const tx = () => img.evaluate((el) => new DOMMatrix(getComputedStyle(el).transform).e);
+  const before = await tx();
+  const drag = (type, x) =>
+    cdp.send("Input.dispatchTouchEvent", {
+      type,
+      touchPoints: type === "touchEnd" ? [] : [{ x, y: cy, id: 1 }],
+    });
+  await drag("touchStart", cx);
+  for (const dx of [20, 40, 60, 80]) await drag("touchMove", cx - dx);
+  await drag("touchEnd", cx - 80);
+  await expect.poll(tx).toBeLessThan(before);
+  await expect(page.locator("#lightbox-counter")).toHaveText("1 / 10");
+
+  // Navigating resets the zoom for the next image.
+  await page.keyboard.press("ArrowRight");
+  await expect(page.locator("#lightbox-counter")).toHaveText("2 / 10");
+  await expect(dialog).not.toHaveClass(/zoomed/);
+});
+
 test("back navigation with the lightbox open closes it and restores the page", async ({
   page,
 }) => {

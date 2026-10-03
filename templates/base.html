@@ -144,6 +144,7 @@
   }
 
   function stopPlayback() {
+    resetZoom();
     finishPendingSlide();
     Array.prototype.slice.call(content.children).forEach(teardownMedia);
     content.innerHTML = "";
@@ -255,6 +256,7 @@
       newEl.alt = alt;
     }
 
+    resetZoom();
     var oldEl = content.firstElementChild;
     if (!oldEl || direction === 0 || prefersReducedMotion()) {
       finishPendingSlide();
@@ -516,6 +518,238 @@
     if (event.target === dialog) dialog.close();
   });
 
+  // -------------------------------------------------------------------
+  // Image zoom: two-finger pinch (zooming around the fingers' midpoint),
+  // double-tap / double-click to toggle, ctrl+wheel (trackpad pinch) on
+  // desktop. While zoomed, one finger (or a mouse drag) pans within the
+  // image's bounds and the swipe / drag-to-close gestures are suspended;
+  // the `zoomed` class switches the dialog to touch-action: none so the
+  // browser never claims the pan. Any navigation or close resets it.
+  var MAX_ZOOM = 5;
+  var zoom = null; // { el, s, tx, ty } for the current <img>, or null
+  var pinch = null;
+  var pan = null;
+  var lastTap = null;
+  var lastTouchT = -Infinity;
+
+  function zoomTarget() {
+    var el = content.firstElementChild;
+    return el && el.tagName === "IMG" && !pendingSlide ? el : null;
+  }
+
+  function stageCenter() {
+    var rect = content.parentElement.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+
+  function applyZoom(animate) {
+    var el = zoom.el;
+    if (animate && !prefersReducedMotion()) {
+      el.style.transition = "transform 180ms ease-out";
+      setTimeout(function () { el.style.transition = ""; }, 200);
+    }
+    el.style.transform = zoom.s === 1 ? "" :
+      "translate(" + zoom.tx + "px, " + zoom.ty + "px) scale(" + zoom.s + ")";
+    dialog.classList.toggle("zoomed", zoom.s > 1);
+  }
+
+  function resetZoom() {
+    pinch = pan = null;
+    dialog.classList.remove("zoomed");
+    if (!zoom) return;
+    if (zoom.el.isConnected) zoom.el.style.transform = "";
+    zoom = null;
+  }
+
+  // Keeps the letterboxed picture (not the element's full box) covering
+  // the viewport edge it overflows, so panning never reveals empty space.
+  function clampZoom() {
+    var el = zoom.el;
+    zoom.s = Math.min(MAX_ZOOM, Math.max(1, zoom.s));
+    var w = el.offsetWidth, h = el.offsetHeight;
+    var nw = el.naturalWidth || w, nh = el.naturalHeight || h;
+    var fit = Math.min(w / nw, h / nh);
+    var mx = Math.max(0, (nw * fit * zoom.s - w) / 2);
+    var my = Math.max(0, (nh * fit * zoom.s - h) / 2);
+    zoom.tx = Math.min(mx, Math.max(-mx, zoom.tx));
+    zoom.ty = Math.min(my, Math.max(-my, zoom.ty));
+  }
+
+  // Scales to `s` while keeping the image point under screen point `p`
+  // fixed (or, given `to`, moving it to `to`).
+  function zoomAbout(s, p, from, to) {
+    var c = stageCenter();
+    from = from || zoom;
+    to = to || p;
+    var qx = (p.x - c.x - from.tx) / from.s;
+    var qy = (p.y - c.y - from.ty) / from.s;
+    zoom.s = s;
+    zoom.tx = to.x - c.x - s * qx;
+    zoom.ty = to.y - c.y - s * qy;
+  }
+
+  function ensureZoom() {
+    var el = zoomTarget();
+    if (!el) return null;
+    if (!zoom || zoom.el !== el) zoom = { el: el, s: 1, tx: 0, ty: 0 };
+    return zoom;
+  }
+
+  function toggleZoomAt(p) {
+    if (!ensureZoom()) return;
+    if (zoom.s > 1) {
+      zoom.s = 1;
+      zoom.tx = zoom.ty = 0;
+    } else {
+      zoomAbout(2.5, p);
+      clampZoom();
+    }
+    applyZoom(true);
+  }
+
+  function midpoint(t) {
+    return {
+      x: (t[0].clientX + t[1].clientX) / 2,
+      y: (t[0].clientY + t[1].clientY) / 2,
+    };
+  }
+
+  function spread(t) {
+    return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  }
+
+  function startPan(point, afterPinch) {
+    pan = { x: point.clientX, y: point.clientY, tx: zoom.tx, ty: zoom.ty,
+      afterPinch: !!afterPinch };
+  }
+
+  // Returns true when the zoom layer owns this touch sequence.
+  function zoomTouchStart(event) {
+    lastTouchT = event.timeStamp;
+    if (event.touches.length === 2 && ensureZoom()) {
+      cancelTouchGesture();
+      lastTap = null;
+      pan = null;
+      pinch = {
+        d: spread(event.touches) || 1,
+        m: midpoint(event.touches),
+        from: { s: zoom.s, tx: zoom.tx, ty: zoom.ty },
+      };
+      return true;
+    }
+    if (event.touches.length === 1 && zoom && zoom.s > 1 && !pinch &&
+        !event.target.closest("button")) {
+      startPan(event.touches[0]);
+      return true;
+    }
+    return !!pinch;
+  }
+
+  function zoomTouchMove(event) {
+    if (pinch && event.touches.length === 2) {
+      event.preventDefault();
+      var s = pinch.from.s * spread(event.touches) / pinch.d;
+      zoomAbout(Math.min(MAX_ZOOM * 1.5, Math.max(0.6, s)), pinch.m, pinch.from,
+        midpoint(event.touches));
+      applyZoom(false);
+      return true;
+    }
+    if (pan && event.touches.length === 1) {
+      event.preventDefault();
+      var t = event.touches[0];
+      zoom.tx = pan.tx + t.clientX - pan.x;
+      zoom.ty = pan.ty + t.clientY - pan.y;
+      clampZoom();
+      applyZoom(false);
+      return true;
+    }
+    return !!(pinch || pan);
+  }
+
+  function zoomTouchEnd(event, cancelled) {
+    if (pinch) {
+      if (event.touches.length >= 2) return true;
+      pinch = null;
+      if (zoom.s <= 1) {
+        zoom.s = 1;
+        zoom.tx = zoom.ty = 0;
+      } else {
+        clampZoom();
+      }
+      applyZoom(true);
+      // One finger still down on a zoomed image carries on as a pan.
+      if (event.touches.length === 1 && zoom.s > 1) startPan(event.touches[0], true);
+      return true;
+    }
+    if (pan) {
+      if (event.touches.length) return true;
+      var t = event.changedTouches[0];
+      var moved = pan.afterPinch || cancelled ||
+        Math.hypot(t.clientX - pan.x, t.clientY - pan.y) > 10;
+      pan = null;
+      zoomDoubleTap(event, moved);
+      return true;
+    }
+    return false;
+  }
+
+  // A quick second tap near the first toggles zoom at that point.
+  function zoomDoubleTap(event, moved) {
+    if (moved || event.touches.length || !zoomTarget()) {
+      lastTap = null;
+      return false;
+    }
+    var touch = event.changedTouches[0];
+    var tap = { x: touch.clientX, y: touch.clientY, t: event.timeStamp };
+    if (lastTap && tap.t - lastTap.t < 300 &&
+        Math.hypot(tap.x - lastTap.x, tap.y - lastTap.y) < 30) {
+      lastTap = null;
+      event.preventDefault();
+      toggleZoomAt(tap);
+      return true;
+    }
+    lastTap = tap;
+    return false;
+  }
+
+  content.addEventListener("dblclick", function (event) {
+    // Touch double-taps are handled above; ignore the synthetic dblclick.
+    if (event.timeStamp - lastTouchT < 800) return;
+    toggleZoomAt({ x: event.clientX, y: event.clientY });
+  });
+
+  dialog.addEventListener("wheel", function (event) {
+    if (!event.ctrlKey || !ensureZoom()) return;
+    event.preventDefault();
+    var p = { x: event.clientX, y: event.clientY };
+    zoomAbout(Math.min(MAX_ZOOM, Math.max(1, zoom.s * Math.exp(-event.deltaY * 0.01))), p);
+    clampZoom();
+    applyZoom(false);
+  }, { passive: false });
+
+  content.addEventListener("pointerdown", function (event) {
+    if (event.pointerType !== "mouse" || event.button !== 0 || !zoom ||
+        zoom.s <= 1 || zoom.el !== event.target) return;
+    event.preventDefault();
+    zoom.el.setPointerCapture(event.pointerId);
+    startPan(event);
+  });
+  content.addEventListener("pointermove", function (event) {
+    if (event.pointerType !== "mouse" || !pan || !zoom) return;
+    zoom.tx = pan.tx + event.clientX - pan.x;
+    zoom.ty = pan.ty + event.clientY - pan.y;
+    clampZoom();
+    applyZoom(false);
+  });
+  content.addEventListener("dragstart", function (event) {
+    if (zoom && zoom.s > 1) event.preventDefault();
+  });
+  ["pointerup", "pointercancel"].forEach(function (type) {
+    content.addEventListener(type, function (event) {
+      if (event.pointerType === "mouse") pan = null;
+    });
+  });
+
   // Touch gestures: a small state machine decides, on the first ~12px of
   // dominant-axis movement, whether the gesture is a horizontal swipe
   // (navigate to the neighbouring image/page) or a vertical upward drag
@@ -524,7 +758,8 @@
   // never gesture; touches starting in a video's native control bar
   // (bottom ~96px of its box — UA shadow DOM, so detected geometrically)
   // neither, so scrubbing/seeking stays possible; swiping on the video
-  // itself works. A second finger invalidates the gesture.
+  // itself works. A second finger invalidates the gesture (on an image it
+  // starts a pinch-zoom instead — see the zoom layer above).
   var touchStart = null;
 
   function touchOnVideoControls(event, touch) {
@@ -610,6 +845,10 @@
   }
 
   dialog.addEventListener("touchstart", function (event) {
+    if (zoomTouchStart(event)) {
+      touchStart = null;
+      return;
+    }
     if (event.touches.length !== 1 || event.target.closest("button")) {
       touchStart = null;
       return;
@@ -631,7 +870,7 @@
   // overscroll/bounce while the media follows the finger); the horizontal
   // swipe path never calls preventDefault.
   dialog.addEventListener("touchmove", function (event) {
-    if (!touchStart) return;
+    if (zoomTouchMove(event) || !touchStart) return;
     if (event.touches.length !== 1) {
       cancelTouchGesture();
       return;
@@ -672,17 +911,20 @@
     touchStart.lastT = event.timeStamp;
   }, { passive: false });
 
-  dialog.addEventListener("touchcancel", function () {
+  dialog.addEventListener("touchcancel", function (event) {
+    zoomTouchEnd(event, true);
     cancelTouchGesture();
   }, { passive: true });
 
   dialog.addEventListener("touchend", function (event) {
-    if (!touchStart) return;
+    if (zoomTouchEnd(event, false) || !touchStart) return;
     var state = touchStart;
     touchStart = null;
     var touch = event.changedTouches[0];
     var dx = touch.clientX - state.x;
     var dy = touch.clientY - state.y;
+    if (!state.mode && Math.hypot(dx, dy) < 10 &&
+        zoomDoubleTap(event, state.controls)) return;
     if (state.mode === "v") {
       event.preventDefault(); // no synthetic click after a drag
       if (-dy > window.innerHeight * 0.22 || state.velocity > 800) {
