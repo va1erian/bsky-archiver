@@ -374,6 +374,20 @@
   object-fit: contain;
 }
 
+/* Zoomed in (pinch / double-tap / ctrl+wheel): the viewer owns every touch
+   so one-finger panning isn't claimed by the browser. */
+#lightbox.zoomed {
+  touch-action: none;
+}
+
+#lightbox.zoomed img {
+  cursor: grab;
+}
+
+#lightbox.zoomed img:active {
+  cursor: grabbing;
+}
+
 #lightbox::backdrop {
   background: rgba(0, 0, 0, 0.92);
 }
