@@ -982,6 +982,33 @@ impl ArchiveStore {
         join_result(result)
     }
 
+    /// Records the resolved DID for an existing watched account, without
+    /// inserting one. Used to repair a source that was seeded without a DID
+    /// (see [`crate::app::init`]); unlike [`Self::add_watched_source`], a
+    /// source the user removed in the meantime stays removed rather than
+    /// being resurrected. Returns whether a matching account row was updated.
+    pub async fn set_watched_source_did(
+        &self,
+        value: &str,
+        did: &str,
+    ) -> Result<bool, StorageError> {
+        let db = Arc::clone(&self.db);
+        let kind = SourceKind::Account.as_str().to_string();
+        let value = value.to_string();
+        let did = did.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let affected = conn.execute(
+                "UPDATE watched_sources SET did = ?1
+                 WHERE source_kind = ?2 AND source_value = ?3",
+                params![did, kind, value],
+            )?;
+            Ok(affected > 0)
+        })
+        .await;
+        join_result(result)
+    }
+
     /// Lists the Browser page's saved (favorite) accounts, oldest-added
     /// first, from the `saved_accounts` table.
     pub async fn list_saved_accounts(&self) -> Result<Vec<SavedAccount>, StorageError> {

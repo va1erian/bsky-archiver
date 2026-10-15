@@ -68,7 +68,7 @@ plain `docker compose`.
 | `state` | `AppState`, the shared handle (config + storage + health + live roster + Bluesky client + a weak handle on the producer channel) passed to every request handler and background task. |
 | `web` | The `axum` HTTP server: routing, password-gated session auth, the pages/JSON surface backing the UI, and the `/sources` add/remove endpoints that manage the live watch list. |
 | `templates` | `askama` templates and their view models (kept separate from `web` so that module stays about *what data* each route needs, not how it's marked up). |
-| `app` | Startup sequencing (open storage, authenticate — failing fast on any error — and load the watch list, seeding it with the authenticated account on a fresh install) and supervised orchestration of every background task (firehose, REST fallback, feed poller, likes/bookmarks poller, media downloader, web server) plus graceful shutdown. |
+| `app` | Startup sequencing (open storage, authenticate — failing fast on bad credentials, but starting anyway when Bluesky rate-limits the login and letting the session be established lazily — and load the watch list, seeding it with the authenticated account on a fresh install) and supervised orchestration of every background task (firehose, REST fallback, feed poller, likes/bookmarks poller, media downloader, web server) plus graceful shutdown. |
 
 Every background task in `app::serve` is independently supervised: a panic or
 unexpected exit in the firehose consumer, REST fallback poller, feed poller,
@@ -78,7 +78,10 @@ service. The only failures that stop
 the process outright are genuine startup-validation failures (invalid config, bad
 Bluesky credentials, an unwritable database path) — those are surfaced immediately,
 with a non-zero exit, so a misconfigured deployment fails visibly instead of running
-in a broken state.
+in a broken state. A transient Bluesky rate limit (`429`) at startup is *not* one of
+them: the service still comes up (the web UI and every supervised task start, and the
+poller backoff honors the server's `Retry-After` where available), authenticating
+lazily on the first API call once the limit clears.
 
 ## Local development
 
@@ -216,8 +219,9 @@ reports unhealthy if any background subsystem (firehose, REST fallback, feed
 poller, likes/bookmarks poller, nightly sweeper, media downloader) is in an error
 state. The
 process also fails fast and exits non-zero on startup if configuration is invalid
-or Bluesky authentication fails, so a misconfigured deployment is immediately
-visible in container logs/exit status rather than hanging.
+or Bluesky credentials are rejected, so a misconfigured deployment is immediately
+visible in container logs/exit status rather than hanging. A transient rate limit at
+startup is tolerated: the service starts and authenticates once the limit clears.
 
 ### First deploy, step by step
 
