@@ -42,6 +42,14 @@ impl BlueskyError {
             _ => None,
         }
     }
+
+    /// Whether Bluesky answered with `429 Too Many Requests`. Startup treats
+    /// this as transient — it starts up anyway and authenticates lazily on
+    /// the first API call — while every other error (notably a `401` from
+    /// bad credentials) still fails fast.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, BlueskyError::Api { status: 429, .. })
+    }
 }
 
 /// Parses a retry hint out of response headers, preferring `Retry-After`
@@ -248,6 +256,12 @@ pub struct BlueskyClient {
     identifier: String,
     app_password: Secret,
     session: tokio::sync::RwLock<Option<Session>>,
+    /// Serializes logins so concurrent callers that all observe a missing
+    /// session share a single `createSession` call (a thundering herd of
+    /// logins is exactly what gets an account rate-limited). Forced
+    /// re-logins are serialized too, though each still issues its own
+    /// request.
+    login_lock: tokio::sync::Mutex<()>,
     /// Process-wide soft cap on requests in flight, shared with the media
     /// downloader. `None` in tests/callers that don't opt in, in which case
     /// requests are never throttled here.
@@ -265,6 +279,7 @@ impl BlueskyClient {
             identifier,
             app_password,
             session: tokio::sync::RwLock::new(None),
+            login_lock: tokio::sync::Mutex::new(()),
             request_limiter: None,
         }
     }
@@ -292,7 +307,21 @@ impl BlueskyClient {
 
     /// Logs in unconditionally, overwriting any cached session. Used both
     /// for the first login and to force a fresh session after a 401.
+    /// Serialized against other logins (see [`Self::login_locked`]).
     async fn login(&self) -> Result<String, BlueskyError> {
+        let _guard = self.login_lock.lock().await;
+        self.login_locked().await
+    }
+
+    /// The un-serialized login: performs `createSession` and stores the
+    /// resulting session. Only called while holding `login_lock`.
+    ///
+    /// A non-success response is surfaced as a [`BlueskyError::Api`] — not
+    /// the opaque [`BlueskyError::Auth`] it used to be — so callers (and the
+    /// startup path in particular) can tell a transient `429`/server error
+    /// apart from a genuine credential rejection, and so a rate-limit hint
+    /// survives into the pollers' backoff.
+    async fn login_locked(&self) -> Result<String, BlueskyError> {
         let url = self.xrpc_url("com.atproto.server.createSession");
         let _permit = self.throttle().await;
         let response = self
@@ -307,10 +336,13 @@ impl BlueskyClient {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = parse_retry_hint(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(BlueskyError::Auth(format!(
-                "createSession failed with status {status}: {body}"
-            )));
+            return Err(BlueskyError::Api {
+                status: status.as_u16(),
+                body,
+                retry_after,
+            });
         }
 
         let parsed: CreateSessionResponse = response.json().await?;
@@ -323,12 +355,18 @@ impl BlueskyClient {
     }
 
     /// Returns a valid access token, logging in first if there is no
-    /// session yet.
+    /// session yet. Concurrent callers share a single login (the double
+    /// check after acquiring `login_lock` avoids a redundant `createSession`
+    /// for every task that raced here).
     async fn access_token(&self) -> Result<String, BlueskyError> {
         if let Some(session) = self.session.read().await.as_ref() {
             return Ok(session.access_jwt.clone());
         }
-        self.login().await
+        let _guard = self.login_lock.lock().await;
+        if let Some(session) = self.session.read().await.as_ref() {
+            return Ok(session.access_jwt.clone());
+        }
+        self.login_locked().await
     }
 
     /// Performs an authenticated GET against `method` with the given query
@@ -1137,7 +1175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_failure_produces_auth_error() {
+    async fn login_failure_surfaces_api_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/xrpc/com.atproto.server.createSession"))
@@ -1153,7 +1191,13 @@ mod tests {
             .get_actor_likes("did:plc:alice", None, 50)
             .await
             .expect_err("should fail to authenticate");
-        assert!(matches!(err, BlueskyError::Auth(_)));
+        match err {
+            // A rejected login is surfaced as an API error (carrying the
+            // status) rather than the old opaque `Auth` string, so callers
+            // can tell a `401` apart from a transient `429`.
+            BlueskyError::Api { status, .. } => assert_eq!(status, 401),
+            other => panic!("expected Api error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1200,7 +1244,33 @@ mod tests {
             .authenticate()
             .await
             .expect_err("bad credentials should fail authenticate");
-        assert!(matches!(err, BlueskyError::Auth(_)));
+        assert!(matches!(err, BlueskyError::Api { status: 401, .. }));
+        assert!(!err.is_rate_limited(), "a 401 is not a rate limit");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_login_surfaces_retry_hint_and_is_not_fatal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_json(json!({
+                        "error": "RateLimitExceeded",
+                        "message": "Rate Limit Exceeded",
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let err = client
+            .authenticate()
+            .await
+            .expect_err("rate limit should surface as an error");
+        assert!(err.is_rate_limited());
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
     }
 
     #[tokio::test]

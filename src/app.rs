@@ -2,7 +2,8 @@
 //! tasks (firehose consumer, REST fallback poller, likes/bookmarks poller,
 //! media downloader), and graceful shutdown.
 //!
-//! Split into [`init`] (build everything, fail fast on any error) and
+//! Split into [`init`] (build everything, fail fast on misconfiguration —
+//! but tolerate a transient Bluesky rate limit and authenticate lazily) and
 //! [`serve`] (run forever until a shutdown signal arrives) so startup
 //! validation failure paths can be exercised directly in tests without
 //! spawning a real process or running the service loop.
@@ -42,7 +43,7 @@ use crate::pipeline::{
     ConnectionHealthSender, candidate_post_channel, connection_health_channel, weak_from_sender,
 };
 use crate::poller::{FeedPoller, LikesBookmarksPoller, PollerConfig, RestFallbackPoller};
-use crate::ratelimit::RequestLimiter;
+use crate::ratelimit::{Backoff, BackoffConfig, RequestLimiter};
 use crate::state::{AppState, SharedAppState};
 use crate::storage::{ArchiveStore, SourceKind, StorageError};
 use crate::sweep::NightlySweeper;
@@ -84,7 +85,11 @@ pub struct Started {
     pub state: SharedAppState,
     health_tx: HealthSender,
     bluesky_client: Arc<BlueskyClient>,
-    self_did: String,
+    /// The authenticated account's DID, when startup managed to log in.
+    /// `None` when Bluesky rate-limited the startup login: the service still
+    /// starts, its own-account queries fall back to the configured handle,
+    /// and the session is established lazily on the first API call.
+    self_did: Option<String>,
     candidate_tx: CandidatePostSender,
     candidate_rx: CandidatePostReceiver,
     conn_health_tx: ConnectionHealthSender,
@@ -93,8 +98,8 @@ pub struct Started {
 }
 
 /// Runs the whole service: loads config from the environment, starts up
-/// (failing fast on any error), then serves until a shutdown signal
-/// arrives.
+/// (failing fast on misconfiguration, but not on a transient rate limit),
+/// then serves until a shutdown signal arrives.
 pub async fn run() -> Result<(), StartupError> {
     let config = AppConfig::from_env()?;
     let base_url = Url::parse(DEFAULT_BLUESKY_BASE_URL).expect("default bluesky base url is valid");
@@ -105,9 +110,9 @@ pub async fn run() -> Result<(), StartupError> {
 
 /// The startup sequence: open storage (self-healing the SQLite index if
 /// it's missing), authenticate to Bluesky (failing fast on bad
-/// credentials), and load/seed the `watched_sources` watch list into the
-/// in-memory roster. Returns everything [`serve`] needs to spawn the
-/// background tasks.
+/// credentials, but starting anyway when rate-limited), and load/seed the
+/// `watched_sources` watch list into the in-memory roster. Returns
+/// everything [`serve`] needs to spawn the background tasks.
 pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, StartupError> {
     tracing::info!(config = ?config, "starting up");
 
@@ -129,13 +134,26 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
         )
         .with_request_limiter(Arc::clone(&request_limiter)),
     );
-    let self_did = bluesky_client
-        .authenticate()
-        .await
-        .map_err(StartupError::from)?;
-    tracing::info!(did = %self_did, "authenticated with bluesky");
+    // Bad credentials are a misconfiguration and still abort startup, but a
+    // rate limit is transient: start up anyway (the web UI comes up, the
+    // supervised pollers retry with backoff) and let the client log in
+    // lazily on the first real API call.
+    let self_did = match bluesky_client.authenticate().await {
+        Ok(did) => {
+            tracing::info!(did = %did, "authenticated with bluesky");
+            Some(did)
+        }
+        Err(err) if err.is_rate_limited() => {
+            tracing::warn!(
+                error = %err,
+                "bluesky rate-limited startup authentication; starting without an initial session"
+            );
+            None
+        }
+        Err(err) => return Err(StartupError::from(err)),
+    };
 
-    seed_empty_watchlist(&config, &store, &self_did).await?;
+    seed_empty_watchlist(&config, &store, self_did.as_deref()).await?;
     let watchlist = Watchlist::new(store.list_watched_sources().await?);
     tracing::info!(
         sources = ?watchlist.snapshot(),
@@ -175,20 +193,132 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
 async fn seed_empty_watchlist(
     config: &AppConfig,
     store: &ArchiveStore,
-    self_did: &str,
+    self_did: Option<&str>,
 ) -> Result<(), StorageError> {
     if !store.list_watched_sources().await?.is_empty() {
         return Ok(());
     }
     store
-        .add_watched_source(SourceKind::Account, &config.bsky_identifier, Some(self_did))
+        .add_watched_source(SourceKind::Account, &config.bsky_identifier, self_did)
         .await?;
     tracing::info!(
         identifier = %config.bsky_identifier,
-        did = %self_did,
+        did = ?self_did,
         "watch list was empty; seeded with the authenticated account"
     );
     Ok(())
+}
+
+/// Resolves and persists the DID for watched account sources that don't have
+/// one yet, then reloads the live roster so the firehose filters on real
+/// DIDs.
+///
+/// This is the repair for an install whose account was seeded while Bluesky
+/// was rate-limiting the startup login: the account is watched by handle, but
+/// Jetstream matches on DIDs, so until this runs the firehose would filter on
+/// a handle and deliver nothing for it. Runs in the background (a rate limit
+/// must not block startup) and retries with backoff, honoring any
+/// server-provided hint, until every account resolves or `shutdown` fires.
+/// Returns once none lack a DID.
+async fn backfill_missing_dids(
+    client: Arc<BlueskyClient>,
+    store: ArchiveStore,
+    watchlist: Watchlist,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut backoff = Backoff::new(BackoffConfig::new(
+        Duration::from_secs(5),
+        Duration::from_secs(300),
+    ));
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+
+        let missing: Vec<String> = match store.list_watched_sources().await {
+            Ok(sources) => sources
+                .into_iter()
+                .filter(|source| {
+                    source.kind == SourceKind::Account
+                        && source.did.is_none()
+                        && !source.value.starts_with("did:")
+                })
+                .map(|source| source.value)
+                .collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to list watched sources for DID backfill");
+                return;
+            }
+        };
+        if missing.is_empty() {
+            return;
+        }
+
+        // Resolve this pass's accounts, reloading the roster for whichever
+        // ones succeeded even if a later one defers, so a single
+        // unresolvable handle can't keep every repair out of the live roster.
+        let mut resolved_any = false;
+        let mut retry_in: Option<Duration> = None;
+        for value in missing {
+            match client.resolve_handle(&value).await {
+                Ok(did) => match store.set_watched_source_did(&value, &did).await {
+                    Ok(true) => {
+                        tracing::info!(handle = %value, %did, "backfilled watched account DID");
+                        resolved_any = true;
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            handle = %value,
+                            "watched account removed during DID backfill; skipping"
+                        );
+                    }
+                    Err(err) => {
+                        let delay = backoff.on_failure(None);
+                        tracing::warn!(
+                            handle = %value,
+                            error = %err,
+                            retry_secs = delay.as_secs(),
+                            "failed to persist resolved watch DID; retrying"
+                        );
+                        retry_in = Some(delay);
+                        break;
+                    }
+                },
+                Err(err) => {
+                    let delay = backoff.on_failure(err.retry_after());
+                    tracing::warn!(
+                        handle = %value,
+                        error = %err,
+                        retry_secs = delay.as_secs(),
+                        "could not resolve watched account DID; retrying"
+                    );
+                    retry_in = Some(delay);
+                    break;
+                }
+            }
+        }
+
+        if resolved_any && let Err(err) = watchlist.reload_from_store(&store).await {
+            tracing::warn!(error = %err, "failed to reload watch list after DID backfill");
+        }
+
+        let Some(delay) = retry_in else {
+            // Nothing deferred this pass; reset the backoff and loop once
+            // more to confirm none remain, then return.
+            backoff.on_success();
+            continue;
+        };
+        // A deferred handle keeps its accumulated backoff across passes (the
+        // reset above only runs on a fully clean pass).
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Spawns the supervised background tasks and runs until SIGINT/SIGTERM
@@ -214,9 +344,23 @@ pub async fn serve(started: Started) {
     let config = &state.config;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let cursor_path = config.archive_dir.join("jetstream_cursor");
+    // The account's own queries (likes/bookmarks poller, nightly sweep)
+    // identify it by handle or DID. Prefer the DID resolved at startup,
+    // falling back to the configured handle when startup was rate-limited
+    // and no session had been established yet.
+    let self_actor = self_did.unwrap_or_else(|| config.bsky_identifier.clone());
     // One shared roster subscription drives every producer, so a UI add or
     // remove (reload) is observed by all of them.
     let roster_rx = state.watchlist.subscribe();
+
+    // Repair any watched account seeded without a DID (see
+    // `backfill_missing_dids`); a no-op when every account already has one.
+    tokio::spawn(backfill_missing_dids(
+        Arc::clone(&bluesky_client),
+        state.store.clone(),
+        state.watchlist.clone(),
+        shutdown_rx.clone(),
+    ));
 
     let firehose_handle = spawn_firehose(
         config.jetstream_url.clone(),
@@ -254,7 +398,7 @@ pub async fn serve(started: Started) {
         Arc::clone(&bluesky_client),
         state.store.clone(),
         candidate_tx.clone(),
-        self_did.clone(),
+        self_actor.clone(),
         Duration::from_secs(config.poll_interval_seconds),
         health_tx.clone(),
         shutdown_rx.clone(),
@@ -289,7 +433,7 @@ pub async fn serve(started: Started) {
         Arc::clone(&bluesky_client),
         state.store.clone(),
         candidate_tx.clone(),
-        self_did,
+        self_actor,
         config.nightly_sweep_local_hour,
         health_tx.clone(),
         shutdown_rx.clone(),
@@ -838,6 +982,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn init_starts_up_when_bluesky_rate_limits_authentication() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_json(serde_json::json!({
+                        "error": "RateLimitExceeded",
+                        "message": "Rate Limit Exceeded",
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let archive_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = archive_dir.path().join("index.sqlite3");
+        let config = test_config(archive_dir.path().to_path_buf(), database_path);
+        let base_url = Url::parse(&server.uri()).unwrap();
+
+        let started = init(config, base_url)
+            .await
+            .expect("a rate-limited startup must still come up");
+        assert!(
+            started.self_did.is_none(),
+            "no DID is known until the client authenticates lazily"
+        );
+
+        // The watch list is still seeded with the authenticated account; the
+        // DID is simply left unresolved for now.
+        let sources = started.state.watchlist.snapshot();
+        assert_eq!(sources.len(), 1, "fresh install seeds exactly one account");
+        assert_eq!(sources[0].kind, SourceKind::Account);
+        assert_eq!(sources[0].value, "alice.bsky.social");
+        assert_eq!(sources[0].did, None);
+    }
+
+    #[tokio::test]
+    async fn backfill_missing_dids_resolves_and_reloads_the_roster() {
+        let server = MockServer::start().await;
+        // `resolveHandle` is authenticated, so a login is needed first.
+        mount_login(&server, "did:plc:alice").await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "did": "did:plc:bob",
+            })))
+            .mount(&server)
+            .await;
+
+        let archive_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = archive_dir.path().join("index.sqlite3");
+        let store = ArchiveStore::open(archive_dir.path().to_path_buf(), database_path)
+            .await
+            .expect("open store");
+        store
+            .add_watched_source(SourceKind::Account, "bob.bsky.social", None)
+            .await
+            .expect("add source");
+        // A feed source (no DID by design) must be left alone.
+        store
+            .add_watched_source(
+                SourceKind::Feed,
+                "at://did:plc:alice/app.bsky.feed.generator/x",
+                None,
+            )
+            .await
+            .expect("add feed");
+        let watchlist = Watchlist::new(store.list_watched_sources().await.unwrap());
+
+        let client = Arc::new(BlueskyClient::new(
+            Url::parse(&server.uri()).unwrap(),
+            "alice.bsky.social".to_string(),
+            Secret::from("app-password".to_string()),
+        ));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        backfill_missing_dids(
+            Arc::clone(&client),
+            store.clone(),
+            watchlist.clone(),
+            shutdown_rx,
+        )
+        .await;
+
+        let sources = store.list_watched_sources().await.unwrap();
+        let account = sources
+            .iter()
+            .find(|s| s.kind == SourceKind::Account)
+            .expect("account source");
+        assert_eq!(account.did.as_deref(), Some("did:plc:bob"));
+        // The feed source is untouched: it has no DID by design.
+        let feed = sources
+            .iter()
+            .find(|s| s.kind == SourceKind::Feed)
+            .expect("feed source");
+        assert_eq!(feed.did, None);
+        // The live roster was reloaded, so the firehose will see the DID.
+        let restored = watchlist
+            .snapshot()
+            .into_iter()
+            .find(|s| s.kind == SourceKind::Account)
+            .expect("account source");
+        assert_eq!(restored.did.as_deref(), Some("did:plc:bob"));
+    }
+
+    #[tokio::test]
+    async fn backfill_missing_dids_gives_up_when_shutdown_fires() {
+        let server = MockServer::start().await;
+        mount_login(&server, "did:plc:alice").await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "600"))
+            .mount(&server)
+            .await;
+
+        let archive_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = archive_dir.path().join("index.sqlite3");
+        let store = ArchiveStore::open(archive_dir.path().to_path_buf(), database_path)
+            .await
+            .expect("open store");
+        store
+            .add_watched_source(SourceKind::Account, "bob.bsky.social", None)
+            .await
+            .expect("add source");
+        let watchlist = Watchlist::new(store.list_watched_sources().await.unwrap());
+
+        let client = Arc::new(BlueskyClient::new(
+            Url::parse(&server.uri()).unwrap(),
+            "alice.bsky.social".to_string(),
+            Secret::from("app-password".to_string()),
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // The resolve is rate-limited with a long hint, so the task parks in
+        // its retry sleep; a shutdown must break out of it (rather than the
+        // task hanging until the hint elapses) and leave the DID unresolved.
+        let task = tokio::spawn(backfill_missing_dids(
+            Arc::clone(&client),
+            store.clone(),
+            watchlist,
+            shutdown_rx,
+        ));
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("backfill must stop promptly on shutdown")
+            .expect("backfill task should not panic");
+
+        let account = store
+            .list_watched_sources()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind == SourceKind::Account)
+            .expect("account source");
+        assert_eq!(account.did, None);
+    }
+
+    #[tokio::test]
     async fn init_reindexes_from_disk_when_database_is_missing() {
         let server = MockServer::start().await;
         mount_login(&server, "did:plc:alice").await;
@@ -892,7 +1196,7 @@ mod tests {
         let base_url = Url::parse(&server.uri()).unwrap();
 
         let started = init(config, base_url).await.expect("init should succeed");
-        assert_eq!(started.self_did, "did:plc:alice");
+        assert_eq!(started.self_did.as_deref(), Some("did:plc:alice"));
 
         let sources = started.state.watchlist.snapshot();
         assert_eq!(sources.len(), 1, "fresh install seeds exactly one account");
