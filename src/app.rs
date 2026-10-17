@@ -132,6 +132,7 @@ pub async fn init(config: AppConfig, bluesky_base_url: Url) -> Result<Started, S
             config.bsky_identifier.clone(),
             config.bsky_app_password.clone(),
         )
+        .with_session_file(config.archive_dir.join("bluesky_session.json"))
         .with_request_limiter(Arc::clone(&request_limiter)),
     );
     // Bad credentials are a misconfiguration and still abort startup, but a

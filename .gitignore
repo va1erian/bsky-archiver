@@ -2,6 +2,8 @@
 .env
 *.log
 /data
+/archive
+bluesky_session.json
 .symphony-mcp.json
 /.symphony/.workspaces/
 /.symphony/symphony-report.html

@@ -52,10 +52,10 @@ use crate::storage::{ArchiveStore, Category};
 /// endpoint's own maximum.
 pub const VERIFY_BATCH_SIZE: usize = 25;
 
-/// How long to wait before retrying a failed sweep. A sweep that errors
-/// partway (e.g. a rate-limit window or a transient 5xx) retries until it
-/// completes, so one bad night can't push the next full pass a whole day
-/// out.
+/// How long to wait before retrying a failed sweep (longer when the server
+/// hinted a longer rate-limit window). A sweep that errors partway (e.g. a
+/// rate-limit window or a transient 5xx) retries until it completes, so one
+/// bad night can't push the next full pass a whole day out.
 pub const RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 
 /// Errors from one full sweep pass.
@@ -65,6 +65,22 @@ pub enum SweepError {
     Bluesky(#[from] crate::bluesky::BlueskyError),
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageError),
+}
+
+impl SweepError {
+    /// The server-provided retry hint behind a rate-limited sweep, if any.
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            SweepError::Bluesky(err) => err.retry_after(),
+            SweepError::Storage(_) => None,
+        }
+    }
+}
+
+/// How long to wait before retrying a failed sweep: the server's hinted
+/// window when it is longer than [`RETRY_DELAY`], the base delay otherwise.
+fn retry_delay(err: &SweepError) -> Duration {
+    err.retry_after().unwrap_or_default().max(RETRY_DELAY)
 }
 
 impl From<PollError> for SweepError {
@@ -135,12 +151,13 @@ impl NightlySweeper {
                         break;
                     }
                     Err(err) => {
+                        let delay = retry_delay(&err);
                         warn!(
                             error = %err,
-                            retry_secs = RETRY_DELAY.as_secs(),
+                            retry_secs = delay.as_secs(),
                             "likes/bookmarks sweep failed; retrying"
                         );
-                        tokio::time::sleep(RETRY_DELAY).await;
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }
