@@ -112,6 +112,31 @@ fn sweep_delay_targets_configured_local_hour() {
     );
 }
 
+#[test]
+fn sweep_retry_delay_honors_a_longer_server_hint() {
+    let rate_limited = SweepError::Bluesky(crate::bluesky::BlueskyError::Api {
+        status: 429,
+        body: "rate limited".to_string(),
+        retry_after: Some(Duration::from_secs(6 * 3600)),
+    });
+    assert_eq!(retry_delay(&rate_limited), Duration::from_secs(6 * 3600));
+
+    // A hint shorter than the base delay is ignored, as is no hint at all.
+    let hinted_shortly = SweepError::Bluesky(crate::bluesky::BlueskyError::Api {
+        status: 429,
+        body: "rate limited".to_string(),
+        retry_after: Some(Duration::from_secs(30)),
+    });
+    assert_eq!(retry_delay(&hinted_shortly), RETRY_DELAY);
+
+    let outage = SweepError::Bluesky(crate::bluesky::BlueskyError::Api {
+        status: 503,
+        body: "unavailable".to_string(),
+        retry_after: None,
+    });
+    assert_eq!(retry_delay(&outage), RETRY_DELAY);
+}
+
 #[tokio::test]
 async fn sweep_archives_missed_items_and_marks_deleted_upstream_posts() {
     let server = MockServer::start().await;

@@ -1,5 +1,7 @@
 /target
 /data
+/archive
+bluesky_session.json
 .env
 *.log
 .github

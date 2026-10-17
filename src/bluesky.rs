@@ -3,9 +3,13 @@
 //! and bookmarks.
 //!
 //! Covers what both the authored-post REST fallback (AR-6) and the
-//! likes/bookmarks poller (AR-7) need: session auth (with automatic
-//! re-login on a 401), `getAuthorFeed`, `getActorLikes`, and `getBookmarks`.
+//! likes/bookmarks poller (AR-7) need: session auth (renewed through
+//! `refreshSession` when the access token expires, see [`session`]),
+//! `getAuthorFeed`, `getActorLikes`, and `getBookmarks`.
 
+mod session;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +17,7 @@ use serde::Deserialize;
 
 use crate::config::Secret;
 use crate::ratelimit::RequestLimiter;
+use session::{LoginGate, Session, SessionFile};
 
 /// Errors produced by calls against the Bluesky HTTP API.
 #[derive(Debug, thiserror::Error)]
@@ -228,40 +233,38 @@ pub struct AuthorFeedPage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct CreateSessionResponse {
-    #[serde(rename = "accessJwt")]
-    access_jwt: String,
-    did: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct ResolveHandleResponse {
     did: String,
 }
 
-#[derive(Debug, Clone)]
-struct Session {
-    access_jwt: String,
-    #[allow(dead_code)]
+/// The subset of `com.atproto.server.getSession` this client needs: the DID
+/// the current access token actually belongs to, which is what startup
+/// reports rather than trusting the DID saved alongside the token.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionInfo {
     did: String,
 }
 
 /// A thin async client for the subset of the `com.atproto.*` / `app.bsky.*`
-/// XRPC surface this project needs. Holds a lazily-established, auto-renewed
-/// (on 401) session behind an async lock so callers never have to manage
-/// auth themselves.
+/// XRPC surface this project needs. Holds a lazily-established session
+/// behind an async lock, renewed with `refreshSession` when the access
+/// token expires, so callers never have to manage auth themselves. A full
+/// `createSession` login is the last resort (see [`session`]).
 pub struct BlueskyClient {
     http: reqwest::Client,
     base_url: url::Url,
     identifier: String,
     app_password: Secret,
     session: tokio::sync::RwLock<Option<Session>>,
-    /// Serializes logins so concurrent callers that all observe a missing
-    /// session share a single `createSession` call (a thundering herd of
-    /// logins is exactly what gets an account rate-limited). Forced
-    /// re-logins are serialized too, though each still issues its own
-    /// request.
+    /// Serializes logins and renewals so concurrent callers that all
+    /// observe a missing or expired session share a single request (a
+    /// thundering herd of logins is exactly what gets an account
+    /// rate-limited).
     login_lock: tokio::sync::Mutex<()>,
+    /// Cooldown after a rate-limited `createSession`.
+    login_gate: LoginGate,
+    /// Where the session is kept across restarts, when enabled.
+    session_file: Option<SessionFile>,
     /// Process-wide soft cap on requests in flight, shared with the media
     /// downloader. `None` in tests/callers that don't opt in, in which case
     /// requests are never throttled here.
@@ -280,8 +283,19 @@ impl BlueskyClient {
             app_password,
             session: tokio::sync::RwLock::new(None),
             login_lock: tokio::sync::Mutex::new(()),
+            login_gate: LoginGate::default(),
+            session_file: None,
             request_limiter: None,
         }
+    }
+
+    /// Persists the session at `path` and resumes the one saved there, so a
+    /// restart doesn't spend a rate-limited `createSession` login.
+    pub fn with_session_file(mut self, path: PathBuf) -> Self {
+        let file = SessionFile::new(path, self.identifier.clone());
+        *self.session.get_mut() = file.load();
+        self.session_file = Some(file);
+        self
     }
 
     /// Attaches a process-wide request limiter: every request this client
@@ -305,12 +319,65 @@ impl BlueskyClient {
             .expect("xrpc method names are valid URL path segments")
     }
 
-    /// Logs in unconditionally, overwriting any cached session. Used both
-    /// for the first login and to force a fresh session after a 401.
-    /// Serialized against other logins (see [`Self::login_locked`]).
-    async fn login(&self) -> Result<String, BlueskyError> {
+    /// Stores `session` as the current one and persists it for restarts.
+    async fn store_session(&self, session: Session) {
+        if let Some(file) = &self.session_file {
+            file.save(&session).await;
+        }
+        *self.session.write().await = Some(session);
+    }
+
+    /// Replaces the stale access token `stale` with a fresh one, or returns
+    /// the current token if another caller already renewed it. Renews with
+    /// the session's refresh token; only when that is rejected (expired,
+    /// revoked) does it fall back to a full `createSession` login, which
+    /// Bluesky rate-limits to a few per day. A refresh that fails for any
+    /// other reason (rate limit, outage) is surfaced rather than answered
+    /// with a login.
+    async fn renew_session(&self, stale: &str) -> Result<String, BlueskyError> {
         let _guard = self.login_lock.lock().await;
+        let current = self.session.read().await.clone();
+        if let Some(session) = current {
+            if session.access_jwt != stale {
+                return Ok(session.access_jwt);
+            }
+            if let Some(access_jwt) = self.refresh_locked(&session.refresh_jwt).await? {
+                return Ok(access_jwt);
+            }
+            tracing::info!("bluesky refresh token was rejected; logging in again");
+        }
         self.login_locked().await
+    }
+
+    /// Exchanges `refresh_jwt` for a new token pair (`refreshSession`) and
+    /// stores it. `Ok(None)` means the refresh token itself was rejected.
+    /// Only called while holding `login_lock`.
+    async fn refresh_locked(&self, refresh_jwt: &str) -> Result<Option<String>, BlueskyError> {
+        let url = self.xrpc_url("com.atproto.server.refreshSession");
+        let response = {
+            let _permit = self.throttle().await;
+            self.http.post(url).bearer_auth(refresh_jwt).send().await?
+        };
+
+        let status = response.status();
+        if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED
+        {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let retry_after = parse_retry_hint(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            return Err(BlueskyError::Api {
+                status: status.as_u16(),
+                body,
+                retry_after,
+            });
+        }
+
+        let session: Session = response.json().await?;
+        let access_jwt = session.access_jwt.clone();
+        self.store_session(session).await;
+        Ok(Some(access_jwt))
     }
 
     /// The un-serialized login: performs `createSession` and stores the
@@ -320,8 +387,21 @@ impl BlueskyClient {
     /// the opaque [`BlueskyError::Auth`] it used to be — so callers (and the
     /// startup path in particular) can tell a transient `429`/server error
     /// apart from a genuine credential rejection, and so a rate-limit hint
-    /// survives into the pollers' backoff.
+    /// survives into the pollers' backoff. A `429` also closes the login
+    /// gate: until the window reopens, further attempts fail immediately
+    /// with the remaining wait instead of spending more of the limit.
     async fn login_locked(&self) -> Result<String, BlueskyError> {
+        if let Some(remaining) = self.login_gate.remaining() {
+            return Err(BlueskyError::Api {
+                status: 429,
+                body: format!(
+                    "bluesky login is rate-limited; not retrying for another {}s",
+                    remaining.as_secs()
+                ),
+                retry_after: Some(remaining),
+            });
+        }
+
         let url = self.xrpc_url("com.atproto.server.createSession");
         let _permit = self.throttle().await;
         let response = self
@@ -337,6 +417,9 @@ impl BlueskyClient {
         let status = response.status();
         if !status.is_success() {
             let retry_after = parse_retry_hint(response.headers());
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.login_gate.block(retry_after);
+            }
             let body = response.text().await.unwrap_or_default();
             return Err(BlueskyError::Api {
                 status: status.as_u16(),
@@ -345,12 +428,10 @@ impl BlueskyClient {
             });
         }
 
-        let parsed: CreateSessionResponse = response.json().await?;
-        let access_jwt = parsed.access_jwt.clone();
-        *self.session.write().await = Some(Session {
-            access_jwt: parsed.access_jwt,
-            did: parsed.did,
-        });
+        let session: Session = response.json().await?;
+        let access_jwt = session.access_jwt.clone();
+        self.login_gate.clear();
+        self.store_session(session).await;
         Ok(access_jwt)
     }
 
@@ -388,8 +469,8 @@ impl BlueskyClient {
         // Bluesky rejects an expired access token with HTTP 401, or with a
         // 400 whose body names `ExpiredToken` (the AppView's own convention
         // — not a 401, which is what makes long-running pollers strand on a
-        // stale session). Both mean the cached session is stale: log in
-        // again and retry the request exactly once. The response body is
+        // stale session). Both mean the cached session is stale: renew it
+        // and retry the request exactly once. The response body is
         // consumed up front for exactly those statuses because (a) it is
         // what distinguishes an expired token from any other 400 and (b) it
         // is the same body the error path below wants.
@@ -402,8 +483,8 @@ impl BlueskyClient {
             let expired = status == reqwest::StatusCode::UNAUTHORIZED
                 || body.as_deref().is_some_and(is_expired_token_body);
             if expired {
-                tracing::info!(%method, "bluesky access token expired; re-authenticating");
-                access_token = self.login().await?;
+                tracing::info!(%method, "bluesky access token expired; renewing the session");
+                access_token = self.renew_session(&access_token).await?;
                 let fresh = self.send_get(&url, &access_token, query).await?;
                 status = fresh.status();
                 retry_after = parse_retry_hint(fresh.headers());
@@ -624,19 +705,25 @@ impl BlueskyClient {
         let mut access_token = self.access_token().await?;
         let mut response = Some(self.send_post(&url, &access_token, body).await?);
 
-        // Same expired-token convention the GET path retries on: the
-        // first body-reading status signals a possible stale session, and
-        // a 401 means re-authenticate and try the same POST once more.
+        // Same expired-token convention the GET path retries on: a 401, or
+        // a 400 whose body names `ExpiredToken`, means a stale session —
+        // renew it and try the same POST once more. Any other 400 is a real
+        // error and is surfaced as is.
         let first_status = response.as_ref().expect("just sent").status();
-        if reads_body_before_error(first_status)
-            && first_status == reqwest::StatusCode::UNAUTHORIZED
-        {
+        if reads_body_before_error(first_status) {
             let sent = response.take().expect("response present");
-            // Drain the body so the connection is reusable before the
-            // re-auth request is issued.
-            let _ = sent.text().await;
-            tracing::info!(%method, "bluesky access token expired; re-authenticating");
-            access_token = self.login().await?;
+            let body_text = sent.text().await.unwrap_or_default();
+            if first_status != reqwest::StatusCode::UNAUTHORIZED
+                && !is_expired_token_body(&body_text)
+            {
+                return Err(BlueskyError::Api {
+                    status: first_status.as_u16(),
+                    body: body_text,
+                    retry_after: None,
+                });
+            }
+            tracing::info!(%method, "bluesky access token expired; renewing the session");
+            access_token = self.renew_session(&access_token).await?;
             response = Some(self.send_post(&url, &access_token, body).await?);
         }
 
@@ -700,15 +787,17 @@ impl BlueskyClient {
 
     /// Authenticates immediately, returning the authenticated account's own
     /// DID. Used at startup to fail fast on bad credentials rather than
-    /// discovering the problem on the first real API call.
+    /// discovering the problem on the first real API call. A saved session
+    /// is verified (and renewed if expired) instead of logging in again;
+    /// bad credentials only surface when a login is actually needed.
     pub async fn authenticate(&self) -> Result<String, BlueskyError> {
-        self.login().await?;
-        let session = self.session.read().await;
-        Ok(session
-            .as_ref()
-            .expect("login() just populated the session")
-            .did
-            .clone())
+        if self.session.read().await.is_some() {
+            let verified: SessionInfo = self
+                .get_authenticated("com.atproto.server.getSession", &[])
+                .await?;
+            return Ok(verified.did);
+        }
+        self.own_did().await
     }
 
     /// Resolves `handle` (a Bluesky handle, e.g. `alice.bsky.social`) to its
@@ -1009,119 +1098,422 @@ mod tests {
         assert!(page.blocked_posts.is_empty());
     }
 
-    #[tokio::test]
-    async fn expired_session_triggers_relogin_and_retry() {
-        let server = MockServer::start().await;
+    fn session_json(access: &str, refresh: &str) -> serde_json::Value {
+        json!({
+            "accessJwt": access,
+            "refreshJwt": refresh,
+            "did": "did:plc:alice",
+            "handle": "alice.bsky.social",
+        })
+    }
 
+    async fn mock_login_once(server: &MockServer) {
         Mock::given(method("POST"))
             .and(path("/xrpc/com.atproto.server.createSession"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "accessJwt": "token-1",
-                "refreshJwt": "refresh-1",
-                "did": "did:plc:alice",
-                "handle": "alice.bsky.social",
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(session_json("token-1", "refresh-1")),
+            )
             .up_to_n_times(1)
-            .mount(&server)
+            .expect(1)
+            .mount(server)
             .await;
+    }
 
-        // Second login (after the 401) returns a fresh token.
+    async fn mock_refresh(server: &MockServer, expected_calls: u64) {
         Mock::given(method("POST"))
-            .and(path("/xrpc/com.atproto.server.createSession"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "accessJwt": "token-2",
-                "refreshJwt": "refresh-2",
-                "did": "did:plc:alice",
-                "handle": "alice.bsky.social",
-            })))
-            .mount(&server)
+            .and(path("/xrpc/com.atproto.server.refreshSession"))
+            .and(header("authorization", "Bearer refresh-1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(session_json("token-2", "refresh-2")),
+            )
+            .expect(expected_calls)
+            .mount(server)
             .await;
+    }
 
+    async fn mock_likes(server: &MockServer, token: &str, response: ResponseTemplate) {
         Mock::given(method("GET"))
             .and(path("/xrpc/app.bsky.feed.getActorLikes"))
-            .and(header("authorization", "Bearer token-1"))
-            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-                "error": "ExpiredToken",
-                "message": "token expired",
-            })))
-            .mount(&server)
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(response)
+            .mount(server)
             .await;
+    }
 
-        Mock::given(method("GET"))
-            .and(path("/xrpc/app.bsky.feed.getActorLikes"))
-            .and(header("authorization", "Bearer token-2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "feed": [],
-                "cursor": null,
-            })))
-            .mount(&server)
-            .await;
+    fn expired(status: u16) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_json(json!({
+            "error": "ExpiredToken",
+            "message": "Token has expired",
+        }))
+    }
+
+    fn empty_likes() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"feed": [], "cursor": null}))
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_renewed_with_a_refresh_not_a_login() {
+        let server = MockServer::start().await;
+        // Exactly one createSession for the whole test: the first login.
+        mock_login_once(&server).await;
+        mock_refresh(&server, 1).await;
+        mock_likes(&server, "token-1", expired(401)).await;
+        mock_likes(&server, "token-2", empty_likes()).await;
 
         let client = client(&server);
         let page = client
             .get_actor_likes("did:plc:alice", None, 50)
             .await
-            .expect("should succeed after relogin");
+            .expect("should succeed after refreshing the session");
         assert!(page.feed.is_empty());
+
+        // The renewed session is cached: no further refresh or login.
+        client
+            .get_actor_likes("did:plc:alice", None, 50)
+            .await
+            .expect("renewed session is reused");
     }
 
     #[tokio::test]
-    async fn expired_token_400_triggers_relogin_and_retry() {
+    async fn expired_token_400_is_renewed_with_a_refresh() {
         let server = MockServer::start().await;
-
-        // First login returns a token the (mock) AppView then rejects with
-        // its expired-token convention: an HTTP 400 whose body names
-        // `ExpiredToken` — not a 401, which is what used to strand long
-        // pollers retrying forever on the stale session.
-        Mock::given(method("POST"))
-            .and(path("/xrpc/com.atproto.server.createSession"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "accessJwt": "token-1",
-                "refreshJwt": "refresh-1",
-                "did": "did:plc:alice",
-                "handle": "alice.bsky.social",
-            })))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/xrpc/com.atproto.server.createSession"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "accessJwt": "token-2",
-                "refreshJwt": "refresh-2",
-                "did": "did:plc:alice",
-                "handle": "alice.bsky.social",
-            })))
-            .mount(&server)
-            .await;
+        // The AppView's expired-token convention is an HTTP 400 whose body
+        // names `ExpiredToken` — not a 401, which is what used to strand
+        // long pollers retrying forever on the stale session.
+        mock_login_once(&server).await;
+        mock_refresh(&server, 1).await;
 
         Mock::given(method("GET"))
             .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
             .and(header("authorization", "Bearer token-1"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "error": "ExpiredToken",
-                "message": "Token has expired",
-            })))
+            .respond_with(expired(400))
             .mount(&server)
             .await;
-
         Mock::given(method("GET"))
             .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
             .and(header("authorization", "Bearer token-2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "bookmarks": [],
-                "cursor": null,
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"bookmarks": [], "cursor": null})),
+            )
+            .mount(&server)
+            .await;
+
+        let page = client(&server)
+            .get_bookmarks(None, 50)
+            .await
+            .expect("should succeed after refreshing on a 400 ExpiredToken");
+        assert!(page.bookmarks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_token_falls_back_to_a_login() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(session_json("token-1", "refresh-1")),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(session_json("token-2", "refresh-2")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.refreshSession"))
+            .respond_with(expired(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_likes(&server, "token-1", expired(401)).await;
+        mock_likes(&server, "token-2", empty_likes()).await;
+
+        client(&server)
+            .get_actor_likes("did:plc:alice", None, 50)
+            .await
+            .expect("should log in again once the refresh token is rejected");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_refresh_is_surfaced_without_a_login() {
+        let server = MockServer::start().await;
+        mock_login_once(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.refreshSession"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_likes(&server, "token-1", expired(401)).await;
+
+        let err = client(&server)
+            .get_actor_likes("did:plc:alice", None, 50)
+            .await
+            .expect_err("a rate-limited refresh must not be answered with a login");
+        assert!(err.is_rate_limited());
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn concurrent_expired_callers_share_one_refresh() {
+        let server = MockServer::start().await;
+        mock_login_once(&server).await;
+        mock_refresh(&server, 1).await;
+        mock_likes(&server, "token-1", expired(401)).await;
+        mock_likes(&server, "token-2", empty_likes()).await;
+
+        let client = client(&server);
+        // Log in first so every concurrent call starts from the same
+        // (about to expire) token.
+        client.authenticate().await.expect("login");
+        let results = futures_util::future::join_all(
+            (0..5).map(|_| client.get_actor_likes("did:plc:alice", None, 50)),
+        )
+        .await;
+        for result in results {
+            result.expect("every caller recovers through the single refresh");
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_login_closes_the_gate_for_later_callers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "600")
+                    .set_body_json(json!({
+                        "error": "RateLimitExceeded",
+                        "message": "Rate Limit Exceeded",
+                    })),
+            )
+            .expect(1)
             .mount(&server)
             .await;
 
         let client = client(&server);
-        let page = client
+        let first = client
             .get_bookmarks(None, 50)
             .await
-            .expect("should succeed after relogin on a 400 ExpiredToken");
-        assert!(page.bookmarks.is_empty());
+            .expect_err("the login is rate-limited");
+        assert_eq!(first.retry_after(), Some(Duration::from_secs(600)));
+
+        // The mock allows exactly one createSession: these must not reach it.
+        for _ in 0..3 {
+            let err = client
+                .get_actor_likes("did:plc:alice", None, 50)
+                .await
+                .expect_err("still rate-limited");
+            assert!(err.is_rate_limited());
+            let remaining = err.retry_after().expect("remaining wait is reported");
+            assert!(remaining <= Duration::from_secs(600) && remaining > Duration::from_secs(590));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_is_resumed_from_disk_without_a_login() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        // One login for the whole test; the second client must not add one.
+        mock_login_once(&server).await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path(
+                "/xrpc/com.atproto.server.getSession",
+            ))
+            .and(header("authorization", "Bearer token-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "did": "did:plc:alice",
+                "handle": "alice.bsky.social",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let first = client(&server).with_session_file(path.clone());
+        assert_eq!(first.authenticate().await.unwrap(), "did:plc:alice");
+
+        // A "restart": a fresh client over the same file verifies the saved
+        // session instead of logging in.
+        let second = client(&server).with_session_file(path);
+        assert_eq!(second.authenticate().await.unwrap(), "did:plc:alice");
+    }
+
+    #[tokio::test]
+    async fn saved_session_is_ignored_for_another_identifier() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path(
+                "/xrpc/com.atproto.server.createSession",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(session_json("token-1", "refresh-1")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .with_session_file(path.clone())
+            .authenticate()
+            .await
+            .unwrap();
+
+        let other = BlueskyClient::new(
+            url::Url::parse(&server.uri()).unwrap(),
+            "bob.bsky.social".to_string(),
+            Secret::from("app-password".to_string()),
+        )
+        .with_session_file(path);
+        other.authenticate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewed_session_is_persisted() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        mock_login_once(&server).await;
+        mock_refresh(&server, 1).await;
+        mock_likes(&server, "token-1", expired(401)).await;
+        mock_likes(&server, "token-2", empty_likes()).await;
+
+        client(&server)
+            .with_session_file(path.clone())
+            .get_actor_likes("did:plc:alice", None, 50)
+            .await
+            .unwrap();
+
+        let saved = SessionFile::new(path, "alice.bsky.social".to_string())
+            .load()
+            .expect("session saved");
+        assert_eq!(saved.access_jwt, "token-2");
+        assert_eq!(saved.refresh_jwt, "refresh-2");
+    }
+
+    #[tokio::test]
+    async fn saved_session_with_an_expired_access_token_is_renewed_at_startup() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("session.json");
+        session::SessionFile::new(session_path.clone(), "alice.bsky.social".to_string())
+            .save(&session::Session {
+                access_jwt: "token-1".to_string(),
+                refresh_jwt: "refresh-1".to_string(),
+                did: "did:plc:alice".to_string(),
+            })
+            .await;
+
+        // A restart days later resumes the pair and renews it: one refresh,
+        // no login against the limited `createSession` budget.
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.refreshSession"))
+            .and(header("authorization", "Bearer refresh-1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(session_json("token-2", "refresh-2")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.server.getSession"))
+            .and(header("authorization", "Bearer token-1"))
+            .respond_with(expired(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.server.getSession"))
+            .and(header("authorization", "Bearer token-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "did": "did:plc:alice",
+                "handle": "alice.bsky.social",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server).with_session_file(session_path);
+        assert_eq!(client.authenticate().await.unwrap(), "did:plc:alice");
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_is_surfaced_without_a_login() {
+        let server = MockServer::start().await;
+        mock_login_once(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.refreshSession"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_likes(&server, "token-1", expired(401)).await;
+
+        let err = client(&server)
+            .get_actor_likes("did:plc:alice", None, 50)
+            .await
+            .expect_err("a failed refresh is surfaced, not papered over with a login");
+        assert!(matches!(err, BlueskyError::Api { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn expired_token_on_a_write_is_renewed_and_retried() {
+        let server = MockServer::start().await;
+        mock_login_once(&server).await;
+        mock_refresh(&server, 1).await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/app.bsky.bookmark.createBookmark"))
+            .and(header("authorization", "Bearer token-1"))
+            .respond_with(expired(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/app.bsky.bookmark.createBookmark"))
+            .and(header("authorization", "Bearer token-2"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .bookmark_post(&StrongRef {
+                uri: "at://did:plc:bob/app.bsky.feed.post/1".to_string(),
+                cid: "cid-1".to_string(),
+            })
+            .await
+            .expect("write succeeds after renewing the session");
+    }
+
+    #[tokio::test]
+    async fn plain_400_on_a_write_is_surfaced_without_renewing() {
+        let server = MockServer::start().await;
+        mock_login_once(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/app.bsky.bookmark.createBookmark"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "InvalidRequest",
+                "message": "bad uri",
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .bookmark_post(&StrongRef {
+                uri: "nope".to_string(),
+                cid: "cid-1".to_string(),
+            })
+            .await
+            .expect_err("a plain 400 is a real error");
+        assert!(matches!(err, BlueskyError::Api { status: 400, .. }));
     }
 
     #[tokio::test]

@@ -53,7 +53,7 @@ plain `docker compose`.
 | Module | Owns |
 | --- | --- |
 | `config` | Loading, defaulting, and validating every environment variable into one typed `AppConfig`. Startup fails fast (non-zero exit) on anything invalid. |
-| `bluesky` | The `com.atproto.*` / `app.bsky.*` REST (XRPC) client: session auth (with automatic re-login when the access token expires — either a 401 or the AppView's 400 `ExpiredToken` convention), `getAuthorFeed`, `getFeed`, `getActorLikes`, `getBookmarks`, and handle resolution. |
+| `bluesky` | The `com.atproto.*` / `app.bsky.*` REST (XRPC) client: session auth, `getAuthorFeed`, `getFeed`, `getActorLikes`, `getBookmarks`, and handle resolution. Bluesky allows only ~10 `createSession` logins per account per day, so the client logs in once and then renews an expired access token (a 401 or the AppView's 400 `ExpiredToken`) with `refreshSession`, falling back to a login only if the refresh token is rejected. The token pair is saved to `ARCHIVE_DIR/bluesky_session.json` (owner-only on Unix, so its directory ACL is what protects it elsewhere; the file is a credential, treat it like `.env` — it is git-ignored and only one process should write a given `ARCHIVE_DIR`) so a restart resumes the session instead of spending a login. After a rate-limited login every caller fails fast until the server's retry window ends, rather than each spending more of the limit. |
 | `firehose` | The Jetstream websocket consumer: real-time capture of the watched accounts' authored posts with media, filtered by DID from the live roster, with reconnect/backoff, a persisted cursor so a restart resumes roughly where it left off, and an immediate reconnect when the watched-account set changes. |
 | `poller` | The REST-polling fallback for authored posts (active whenever the firehose is down), the feed poller (algorithm/custom feeds, which are never on the firehose), and the periodic likes/bookmarks poller. All use adaptive intervals with jittered exponential backoff. The bookmarks poller also detects deletions: a bookmark whose post comes back as `notFound` was deleted upstream, and its archived copy is marked with a `deleted_at` timestamp (a `blocked` post still exists and is never marked). |
 | `tumblr` | The Tumblr API v2 client (OAuth 1.0a HMAC-SHA1-signed requests) and the Tumblr likes poller, which archives the configured Tumblr account's liked posts into the `tumblr_likes` category on the same adaptive polling cadence. Only runs when the `TUMBLR_*` credentials are configured. |
@@ -80,8 +80,8 @@ Bluesky credentials, an unwritable database path) — those are surfaced immedia
 with a non-zero exit, so a misconfigured deployment fails visibly instead of running
 in a broken state. A transient Bluesky rate limit (`429`) at startup is *not* one of
 them: the service still comes up (the web UI and every supervised task start, and the
-poller backoff honors the server's `Retry-After` where available), authenticating
-lazily on the first API call once the limit clears.
+poller and sweep backoff honor the server's `Retry-After` where available),
+authenticating lazily on the first API call once the limit clears.
 
 ## Local development
 
