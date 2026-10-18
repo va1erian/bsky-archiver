@@ -308,11 +308,11 @@ impl BlueskyClient {
         Self {
             http: reqwest::Client::new(),
             base_url,
+            login_gate: LoginGate::new(None, identifier.clone()),
             identifier,
             app_password,
             session: tokio::sync::RwLock::new(None),
             login_lock: tokio::sync::Mutex::new(()),
-            login_gate: LoginGate::new(None),
             session_file: None,
             request_limiter: None,
         }
@@ -327,7 +327,7 @@ impl BlueskyClient {
     pub fn with_session_file(mut self, path: PathBuf) -> Self {
         let file = SessionFile::new(path, self.identifier.clone());
         *self.session.get_mut() = file.load();
-        self.login_gate = LoginGate::new(Some(file.gate_path()));
+        self.login_gate = LoginGate::new(Some(file.gate_path()), self.identifier.clone());
         self.session_file = Some(file);
         self
     }
@@ -1721,6 +1721,65 @@ mod tests {
         assert_eq!(
             err.health_detail(),
             "rate-limited (HTTP 429); retrying in 2h8m"
+        );
+    }
+
+    /// The fix end to end: a gate file written by a previous process (next
+    /// to the session file) must make every login attempt fail fast WITHOUT
+    /// hitting `createSession` — the whole point is not spending one of the
+    /// day's few logins re-discovering the limit. `expect(0)` on the login
+    /// mock verifies the server is never asked.
+    #[tokio::test]
+    async fn persisted_login_gate_fails_fast_without_spending_a_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("bluesky_session.json");
+        let gate_path = dir.path().join("bluesky_login_gate.json");
+        let in_an_hour = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(
+            &gate_path,
+            serde_json::json!({
+                "identifier": "alice.bsky.social",
+                "blocked_until": in_an_hour,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessJwt": "token",
+                "refreshJwt": "refresh",
+                "did": "did:plc:alice",
+                "handle": "alice.bsky.social",
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = BlueskyClient::new(
+            url::Url::parse(&server.uri()).unwrap(),
+            "alice.bsky.social".to_string(),
+            Secret::from("app-password".to_string()),
+        )
+        .with_session_file(session_path);
+
+        let err = client
+            .authenticate()
+            .await
+            .expect_err("a closed gate must fail the login fast");
+        assert!(err.is_rate_limited());
+        let remaining = err
+            .retry_after()
+            .expect("the gate carries its remaining wait");
+        assert!(
+            remaining > Duration::from_secs(3000) && remaining <= Duration::from_secs(3600),
+            "the remaining wait is the persisted deadline, not a fresh guess: {remaining:?}"
         );
     }
 

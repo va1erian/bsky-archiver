@@ -152,15 +152,21 @@ fn write_private<T: Serialize>(path: &std::path::Path, value: &T) -> std::io::Re
 /// limit.
 pub(super) struct LoginGate {
     blocked_until: Mutex<Option<Instant>>,
+    /// The account this gate counts against, checked against the file's tag.
+    identifier: String,
     /// Where the deadline is persisted, when there is a session directory
     /// to keep it in (`None` in tests).
     path: Option<PathBuf>,
 }
 
-/// The on-disk form of the gate: the Unix-seconds deadline logins are
-/// blocked until. Not a secret — it's a time, not a token.
+/// The on-disk form of the gate: the account it was written for and the
+/// Unix-seconds deadline logins are blocked until. Tagged with the
+/// identifier (like [`PersistedSession`]) so a changed `BSKY_IDENTIFIER`
+/// never inherits another account's lockout — the createSession limit is
+/// per-account. Not a secret — it's a time, not a token.
 #[derive(Serialize, Deserialize)]
 struct PersistedGate {
+    identifier: String,
     blocked_until: u64,
 }
 
@@ -173,10 +179,12 @@ fn unix_now() -> u64 {
 
 impl LoginGate {
     /// A gate persisting its deadline at `path`, resuming a still-valid
-    /// block from there. An unreadable or stale file is treated as open.
-    pub fn new(path: Option<PathBuf>) -> Self {
+    /// block from there. An unreadable, other-account, or stale file is
+    /// treated as open.
+    pub fn new(path: Option<PathBuf>, identifier: String) -> Self {
         let gate = LoginGate {
             blocked_until: Mutex::new(None),
+            identifier,
             path,
         };
         if let Some(path) = &gate.path {
@@ -195,14 +203,19 @@ impl LoginGate {
                     return gate;
                 }
             };
-            if persisted.blocked_until <= unix_now() {
+            if persisted.identifier != gate.identifier {
+                warn!("the saved bluesky login gate is for another account; ignoring it");
+                return gate;
+            }
+            let now = unix_now();
+            if persisted.blocked_until <= now {
                 return gate;
             }
             // Bounded by MAX_LOGIN_COOLDOWN at block() time for files we
             // wrote; the cap also keeps a hand-crafted file from overflowing
             // `Instant` on addition.
-            let remaining =
-                Duration::from_secs(persisted.blocked_until - unix_now()).min(MAX_LOGIN_COOLDOWN);
+            let remaining = Duration::from_secs(persisted.blocked_until.saturating_sub(now))
+                .min(MAX_LOGIN_COOLDOWN);
             let Some(until) = Instant::now().checked_add(remaining) else {
                 return gate;
             };
@@ -255,7 +268,10 @@ impl LoginGate {
     fn persist(&self, path: &std::path::Path, until: Instant) {
         let remaining = until.duration_since(Instant::now());
         let blocked_until = unix_now().saturating_add(remaining.as_secs().max(1));
-        let saved = PersistedGate { blocked_until };
+        let saved = PersistedGate {
+            identifier: self.identifier.clone(),
+            blocked_until,
+        };
         if let Err(err) = write_private(path, &saved) {
             warn!(error = %err, "could not save the bluesky login gate");
         }
@@ -328,7 +344,7 @@ mod tests {
 
     #[test]
     fn login_gate_blocks_for_the_hint_and_clears() {
-        let gate = LoginGate::new(None);
+        let gate = LoginGate::new(None, "alice.bsky.social".to_string());
         assert!(gate.remaining().is_none());
 
         gate.block(Some(Duration::from_secs(120)));
@@ -341,7 +357,7 @@ mod tests {
 
     #[test]
     fn login_gate_defaults_and_caps_the_cooldown() {
-        let gate = LoginGate::new(None);
+        let gate = LoginGate::new(None, "alice.bsky.social".to_string());
         gate.block(None);
         assert!(gate.remaining().unwrap() <= DEFAULT_LOGIN_COOLDOWN);
 
@@ -351,7 +367,7 @@ mod tests {
 
     #[test]
     fn login_gate_reopens_once_the_window_passes() {
-        let gate = LoginGate::new(None);
+        let gate = LoginGate::new(None, "alice.bsky.social".to_string());
         gate.block(Some(Duration::from_millis(1)));
         std::thread::sleep(Duration::from_millis(20));
         assert!(gate.remaining().is_none());
@@ -362,12 +378,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bluesky_login_gate.json");
 
-        let gate = LoginGate::new(Some(path.clone()));
+        let gate = LoginGate::new(Some(path.clone()), "alice.bsky.social".to_string());
         gate.block(Some(Duration::from_secs(120)));
 
         // A restarted client reads the still-valid deadline and fails fast
         // without spending a login on the window.
-        let restarted = LoginGate::new(Some(path.clone()));
+        let restarted = LoginGate::new(Some(path.clone()), "alice.bsky.social".to_string());
         let remaining = restarted
             .remaining()
             .expect("restarted gate resumes the block");
@@ -376,7 +392,11 @@ mod tests {
         // Clearing (a successful login) removes the file entirely.
         restarted.clear();
         assert!(!path.exists());
-        assert!(LoginGate::new(Some(path)).remaining().is_none());
+        assert!(
+            LoginGate::new(Some(path), "alice.bsky.social".to_string())
+                .remaining()
+                .is_none()
+        );
     }
 
     #[test]
@@ -385,10 +405,42 @@ mod tests {
         let path = dir.path().join("bluesky_login_gate.json");
 
         std::fs::write(&path, "not json").unwrap();
-        assert!(LoginGate::new(Some(path.clone())).remaining().is_none());
+        assert!(
+            LoginGate::new(Some(path.clone()), "alice.bsky.social".to_string())
+                .remaining()
+                .is_none()
+        );
 
         // A deadline in the past is not a block.
-        std::fs::write(&path, r#"{"blocked_until": 0}"#).unwrap();
-        assert!(LoginGate::new(Some(path.clone())).remaining().is_none());
+        std::fs::write(
+            &path,
+            r#"{"identifier":"alice.bsky.social","blocked_until":0}"#,
+        )
+        .unwrap();
+        assert!(
+            LoginGate::new(Some(path.clone()), "alice.bsky.social".to_string())
+                .remaining()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn login_gate_ignores_another_accounts_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bluesky_login_gate.json");
+
+        // Written while `BSKY_IDENTIFIER` was bob's; alice must not inherit
+        // bob's lockout (the createSession limit is per-account).
+        std::fs::write(
+            &path,
+            r#"{"identifier":"bob.bsky.social","blocked_until":9999999999}"#,
+        )
+        .unwrap();
+        assert!(
+            LoginGate::new(Some(path), "alice.bsky.social".to_string())
+                .remaining()
+                .is_none(),
+            "another account's gate must not block this one"
+        );
     }
 }
