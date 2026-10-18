@@ -42,6 +42,7 @@ use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
 use crate::bluesky::BlueskyClient;
+use crate::health::SubsystemReporter;
 use crate::pipeline::{
     CandidatePost, CandidatePostSender, PostCategory, extract_media_from_record,
 };
@@ -73,6 +74,15 @@ impl SweepError {
         match self {
             SweepError::Bluesky(err) => err.retry_after(),
             SweepError::Storage(_) => None,
+        }
+    }
+
+    /// A short, UI-safe reason for the health lights (see
+    /// [`crate::bluesky::BlueskyError::health_detail`]).
+    fn health_detail(&self) -> String {
+        match self {
+            SweepError::Bluesky(err) => err.health_detail(),
+            SweepError::Storage(_) => "archive write failed".to_string(),
         }
     }
 }
@@ -112,6 +122,9 @@ pub struct NightlySweeper {
     actor: String,
     /// Local hour of day (0-23, config-validated) the sweep runs at.
     local_hour: u32,
+    /// Reports sweep outcomes to the health lights: `Degraded` with a
+    /// reason while a pass keeps failing, `Connected` once one completes.
+    health: SubsystemReporter,
 }
 
 impl NightlySweeper {
@@ -128,7 +141,15 @@ impl NightlySweeper {
             sender,
             actor,
             local_hour,
+            health: SubsystemReporter::disabled(),
         }
+    }
+
+    /// Attaches the health reporter the app wires to the nightly-sweep
+    /// snapshot field (tests construct sweepers without one).
+    pub fn with_health_reporter(mut self, health: SubsystemReporter) -> Self {
+        self.health = health;
+        self
     }
 
     /// Runs forever: sweep once at startup (catching up on anything the
@@ -148,6 +169,7 @@ impl NightlySweeper {
                             media_requeued = summary.media_requeued,
                             "likes/bookmarks sweep complete"
                         );
+                        self.health.connected();
                         break;
                     }
                     Err(err) => {
@@ -157,6 +179,7 @@ impl NightlySweeper {
                             retry_secs = delay.as_secs(),
                             "likes/bookmarks sweep failed; retrying"
                         );
+                        self.health.degraded(err.health_detail());
                         tokio::time::sleep(delay).await;
                     }
                 }

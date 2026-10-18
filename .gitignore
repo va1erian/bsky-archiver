@@ -4,6 +4,7 @@
 /data
 /archive
 bluesky_session.json
+bluesky_login_gate.json
 .symphony-mcp.json
 /.symphony/.workspaces/
 /.symphony/symphony-report.html

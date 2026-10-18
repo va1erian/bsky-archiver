@@ -1545,3 +1545,81 @@ async fn backfill_feed_once_archives_only_archive_worthy_posts() {
     assert_eq!(sent.at_uri, "at://did:plc:alice/app.bsky.feed.post/8");
     assert!(rx.recv().await.is_none(), "text-only post skipped");
 }
+
+/// The health wiring end to end: a rate-limited bookmarks pass must light
+/// the subsystem `Degraded` with the rate-limit reason, and a succeeding
+/// pass must light it `Connected` again — no more green-while-broken.
+#[tokio::test]
+async fn failing_pass_lights_degraded_then_success_lights_connected() {
+    use crate::health::Status;
+
+    let server = MockServer::start().await;
+    mock_session(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getActorLikes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [],
+            "cursor": null,
+        })))
+        .mount(&server)
+        .await;
+
+    // The bookmarks endpoint rate-limits the first call and succeeds after.
+    // A fn-local static keeps the responder closure non-capturing, which is
+    // what wiremock's `respond_with` infers best.
+    static BOOKMARK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.bookmark.getBookmarks"))
+        .respond_with(|_: &wiremock::Request| {
+            let call = BOOKMARK_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                ResponseTemplate::new(429).insert_header("retry-after", "1")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "bookmarks": [],
+                    "cursor": null,
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let (_dir, store) = open_store().await;
+    let (tx, _rx) = candidate_post_channel(8);
+    let (health_tx, mut health_rx) = crate::health::health_channel();
+    let poller = LikesBookmarksPoller::new(
+        make_client(&server),
+        store,
+        tx,
+        "did:plc:alice".to_string(),
+        Duration::from_millis(50),
+    )
+    .with_health_reporter(crate::health::SubsystemReporter::new(
+        health_tx,
+        |snapshot, health| snapshot.likes_bookmarks = health,
+    ));
+
+    tokio::spawn(async move { poller.run().await });
+
+    // First cycle: the bookmarks pass 429s → Degraded with the reason.
+    tokio::time::timeout(Duration::from_secs(5), health_rx.changed())
+        .await
+        .expect("a health update arrives")
+        .expect("sender alive");
+    let snapshot = health_rx.borrow().clone();
+    assert_eq!(snapshot.likes_bookmarks.status, Status::Degraded);
+    assert_eq!(
+        snapshot.likes_bookmarks.detail.as_deref(),
+        Some("rate-limited (HTTP 429); retrying in 1s")
+    );
+
+    // Second cycle (the hint's 1s wait): everything succeeds → Connected.
+    tokio::time::timeout(Duration::from_secs(5), health_rx.changed())
+        .await
+        .expect("a second health update arrives")
+        .expect("sender alive");
+    let snapshot = health_rx.borrow().clone();
+    assert_eq!(snapshot.likes_bookmarks.status, Status::Connected);
+    assert_eq!(snapshot.likes_bookmarks.detail, None);
+}
