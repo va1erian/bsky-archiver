@@ -55,6 +55,35 @@ impl BlueskyError {
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, BlueskyError::Api { status: 429, .. })
     }
+
+    /// A short, UI-safe reason for the health lights: what failed and when
+    /// we'll retry, never the response body (which is server-controlled
+    /// text) or anything request-shaped. Deliberately terse — the log lines
+    /// carry the full detail.
+    pub fn health_detail(&self) -> String {
+        match self {
+            BlueskyError::Http(_) => "network error".to_string(),
+            BlueskyError::Api {
+                status,
+                retry_after,
+                ..
+            } => {
+                let reason = if *status == 429 {
+                    "rate-limited"
+                } else {
+                    "request failed"
+                };
+                match retry_after {
+                    Some(hint) => format!(
+                        "{reason} (HTTP {status}); retrying in {}",
+                        crate::health::fmt_retry_hint(*hint)
+                    ),
+                    None => format!("{reason} (HTTP {status})"),
+                }
+            }
+            BlueskyError::Auth(_) => "authentication failed".to_string(),
+        }
+    }
 }
 
 /// Parses a retry hint out of response headers, preferring `Retry-After`
@@ -283,17 +312,22 @@ impl BlueskyClient {
             app_password,
             session: tokio::sync::RwLock::new(None),
             login_lock: tokio::sync::Mutex::new(()),
-            login_gate: LoginGate::default(),
+            login_gate: LoginGate::new(None),
             session_file: None,
             request_limiter: None,
         }
     }
 
     /// Persists the session at `path` and resumes the one saved there, so a
-    /// restart doesn't spend a rate-limited `createSession` login.
+    /// restart doesn't spend a rate-limited `createSession` login. The
+    /// login gate's deadline persists alongside it (a sibling
+    /// `bluesky_login_gate.json`), so a restart during a rate-limit window
+    /// also fails fast instead of spending a login re-discovering the
+    /// limit.
     pub fn with_session_file(mut self, path: PathBuf) -> Self {
         let file = SessionFile::new(path, self.identifier.clone());
         *self.session.get_mut() = file.load();
+        self.login_gate = LoginGate::new(Some(file.gate_path()));
         self.session_file = Some(file);
         self
     }
@@ -1663,6 +1697,31 @@ mod tests {
             .expect_err("rate limit should surface as an error");
         assert!(err.is_rate_limited());
         assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+        assert_eq!(
+            err.health_detail(),
+            "rate-limited (HTTP 429); retrying in 30s",
+            "the health detail names the limit and the wait, never the body"
+        );
+    }
+
+    #[test]
+    fn health_detail_is_terse_and_body_free() {
+        let err = BlueskyError::Api {
+            status: 500,
+            body: "server internals nobody should display".to_string(),
+            retry_after: None,
+        };
+        assert_eq!(err.health_detail(), "request failed (HTTP 500)");
+
+        let err = BlueskyError::Api {
+            status: 429,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(7685)),
+        };
+        assert_eq!(
+            err.health_detail(),
+            "rate-limited (HTTP 429); retrying in 2h8m"
+        );
     }
 
     #[tokio::test]

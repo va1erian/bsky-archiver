@@ -7,6 +7,7 @@
 //! and the channel — no HTTP endpoint lives here.
 
 use serde::Serialize;
+use std::time::Duration;
 use tokio::sync::watch;
 
 /// Coarse status of one subsystem.
@@ -110,6 +111,63 @@ pub fn health_channel() -> (HealthSender, HealthReceiver) {
     watch::channel(HealthSnapshot::default())
 }
 
+/// A cloneable handle one background task uses to report how its *work* is
+/// going, as opposed to whether the task is alive (that's the supervisor's
+/// job): a poller that keeps looping through rate-limited passes is alive
+/// but not doing its job, so it reports [`Status::Degraded`] with a short
+/// reason here and [`Status::Connected`] again once a pass succeeds.
+#[derive(Clone)]
+pub struct SubsystemReporter {
+    tx: Option<HealthSender>,
+    set: fn(&mut HealthSnapshot, SubsystemHealth),
+}
+
+impl SubsystemReporter {
+    /// Builds a reporter writing into `set`'s one snapshot field.
+    pub fn new(tx: HealthSender, set: fn(&mut HealthSnapshot, SubsystemHealth)) -> Self {
+        SubsystemReporter { tx: Some(tx), set }
+    }
+
+    /// A reporter that discards updates: tests and callers constructed
+    /// without a snapshot still get the same poller API.
+    pub fn disabled() -> Self {
+        SubsystemReporter {
+            tx: None,
+            set: |_, _| {},
+        }
+    }
+
+    pub fn connected(&self) {
+        self.update(SubsystemHealth::connected());
+    }
+
+    pub fn degraded(&self, detail: impl Into<String>) {
+        self.update(SubsystemHealth::degraded(detail));
+    }
+
+    fn update(&self, health: SubsystemHealth) {
+        if let Some(tx) = &self.tx {
+            tx.send_modify(|s| (self.set)(s, health));
+        }
+    }
+}
+
+/// Formats a retry hint the way the dashboard's health detail shows it:
+/// whole seconds under a minute, otherwise minutes, otherwise hours plus
+/// remaining minutes. Shared by every subsystem's failure detail so the
+/// lights all speak the same dialect.
+pub(crate) fn fmt_retry_hint(hint: Duration) -> String {
+    let secs = hint.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    format!("{}h{}m", mins / 60, mins % 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +194,50 @@ mod tests {
         assert_eq!(snapshot.firehose.status, Status::Connected);
         assert_eq!(snapshot.rest_fallback.status, Status::Degraded);
         assert_eq!(snapshot.feed_poller.status, Status::Degraded);
+    }
+
+    #[tokio::test]
+    async fn reporter_writes_only_its_own_field() {
+        let (tx, rx) = health_channel();
+        let reporter = SubsystemReporter::new(tx, |s, h| s.likes_bookmarks = h);
+
+        reporter.degraded("rate-limited; retrying in 5m");
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.likes_bookmarks.status, Status::Degraded);
+        assert_eq!(
+            snapshot.likes_bookmarks.detail.as_deref(),
+            Some("rate-limited; retrying in 5m")
+        );
+        assert_eq!(snapshot.rest_fallback.status, Status::Degraded);
+        assert_eq!(
+            snapshot.rest_fallback.detail.as_deref(),
+            Some("starting up")
+        );
+
+        reporter.connected();
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.likes_bookmarks.status, Status::Connected);
+        assert_eq!(snapshot.likes_bookmarks.detail, None);
+    }
+
+    #[tokio::test]
+    async fn disabled_reporter_discards_updates() {
+        let (_tx, rx) = health_channel();
+        let reporter = SubsystemReporter::disabled();
+        reporter.degraded("ignored");
+        reporter.connected();
+        assert!(
+            !rx.has_changed().expect("sender alive"),
+            "no update should have been published"
+        );
+    }
+
+    #[test]
+    fn retry_hint_reads_in_human_units() {
+        use std::time::Duration;
+        assert_eq!(fmt_retry_hint(Duration::from_secs(45)), "45s");
+        assert_eq!(fmt_retry_hint(Duration::from_secs(95)), "1m");
+        assert_eq!(fmt_retry_hint(Duration::from_secs(600)), "10m");
+        assert_eq!(fmt_retry_hint(Duration::from_secs(7685)), "2h8m");
     }
 }

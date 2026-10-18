@@ -36,7 +36,7 @@ use url::Url;
 use crate::bluesky::{BlueskyClient, BlueskyError};
 use crate::config::{AppConfig, ConfigError};
 use crate::firehose::FirehoseConsumer;
-use crate::health::{self, HealthSender, HealthSnapshot, SubsystemHealth};
+use crate::health::{self, HealthSender, HealthSnapshot, SubsystemHealth, SubsystemReporter};
 use crate::media::MediaDownloader;
 use crate::pipeline::{
     CandidatePostReceiver, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver,
@@ -572,12 +572,16 @@ fn spawn_rest_fallback(
     health_tx: HealthSender,
     shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    let reporter_tx = health_tx.clone();
+    let set: fn(&mut HealthSnapshot, SubsystemHealth) =
+        |snapshot, health| snapshot.rest_fallback = health;
     tokio::spawn(supervise(
         "rest_fallback",
         shutdown_rx,
         health_tx,
-        |snapshot, health| snapshot.rest_fallback = health,
+        set,
         move || {
+            let reporter = SubsystemReporter::new(reporter_tx.clone(), set);
             let poller = RestFallbackPoller::new(
                 Arc::clone(&client),
                 store.clone(),
@@ -585,7 +589,8 @@ fn spawn_rest_fallback(
                 conn_health_rx.clone(),
                 roster_rx.clone(),
                 poller_config.clone(),
-            );
+            )
+            .with_health_reporter(reporter);
             async move { poller.run().await }
         },
     ))
@@ -601,19 +606,24 @@ fn spawn_feed_poller(
     health_tx: HealthSender,
     shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    let reporter_tx = health_tx.clone();
+    let set: fn(&mut HealthSnapshot, SubsystemHealth) =
+        |snapshot, health| snapshot.feed_poller = health;
     tokio::spawn(supervise(
         "feed_poller",
         shutdown_rx,
         health_tx,
-        |snapshot, health| snapshot.feed_poller = health,
+        set,
         move || {
+            let reporter = SubsystemReporter::new(reporter_tx.clone(), set);
             let poller = FeedPoller::new(
                 Arc::clone(&client),
                 store.clone(),
                 candidate_tx.clone(),
                 roster_rx.clone(),
                 poller_config.clone(),
-            );
+            )
+            .with_health_reporter(reporter);
             async move { poller.run().await }
         },
     ))
@@ -628,19 +638,24 @@ fn spawn_likes_bookmarks(
     health_tx: HealthSender,
     shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    let reporter_tx = health_tx.clone();
+    let set: fn(&mut HealthSnapshot, SubsystemHealth) =
+        |snapshot, health| snapshot.likes_bookmarks = health;
     tokio::spawn(supervise(
         "likes_bookmarks",
         shutdown_rx,
         health_tx,
-        |snapshot, health| snapshot.likes_bookmarks = health,
+        set,
         move || {
+            let reporter = SubsystemReporter::new(reporter_tx.clone(), set);
             let poller = LikesBookmarksPoller::new(
                 Arc::clone(&client),
                 store.clone(),
                 candidate_tx.clone(),
                 actor.clone(),
                 base_interval,
-            );
+            )
+            .with_health_reporter(reporter);
             async move { poller.run().await }
         },
     ))
@@ -687,19 +702,24 @@ fn spawn_nightly_sweep(
     health_tx: HealthSender,
     shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    let reporter_tx = health_tx.clone();
+    let set: fn(&mut HealthSnapshot, SubsystemHealth) =
+        |snapshot, health| snapshot.nightly_sweep = health;
     tokio::spawn(supervise(
         "nightly_sweep",
         shutdown_rx,
         health_tx,
-        |snapshot, health| snapshot.nightly_sweep = health,
+        set,
         move || {
+            let reporter = SubsystemReporter::new(reporter_tx.clone(), set);
             let sweeper = NightlySweeper::new(
                 Arc::clone(&client),
                 store.clone(),
                 candidate_tx.clone(),
                 actor.clone(),
                 local_hour,
-            );
+            )
+            .with_health_reporter(reporter);
             async move { sweeper.run().await }
         },
     ))

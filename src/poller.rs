@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::bluesky::{BlueskyClient, BlueskyError, PostView};
+use crate::health::SubsystemReporter;
 use crate::pipeline::{
     CandidatePost, CandidatePostSender, ConnectionHealth, ConnectionHealthReceiver, MediaRef,
     PostCategory, has_archivable_media,
@@ -178,6 +179,9 @@ pub struct RestFallbackPoller {
     /// channel closes so a dead roster can't spin the loop's sleep select.
     roster_alive: bool,
     config: PollerConfig,
+    /// Reports cycle outcomes to the health lights while the fallback is
+    /// actively polling.
+    health: SubsystemReporter,
 }
 
 impl RestFallbackPoller {
@@ -200,7 +204,15 @@ impl RestFallbackPoller {
             watchlist_rx,
             roster_alive: true,
             config,
+            health: SubsystemReporter::disabled(),
         }
+    }
+
+    /// Attaches the health reporter the app wires to the REST-fallback
+    /// snapshot field (tests construct pollers without one).
+    pub fn with_health_reporter(mut self, health: SubsystemReporter) -> Self {
+        self.health = health;
+        self
     }
 
     /// The currently watched account values (handles or DIDs) from the live
@@ -233,9 +245,12 @@ impl RestFallbackPoller {
             self.config.baseline_interval,
             self.config.max_interval,
         ));
+        // Whether the last active cycle reported Degraded, so going idle can
+        // clear the light exactly once.
+        let mut degraded = false;
 
         loop {
-            if !self.wait_until_active().await {
+            if !self.wait_until_active(&mut degraded).await {
                 return;
             }
 
@@ -243,14 +258,21 @@ impl RestFallbackPoller {
                 CycleOutcome::NewContent => {
                     interval.on_content_found();
                     breaker.on_success();
+                    self.health.connected();
+                    degraded = false;
                     interval.jittered()
                 }
                 CycleOutcome::Empty => {
                     interval.on_empty();
                     breaker.on_success();
+                    self.health.connected();
+                    degraded = false;
                     interval.jittered()
                 }
                 CycleOutcome::Error => {
+                    // Reported Degraded by poll_all_handles, which saw the
+                    // actual error.
+                    degraded = true;
                     interval.on_error();
                     let breaker_delay = breaker.on_failure(None);
                     if breaker.is_open() {
@@ -288,7 +310,14 @@ impl RestFallbackPoller {
 
     /// Blocks until the fallback should be active. Returns `false` if the
     /// health channel closed (firehose task gone for good) while waiting.
-    async fn wait_until_active(&mut self) -> bool {
+    /// `degraded` tracks whether the light is currently Degraded from the
+    /// last active period — going idle clears it once, since a dormant
+    /// fallback is not a broken one.
+    async fn wait_until_active(&mut self, degraded: &mut bool) -> bool {
+        if *degraded {
+            self.health.connected();
+            *degraded = false;
+        }
         loop {
             let health = *self.health_rx.borrow();
             if is_active(
@@ -333,6 +362,7 @@ impl RestFallbackPoller {
                 }
                 Err(err) => {
                     warn!(handle = %handle, error = %err, "rest poller failed to poll handle");
+                    self.health.degraded(err.health_detail());
                     any_error = true;
                 }
             }
@@ -367,6 +397,8 @@ pub struct FeedPoller {
     /// channel closes so a dead roster can't spin the loop's sleep select.
     roster_alive: bool,
     config: PollerConfig,
+    /// Reports cycle outcomes to the health lights.
+    health: SubsystemReporter,
 }
 
 impl FeedPoller {
@@ -386,7 +418,15 @@ impl FeedPoller {
             watchlist_rx,
             roster_alive: true,
             config,
+            health: SubsystemReporter::disabled(),
         }
+    }
+
+    /// Attaches the health reporter the app wires to the feed-poller
+    /// snapshot field (tests construct pollers without one).
+    pub fn with_health_reporter(mut self, health: SubsystemReporter) -> Self {
+        self.health = health;
+        self
     }
 
     /// The currently watched `at://` feed URIs, from the live roster.
@@ -423,6 +463,7 @@ impl FeedPoller {
                 }
                 Err(err) => {
                     warn!(feed = %feed, error = %err, "feed poller failed to poll feed");
+                    self.health.degraded(err.health_detail());
                     any_error = true;
                 }
             }
@@ -456,13 +497,17 @@ impl FeedPoller {
                 CycleOutcome::NewContent => {
                     interval.on_content_found();
                     breaker.on_success();
+                    self.health.connected();
                     interval.jittered()
                 }
                 CycleOutcome::Empty => {
                     interval.on_empty();
                     breaker.on_success();
+                    self.health.connected();
                     interval.jittered()
                 }
+                // Already reported Degraded by poll_all_feeds, which saw
+                // the actual error.
                 CycleOutcome::Error => {
                     interval.on_error();
                     let breaker_delay = breaker.on_failure(None);
@@ -510,6 +555,18 @@ pub(crate) enum PollHandleError {
     Storage(#[from] StorageError),
     #[error("candidate post channel closed")]
     ChannelClosed,
+}
+
+impl PollHandleError {
+    /// A short, UI-safe reason for the health lights (see
+    /// [`BlueskyError::health_detail`]).
+    pub(crate) fn health_detail(&self) -> String {
+        match self {
+            PollHandleError::Bluesky(err) => err.health_detail(),
+            PollHandleError::Storage(_) => "archive write failed".to_string(),
+            PollHandleError::ChannelClosed => "producer channel closed".to_string(),
+        }
+    }
 }
 
 /// Errors from a single one-shot backfill pass ([`backfill_account_once`] /
@@ -819,6 +876,15 @@ impl PollError {
             PollError::Storage(_) => None,
         }
     }
+
+    /// A short, UI-safe reason for the health lights (see
+    /// [`BlueskyError::health_detail`]).
+    fn health_detail(&self) -> String {
+        match self {
+            PollError::Bluesky(err) => err.health_detail(),
+            PollError::Storage(_) => "archive write failed".to_string(),
+        }
+    }
 }
 
 /// Polls the watched account's likes and bookmarks on a timer, archiving
@@ -830,6 +896,9 @@ pub struct LikesBookmarksPoller {
     sender: CandidatePostSender,
     actor: String,
     base_interval: Duration,
+    /// Reports pass outcomes to the health lights: `Degraded` with a reason
+    /// while passes fail, `Connected` once both pass again.
+    health: SubsystemReporter,
 }
 
 impl LikesBookmarksPoller {
@@ -846,7 +915,15 @@ impl LikesBookmarksPoller {
             sender,
             actor,
             base_interval,
+            health: SubsystemReporter::disabled(),
         }
+    }
+
+    /// Attaches the health reporter the app wires to the likes/bookmarks
+    /// snapshot field (tests construct pollers without one).
+    pub fn with_health_reporter(mut self, health: SubsystemReporter) -> Self {
+        self.health = health;
+        self
     }
 
     /// Runs the poll loop forever: alternates likes and bookmarks passes on
@@ -874,9 +951,17 @@ impl LikesBookmarksPoller {
             let delay = match (&likes_result, &bookmarks_result) {
                 (Ok(_), Ok(_)) => {
                     backoff.on_success();
+                    self.health.connected();
                     crate::ratelimit::jittered(self.base_interval, 0.2)
                 }
                 _ => {
+                    let failing = likes_result
+                        .as_ref()
+                        .err()
+                        .or_else(|| bookmarks_result.as_ref().err());
+                    if let Some(err) = failing {
+                        self.health.degraded(err.health_detail());
+                    }
                     let hint = likes_result
                         .as_ref()
                         .err()

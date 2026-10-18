@@ -2,6 +2,7 @@
 /data
 /archive
 bluesky_session.json
+bluesky_login_gate.json
 .env
 *.log
 .github
